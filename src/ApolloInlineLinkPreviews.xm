@@ -55,7 +55,12 @@ typedef NS_ENUM(unsigned char, ApolloLinkPreviewStackAlignItems) {
 @property (nonatomic) CGFloat cornerRadius;
 @property (nonatomic) BOOL clipsToBounds;
 @property (nonatomic) BOOL userInteractionEnabled;
-@property (nonatomic, readonly) CALayer *layer;
+@property (nonatomic) CGFloat alpha;
+@property (nonatomic, getter=isHidden) BOOL hidden;
+@property (nonatomic) CGFloat borderWidth;
+@property (nonatomic) CGColorRef borderColor;
+@property (nonatomic) CGFloat shadowOpacity;
+@property (nonatomic) CGFloat shadowRadius;
 @end
 
 @interface ASTextNode : ASDisplayNode
@@ -796,18 +801,13 @@ static void ApolloLPSetImageNodeBackgroundForURL(ASNetworkImageNode *imageNode, 
     imageNode.backgroundColor = target;
 }
 
+// layoutSpecThatFits: runs on Texture background layout threads — never touch
+// UIView/CALayer here (deadlocks with main-thread cornerRadius updates).
 static void ApolloLPSetAvatarNodeVisible(ASNetworkImageNode *avatarNode, BOOL visible) {
     if (!avatarNode) return;
     avatarNode.placeholderEnabled = visible;
-    avatarNode.layer.opacity = visible ? 1.0 : 0.0;
-    if (avatarNode.isNodeLoaded) {
-        avatarNode.view.hidden = !visible;
-        avatarNode.view.alpha = visible ? 1.0 : 0.0;
-    }
-    if (!visible) {
-        ApolloLPSetNetworkImageURLPreservingImage(avatarNode, nil);
-        ApolloLPSetImageNodeBackgroundForURL(avatarNode, nil);
-    }
+    avatarNode.alpha = visible ? 1.0 : 0.0;
+    avatarNode.hidden = !visible;
 }
 
 static void ApolloLPApplyFallbackImage(ASNetworkImageNode *imageNode, NSURL *imageURL, UIImage *image, NSString *host) {
@@ -1185,10 +1185,10 @@ static void ApolloLPClearHostShell(ASDisplayNode *node) {
             @"background": node.backgroundColor ?: [NSNull null],
             @"cornerRadius": @(node.cornerRadius),
             @"clipsToBounds": @(node.clipsToBounds),
-            @"borderWidth": @(node.layer.borderWidth),
-            @"borderColor": node.layer.borderColor ? (__bridge id)node.layer.borderColor : [NSNull null],
-            @"shadowOpacity": @(node.layer.shadowOpacity),
-            @"shadowRadius": @(node.layer.shadowRadius),
+            @"borderWidth": @(node.borderWidth),
+            @"borderColor": node.borderColor ? (__bridge id)node.borderColor : [NSNull null],
+            @"shadowOpacity": @(node.shadowOpacity),
+            @"shadowRadius": @(node.shadowRadius),
         };
         objc_setAssociatedObject(node, &kApolloLinkPreviewOriginalHostShellKey, original, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
@@ -1196,10 +1196,10 @@ static void ApolloLPClearHostShell(ASDisplayNode *node) {
     node.backgroundColor = [UIColor clearColor];
     node.cornerRadius = 0.0;
     node.clipsToBounds = NO;
-    node.layer.borderWidth = 0.0;
-    node.layer.borderColor = nil;
-    node.layer.shadowOpacity = 0.0;
-    node.layer.shadowRadius = 0.0;
+    node.borderWidth = 0.0;
+    node.borderColor = nil;
+    node.shadowOpacity = 0.0;
+    node.shadowRadius = 0.0;
 }
 
 static void ApolloLPRestoreHostShell(ASDisplayNode *node) {
@@ -1211,11 +1211,11 @@ static void ApolloLPRestoreHostShell(ASDisplayNode *node) {
     node.backgroundColor = [background isKindOfClass:[NSNull class]] ? nil : background;
     node.cornerRadius = [original[@"cornerRadius"] doubleValue];
     node.clipsToBounds = [original[@"clipsToBounds"] boolValue];
-    node.layer.borderWidth = [original[@"borderWidth"] doubleValue];
+    node.borderWidth = [original[@"borderWidth"] doubleValue];
     id borderColor = original[@"borderColor"];
-    node.layer.borderColor = [borderColor isKindOfClass:[NSNull class]] ? nil : (__bridge CGColorRef)borderColor;
-    node.layer.shadowOpacity = [original[@"shadowOpacity"] floatValue];
-    node.layer.shadowRadius = [original[@"shadowRadius"] doubleValue];
+    node.borderColor = [borderColor isKindOfClass:[NSNull class]] ? nil : (__bridge CGColorRef)borderColor;
+    node.shadowOpacity = [original[@"shadowOpacity"] floatValue];
+    node.shadowRadius = [original[@"shadowRadius"] doubleValue];
 }
 
 typedef NS_ENUM(NSUInteger, ApolloLPContext) {
@@ -2786,6 +2786,15 @@ static ApolloLinkPreview *ApolloLPPreviewByApplyingTranslation(ASDisplayNode *ho
     return displayPreview;
 }
 
+static ASLayoutSpec *ApolloLPEmptyLayoutSpec(void) {
+    Class layoutSpecCls = ApolloLPClass(@"ASLayoutSpec");
+    if (!layoutSpecCls) return nil;
+
+    ASLayoutSpec *empty = [[layoutSpecCls alloc] init];
+    ApolloLPApplyStyleSize([empty style], CGSizeZero);
+    return empty;
+}
+
 %hook _TtC6Apollo14LinkButtonNode
 
 - (id)layoutSpecThatFits:(struct CDStruct_90e057aa)constrainedSize {
@@ -2804,6 +2813,13 @@ static ApolloLinkPreview *ApolloLPPreviewByApplyingTranslation(ASDisplayNode *ho
 
     NSString *host = ApolloLPHost(url);
     ApolloLPArea area = ApolloLPAreaForLinkButton((ASDisplayNode *)self);
+    if (ApolloLPIsImageChestAlbumURL(url)) {
+        ApolloLPLogOncePerHost(host, @"suppress-imagechest-card");
+        ApolloLPRestoreHostShell((ASDisplayNode *)self);
+        ASLayoutSpec *empty = ApolloLPEmptyLayoutSpec();
+        return empty ?: %orig;
+    }
+
     NSInteger selectedMode = ApolloLPModeForArea(area);
     if (selectedMode == ApolloLinkPreviewModeOff) {
         ApolloLPLogOncePerHost(host, area == ApolloLPAreaComments ? @"comments-disabled" : @"body-disabled");

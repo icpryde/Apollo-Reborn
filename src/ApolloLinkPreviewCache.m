@@ -1,6 +1,7 @@
 #import "ApolloLinkPreviewCache.h"
 
 #import <CommonCrypto/CommonDigest.h>
+#import <UIKit/UIKit.h>
 
 #import "ApolloCommon.h"
 
@@ -9,12 +10,15 @@ static const NSTimeInterval ApolloLinkPreviewNegativeTTL = 24.0 * 60.0 * 60.0;
 static const NSTimeInterval ApolloLinkPreviewDefaultTTL = 7.0 * 24.0 * 60.0 * 60.0;
 static const NSTimeInterval ApolloLinkPreviewRedditTTL = 24.0 * 60.0 * 60.0;
 static const NSTimeInterval ApolloLinkPreviewYouTubeTTL = 30.0 * 24.0 * 60.0 * 60.0;
+static const NSTimeInterval ApolloLinkPreviewCacheDiskFlushInterval = 8.0;
 
 @interface ApolloLinkPreviewCache ()
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSDictionary *> *entries;
 @property (nonatomic, strong) NSCache<NSString *, ApolloLinkPreview *> *memoryCache;
 @property (nonatomic, strong) dispatch_queue_t queue;
 @property (nonatomic, copy) NSString *cachePath;
+@property (nonatomic) BOOL diskDirty;
+@property (nonatomic) BOOL diskFlushScheduled;
 @end
 
 @implementation ApolloLinkPreviewCache
@@ -40,8 +44,41 @@ static const NSTimeInterval ApolloLinkPreviewYouTubeTTL = 30.0 * 24.0 * 60.0 * 6
         _cachePath = [cacheDirectory stringByAppendingPathComponent:@"com.apollo.linkpreviews.json"];
         _entries = [[self loadEntriesFromDisk] mutableCopy] ?: [NSMutableDictionary dictionary];
         ApolloLog(@"[LinkPreviews] cache init: %lu entries loaded", (unsigned long)_entries.count);
+
+        __weak typeof(self) weakSelf = self;
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidEnterBackgroundNotification
+                                                            object:nil
+                                                             queue:nil
+                                                        usingBlock:^(__unused NSNotification *note) {
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            dispatch_async(strongSelf.queue, ^{
+                [strongSelf flushDiskNowLocked];
+            });
+        }];
     }
     return self;
+}
+
+- (void)markDiskDirtyLocked {
+    self.diskDirty = YES;
+    if (self.diskFlushScheduled) return;
+    self.diskFlushScheduled = YES;
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(ApolloLinkPreviewCacheDiskFlushInterval * NSEC_PER_SEC)),
+                   self.queue, ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        strongSelf.diskFlushScheduled = NO;
+        [strongSelf flushDiskNowLocked];
+    });
+}
+
+- (void)flushDiskNowLocked {
+    if (!self.diskDirty) return;
+    self.diskDirty = NO;
+    [self writeEntriesToDiskLocked];
 }
 
 - (NSDictionary *)loadEntriesFromDisk {
@@ -108,7 +145,7 @@ static const NSTimeInterval ApolloLinkPreviewYouTubeTTL = 30.0 * 24.0 * 60.0 * 6
             self.entries[key] = updated;
         } else if (entry) {
             [self.entries removeObjectForKey:key];
-            [self writeEntriesToDiskLocked];
+            [self markDiskDirtyLocked];
             preview = nil;
         }
     });
@@ -136,7 +173,7 @@ static const NSTimeInterval ApolloLinkPreviewYouTubeTTL = 30.0 * 24.0 * 60.0 * 6
     dispatch_async(self.queue, ^{
         self.entries[key] = entry;
         [self evictIfNeededLocked];
-        [self writeEntriesToDiskLocked];
+        [self markDiskDirtyLocked];
     });
 }
 
@@ -150,6 +187,8 @@ static const NSTimeInterval ApolloLinkPreviewYouTubeTTL = 30.0 * 24.0 * 60.0 * 6
 - (void)flushCache {
     [self.memoryCache removeAllObjects];
     dispatch_async(self.queue, ^{
+        self.diskDirty = NO;
+        self.diskFlushScheduled = NO;
         NSUInteger removed = self.entries.count;
         [self.entries removeAllObjects];
         [[NSFileManager defaultManager] removeItemAtPath:self.cachePath error:nil];
