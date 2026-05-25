@@ -56,6 +56,27 @@ typedef NS_ENUM(NSInteger, Tag) {
 
 #pragma mark - Helpers
 
+- (UITextField *)apollo_textFieldInCell:(UITableViewCell *)cell {
+    for (UIView *subview in cell.contentView.subviews) {
+        if ([subview isKindOfClass:[UITextField class]]) {
+            return (UITextField *)subview;
+        }
+    }
+    return nil;
+}
+
+- (BOOL)apollo_isMaskedAPIKeyTag:(NSInteger)tag {
+    return tag == TagRedditClientId
+        || tag == TagRedditClientSecret
+        || tag == TagImgurClientId
+        || tag == TagImageChestAPIToken
+        || tag == TagGiphyAPIKey;
+}
+
+- (void)apollo_applySecureTextEntry:(BOOL)secure toCell:(UITableViewCell *)cell {
+    [self apollo_textFieldInCell:cell].secureTextEntry = secure;
+}
+
 - (NSArray<NSString *> *)registeredURLSchemes {
     NSArray *urlTypes = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleURLTypes"];
     NSMutableArray *schemes = [NSMutableArray array];
@@ -839,49 +860,47 @@ typedef NS_ENUM(NSInteger, Tag) {
 }
 
 - (UITableViewCell *)apiKeyCellForRow:(NSInteger)row tableView:(UITableView *)tableView {
+    UITableViewCell *cell = nil;
     switch (row) {
         case 0:
-            return [self textFieldCellWithIdentifier:@"Cell_API_Reddit"
+            cell = [self textFieldCellWithIdentifier:@"Cell_API_Reddit"
                                                label:@"Reddit API Key"
                                          placeholder:@"Reddit API Key"
                                                 text:sRedditClientId
                                                  tag:TagRedditClientId
                                            numerical:NO];
+            break;
         case 1:
-            return [self textFieldCellWithIdentifier:@"Cell_API_RedditSecret"
+            cell = [self textFieldCellWithIdentifier:@"Cell_API_RedditSecret"
                                                label:@"Reddit API Secret"
                                          placeholder:@"(usually empty)"
                                                 text:sRedditClientSecret
                                                  tag:TagRedditClientSecret
                                            numerical:NO];
+            break;
         case 2:
-            return [self textFieldCellWithIdentifier:@"Cell_API_Imgur"
+            cell = [self textFieldCellWithIdentifier:@"Cell_API_Imgur"
                                                label:@"Imgur API Key"
                                          placeholder:@"Imgur API Key"
                                                 text:sImgurClientId
                                                  tag:TagImgurClientId
                                            numerical:NO];
+            break;
         case 3:
-            return [self stackedTextFieldCellWithIdentifier:@"Cell_API_ImageChest"
+            cell = [self stackedTextFieldCellWithIdentifier:@"Cell_API_ImageChest"
                                                       label:@"Img Chest API Key"
                                                 placeholder:@"Img Chest API Key"
                                                        text:sImageChestAPIToken
                                                         tag:TagImageChestAPIToken];
-        case 4: {
-            UITableViewCell *cell = [self stackedTextFieldCellWithIdentifier:@"Cell_API_Giphy"
-                                                                       label:@"Giphy API Key"
-                                                                 placeholder:@"Giphy API Key"
-                                                                        text:[[NSUserDefaults standardUserDefaults] stringForKey:UDKeyGiphyAPIKey] ?: @""
-                                                                         tag:TagGiphyAPIKey
-                                                                      detail:@"Required for GIF picker. Get one at developers.giphy.com"];
-            for (UIView *subview in cell.contentView.subviews) {
-                if ([subview isKindOfClass:[UITextField class]]) {
-                    ((UITextField *)subview).secureTextEntry = YES;
-                    break;
-                }
-            }
-            return cell;
-        }
+            break;
+        case 4:
+            cell = [self stackedTextFieldCellWithIdentifier:@"Cell_API_Giphy"
+                                                      label:@"Giphy API Key"
+                                                placeholder:@"Giphy API Key"
+                                                       text:[[NSUserDefaults standardUserDefaults] stringForKey:UDKeyGiphyAPIKey] ?: @""
+                                                        tag:TagGiphyAPIKey
+                                                     detail:@"Required for GIF picker. Get one at developers.giphy.com"];
+            break;
         case 5: {
             NSString *schemesDetail = [NSString stringWithFormat:@"Must match the app whose API key you're using. URI scheme (part before ://) must be registered in Info.plist under CFBundleURLTypes. Registered: %@", [[self registeredURLSchemes] componentsJoinedByString:@", "]];
             UITableViewCell *cell = [self stackedTextFieldCellWithIdentifier:@"Cell_API_Redirect"
@@ -924,8 +943,11 @@ typedef NS_ENUM(NSInteger, Tag) {
             cell.textLabel.text = @"Instructions (old)";
             return cell;
         }
-        default: return [[UITableViewCell alloc] init];
+        default:
+            return [[UITableViewCell alloc] init];
     }
+    [self apollo_applySecureTextEntry:YES toCell:cell];
+    return cell;
 }
 
 - (UITableViewCell *)generalCellForRow:(NSInteger)row tableView:(UITableView *)tableView {
@@ -1663,6 +1685,12 @@ typedef NS_ENUM(NSInteger, Tag) {
     return YES;
 }
 
+- (void)textFieldDidBeginEditing:(UITextField *)textField {
+    if ([self apollo_isMaskedAPIKeyTag:textField.tag]) {
+        textField.secureTextEntry = NO;
+    }
+}
+
 - (void)textFieldDidEndEditing:(UITextField *)textField {
     if (textField.tag == TagRedditClientId) {
         textField.text = [textField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
@@ -1730,6 +1758,10 @@ typedef NS_ENUM(NSInteger, Tag) {
         NSString *trimmed = [textField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
         textField.text = trimmed;
         [[NSUserDefaults standardUserDefaults] setValue:trimmed forKey:UDKeyNotificationBackendRegistrationToken];
+    }
+
+    if ([self apollo_isMaskedAPIKeyTag:textField.tag]) {
+        textField.secureTextEntry = YES;
     }
 }
 
