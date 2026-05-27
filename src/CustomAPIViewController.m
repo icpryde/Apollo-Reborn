@@ -578,7 +578,7 @@ typedef NS_ENUM(NSInteger, Tag) {
 - (void)viewDidLoad {
     [super viewDidLoad];
 
-    self.title = @"Apollo Reborn Options";
+    self.title = @"Apollo Reborn";
     self.tableView.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
     [self apollo_disableAutoHideTabBarIdleIfUnsupported];
     [self apollo_applyTheme];
@@ -637,7 +637,7 @@ typedef NS_ENUM(NSInteger, Tag) {
     switch (section) {
         case SectionBackupRestore: return 2;
         case SectionAPIKeys: return 9; // 7 text fields + Can't sign in? + API key setup guide
-        case SectionGeneral: return 8;
+        case SectionGeneral: return 9;
         case SectionMedia: return (sShowUserAvatars ? 13 : 12) + (sEnableInlineImages ? 0 : -1);
         case SectionSubreddits: return 8;
         case SectionNotificationBackend: return 3; // URL + Registration Token + Test Connection
@@ -978,11 +978,16 @@ typedef NS_ENUM(NSInteger, Tag) {
                                                on:[defaults boolForKey:UDKeyCollapsePinnedComments]
                                            action:@selector(collapsePinnedCommentsSwitchToggled:)];
         case 3:
+            return [self switchCellWithIdentifier:@"Cell_Gen_ShowDeletedComments"
+                                            label:@"Show Deleted Comments"
+                                               on:[defaults boolForKey:UDKeyShowDeletedComments]
+                                           action:@selector(showDeletedCommentsSwitchToggled:)];
+        case 4:
             return [self switchCellWithIdentifier:@"Cell_Gen_RRThumbs"
                                             label:@"Recently Read Thumbnails"
                                                on:[defaults boolForKey:UDKeyShowRecentlyReadThumbnails]
                                            action:@selector(showRecentlyReadThumbnailsSwitchToggled:)];
-        case 4: {
+        case 5: {
             NSString *readPostMaxStr = sReadPostMaxCount > 0 ? [NSString stringWithFormat:@"%ld", (long)sReadPostMaxCount] : @"";
             return [self textFieldCellWithIdentifier:@"Cell_Gen_ReadMax"
                                                label:@"Recently Read Posts Limit"
@@ -991,17 +996,17 @@ typedef NS_ENUM(NSInteger, Tag) {
                                                  tag:TagReadPostMaxCount
                                            numerical:YES];
         }
-        case 5:
+        case 6:
             return [self switchCellWithIdentifier:@"Cell_Gen_FilterNSFWRR"
                                             label:@"Hide NSFW in Recently Read"
                                                on:[defaults boolForKey:UDKeyFilterNSFWRecentlyRead]
                                            action:@selector(filterNSFWRecentlyReadSwitchToggled:)];
-        case 6:
+        case 7:
             return [self switchCellWithIdentifier:@"Cell_Gen_SteamApp"
                                             label:@"Open Steam Links in App"
                                                on:[defaults boolForKey:UDKeyOpenLinksInSteamApp]
                                            action:@selector(steamAppSwitchToggled:)];
-        case 7: {
+        case 8: {
             BOOL idleSupported = [self apollo_supportsAutoHideTabBarIdleSetting];
             UITableViewCell *cell = [self switchCellWithIdentifier:@"Cell_Gen_TabBarIdle"
                                                              label:@"Tab Bar Re-Expands When Idle"
@@ -1735,12 +1740,12 @@ typedef NS_ENUM(NSInteger, Tag) {
             @"\t- **App description:** Apollo API Key *(or anything brief)*\n"
             @"5. Check the box to agree to the terms, then click **Create API Key**.\n"
             @"6. On your dashboard, click your new API key to copy it.\n"
-            @"7. Paste it into **Giphy API Key** under Apollo Reborn Options → API Keys.\n\n"
+            @"7. Paste it into **Giphy API Key** under Apollo Reborn → API Keys.\n\n"
             @"**Img Chest API Key**\n\n"
             @"1. Go to [imgchest.com](https://imgchest.com/) and click **Register** to create an account.\n"
             @"2. After signing in, open the menu from your profile picture and choose **API**.\n"
             @"3. Click **Create API Token**, give it a name, then click **Create**.\n"
-            @"4. Copy the token and paste it into **Img Chest API Key** under Apollo Reborn Options → API Keys.";
+            @"4. Copy the token and paste it into **Img Chest API Key** under Apollo Reborn → API Keys.";
 
         NSAttributedStringMarkdownParsingOptions *markdownOptions = [[NSAttributedStringMarkdownParsingOptions alloc] init];
         markdownOptions.interpretedSyntax = NSAttributedStringMarkdownInterpretedSyntaxInlineOnly;
@@ -1767,12 +1772,12 @@ typedef NS_ENUM(NSInteger, Tag) {
             @"   - App description: Apollo API Key (or anything brief)\n"
             @"5. Check the box to agree to the terms, then click Create API Key.\n"
             @"6. On your dashboard, click your new API key to copy it.\n"
-            @"7. Paste it into Giphy API Key under Apollo Reborn Options → API Keys.\n\n"
+            @"7. Paste it into Giphy API Key under Apollo Reborn → API Keys.\n\n"
             @"Img Chest API Key\n\n"
             @"1. Go to https://imgchest.com/ and click Register to create an account.\n"
             @"2. After signing in, open the menu from your profile picture and choose API.\n"
             @"3. Click Create API Token, give it a name, then click Create.\n"
-            @"4. Copy the token and paste it into Img Chest API Key under Apollo Reborn Options → API Keys.";
+            @"4. Copy the token and paste it into Img Chest API Key under Apollo Reborn → API Keys.";
     }
     textView.textColor = UIColor.labelColor;
     textView.textContainerInset = UIEdgeInsetsMake(16, 16, 16, 16);
@@ -1907,6 +1912,11 @@ typedef NS_ENUM(NSInteger, Tag) {
 
 - (void)collapsePinnedCommentsSwitchToggled:(UISwitch *)sender {
     [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyCollapsePinnedComments];
+}
+
+- (void)showDeletedCommentsSwitchToggled:(UISwitch *)sender {
+    sShowDeletedComments = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sShowDeletedComments forKey:UDKeyShowDeletedComments];
 }
 
 - (void)filterNSFWRecentlyReadSwitchToggled:(UISwitch *)sender {
