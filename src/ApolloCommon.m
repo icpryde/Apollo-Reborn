@@ -277,39 +277,58 @@ UIImage *ApolloEmojiSettingsIcon(NSString *emoji, UIColor *backgroundColor, CGFl
 }
 
 static NSString *ApolloBundledResourcePNGPath(NSString *resourceName) {
-    if (resourceName.length == 0) return nil;
+    return ApolloBundledResourcePath(resourceName, @"png");
+}
+
+NSString *ApolloBundledResourcePath(NSString *baseName, NSString *extension) {
+    if (baseName.length == 0) return nil;
 
     NSBundle *mainBundle = [NSBundle mainBundle];
-    NSString *bundledPath = [mainBundle pathForResource:resourceName
-                                                 ofType:@"png"
-                                            inDirectory:@"ApolloRebornResources"];
-    if (bundledPath.length > 0 && [[NSFileManager defaultManager] fileExistsAtPath:bundledPath]) {
-        return bundledPath;
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+
+    // inject-deb-local.sh: loose files in <App>.app/ApolloRebornResources/
+    NSString *path = [mainBundle pathForResource:baseName
+                                          ofType:extension
+                                     inDirectory:@"ApolloRebornResources"];
+    if (path.length > 0 && [fileManager fileExistsAtPath:path]) {
+        return path;
     }
 
-    bundledPath = [mainBundle pathForResource:resourceName ofType:@"png"];
-    if (bundledPath.length > 0 && [[NSFileManager defaultManager] fileExistsAtPath:bundledPath]) {
-        return bundledPath;
+    // cyan / azule / Sideloadly deb fuse: <App>.app/ApolloReborn.bundle/
+    NSString *innerBundlePath = [mainBundle.bundlePath stringByAppendingPathComponent:@"ApolloReborn.bundle"];
+    NSBundle *innerBundle = [NSBundle bundleWithPath:innerBundlePath];
+    path = [innerBundle pathForResource:baseName ofType:extension];
+    if (path.length > 0 && [fileManager fileExistsAtPath:path]) {
+        return path;
     }
 
+    // Loose at .app root
+    path = [mainBundle pathForResource:baseName ofType:extension];
+    if (path.length > 0 && [fileManager fileExistsAtPath:path]) {
+        return path;
+    }
+
+    // Jailbreak (rootful + rootless)
     NSArray<NSString *> *bundleRoots = @[
         @"/Library/Application Support/ApolloReborn/ApolloReborn.bundle",
         @"/var/jb/Library/Application Support/ApolloReborn/ApolloReborn.bundle",
     ];
     for (NSString *root in bundleRoots) {
         NSBundle *resourceBundle = [NSBundle bundleWithPath:root];
-        NSString *path = [resourceBundle pathForResource:resourceName ofType:@"png"];
-        if (path.length > 0 && [[NSFileManager defaultManager] fileExistsAtPath:path]) return path;
+        path = [resourceBundle pathForResource:baseName ofType:extension];
+        if (path.length > 0 && [fileManager fileExistsAtPath:path]) return path;
     }
 
-    NSString *fileName = [resourceName stringByAppendingPathExtension:@"png"];
+    NSString *fileName = extension.length > 0
+        ? [baseName stringByAppendingPathExtension:extension]
+        : baseName;
     NSArray<NSString *> *supportRoots = @[
         @"/Library/Application Support/ApolloReborn",
         @"/var/jb/Library/Application Support/ApolloReborn",
     ];
     for (NSString *root in supportRoots) {
-        NSString *path = [root stringByAppendingPathComponent:fileName];
-        if ([[NSFileManager defaultManager] fileExistsAtPath:path]) return path;
+        path = [root stringByAppendingPathComponent:fileName];
+        if ([fileManager fileExistsAtPath:path]) return path;
     }
     return nil;
 }

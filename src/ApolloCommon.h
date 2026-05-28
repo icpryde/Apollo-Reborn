@@ -20,6 +20,11 @@ UIImage *ApolloEmojiSettingsIcon(NSString *emoji, UIColor *backgroundColor, CGFl
 UIImage *ApolloBuyMeACoffeeSettingsIcon(CGFloat size);
 UIImage *ApolloRebornOptionsSettingsIcon(CGFloat size);
 
+// Resolve a path to a bundled tweak resource across the install layouts we
+// support (jailbreak rootful/rootless, Sideloadly/cyan/azule deb fuse, and
+// inject-deb-local.sh). Returns nil if no layout has the file.
+NSString *ApolloBundledResourcePath(NSString *baseName, NSString *extension);
+
 // Returns the URL string a LinkButtonNode is presenting, by reading either
 // the obj-c .url getter (older iOS) or the urlTextNode's attributed text
 // (iOS 26+ where the Swift URL ivar is no longer ObjC-bridged). May return

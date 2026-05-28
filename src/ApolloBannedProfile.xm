@@ -442,43 +442,10 @@ static void ApolloBannedProfileApplyHeaderSuspendedAppearance(UIViewController *
 
 static UIImage *sBannedProfileIconImage = nil;
 
-static NSString *ApolloBannedProfileResourcePath(NSString *filename) {
-    if (filename.length == 0) return nil;
-
-    NSBundle *mainBundle = [NSBundle mainBundle];
-    NSString *bundledPath = [mainBundle pathForResource:[filename stringByDeletingPathExtension]
-                                                 ofType:[filename pathExtension]
-                                            inDirectory:@"ApolloRebornResources"];
-    if (bundledPath.length > 0 && [[NSFileManager defaultManager] fileExistsAtPath:bundledPath]) {
-        return bundledPath;
-    }
-
-    NSArray<NSString *> *bundleRoots = @[
-        @"/Library/Application Support/ApolloReborn/ApolloReborn.bundle",
-        @"/var/jb/Library/Application Support/ApolloReborn/ApolloReborn.bundle",
-    ];
-    for (NSString *root in bundleRoots) {
-        NSBundle *resourceBundle = [NSBundle bundleWithPath:root];
-        NSString *path = [resourceBundle pathForResource:[filename stringByDeletingPathExtension]
-                                                  ofType:[filename pathExtension]];
-        if (path.length > 0 && [[NSFileManager defaultManager] fileExistsAtPath:path]) return path;
-    }
-
-    NSArray<NSString *> *supportRoots = @[
-        @"/Library/Application Support/ApolloReborn",
-        @"/var/jb/Library/Application Support/ApolloReborn",
-    ];
-    for (NSString *root in supportRoots) {
-        NSString *path = [root stringByAppendingPathComponent:filename];
-        if ([[NSFileManager defaultManager] fileExistsAtPath:path]) return path;
-    }
-    return nil;
-}
-
 UIImage *ApolloBannedProfileIconImage(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        NSString *path = ApolloBannedProfileResourcePath(@"reddit-alien_banned.png");
+        NSString *path = ApolloBundledResourcePath(@"reddit-alien_banned", @"png");
         if (path.length > 0) {
             sBannedProfileIconImage = [UIImage imageWithContentsOfFile:path];
         }
