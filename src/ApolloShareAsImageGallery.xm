@@ -140,6 +140,80 @@ static NSArray<NSURL *> *ApolloShareGalleryImageURLs(id link) {
     return urls.count >= 2 ? urls : nil;
 }
 
+#pragma mark - Single-poster (video / spoiler / NSFW) model extraction
+
+// Calls a 0-arg selector returning an object, guarded. Returns nil on miss.
+static id ApolloShareCall(id obj, SEL sel) {
+    if (!obj || !sel || ![obj respondsToSelector:sel]) return nil;
+    id result = nil;
+    @try {
+        result = ((id (*)(id, SEL))objc_msgSend)(obj, sel);
+    } @catch (__unused NSException *e) {}
+    return result;
+}
+
+// Calls a 0-arg selector returning a BOOL, guarded.
+static BOOL ApolloShareCallBool(id obj, SEL sel) {
+    if (!obj || !sel || ![obj respondsToSelector:sel]) return NO;
+    @try {
+        return ((BOOL (*)(id, SEL))objc_msgSend)(obj, sel);
+    } @catch (__unused NSException *e) { return NO; }
+}
+
+// YES if the link is a video post (direct or crossposted).
+static BOOL ApolloShareLinkHasVideo(id link) {
+    if (!link) return NO;
+    if (ApolloShareCall(link, @selector(video))) return YES;
+    if (ApolloShareCall(link, @selector(mediaVideo))) return YES;
+    if (ApolloShareCall(link, @selector(previewVideo))) return YES;
+    id parent = ApolloShareCall(link, @selector(crosspostParent));
+    if (parent && parent != link) {
+        if (ApolloShareCall(parent, @selector(video))) return YES;
+        if (ApolloShareCall(parent, @selector(mediaVideo))) return YES;
+    }
+    return NO;
+}
+
+// YES if the link is obscured (spoiler or NSFW) — the cases where Apollo hides
+// the media behind an overlay and we instead want the underlying still.
+static BOOL ApolloShareLinkIsObscured(id link) {
+    if (!link) return NO;
+    if (ApolloShareCallBool(link, @selector(isSpoiler))) return YES;
+    if (ApolloShareCallBool(link, @selector(spoiler))) return YES;
+    if (ApolloShareCallBool(link, @selector(isNSFW))) return YES;
+    if (ApolloShareCallBool(link, @selector(NSFW))) return YES;
+    return NO;
+}
+
+// Resolves the best still-image URL for a non-gallery media post: the preview
+// media's full-resolution source image, falling back to the low-res
+// thumbnailURL. Also tries the crosspost parent. Returns nil if none.
+static NSURL *ApolloShareResolvePosterURL(id link) {
+    if (!link) return nil;
+
+    id candidates[2] = { link, ApolloShareCall(link, @selector(crosspostParent)) };
+    for (int i = 0; i < 2; i++) {
+        id src = candidates[i];
+        if (!src) continue;
+
+        // previewMedia.sourceImage.URL — the real (un-obscured) source still.
+        id previewMedia = ApolloShareCall(src, @selector(previewMedia));
+        id sourceImage = ApolloShareCall(previewMedia, @selector(sourceImage));
+        id url = ApolloShareCall(sourceImage, @selector(URL));
+        if ([url isKindOfClass:[NSURL class]]) return (NSURL *)url;
+    }
+
+    // Fallback: low-res thumbnail.
+    id thumb = ApolloShareCall(link, @selector(thumbnailURL));
+    if ([thumb isKindOfClass:[NSURL class]]) {
+        NSURL *t = (NSURL *)thumb;
+        // Reddit uses sentinel strings ("default", "spoiler", "nsfw", "self")
+        // instead of real URLs when there's no thumbnail.
+        if (t.scheme.length > 0) return t;
+    }
+    return nil;
+}
+
 #pragma mark - Image fetch
 
 // Fetches every URL concurrently, preserving order. results[i] is a UIImage or
@@ -285,6 +359,44 @@ static UIImage *ApolloShareGalleryRenderCollage(NSArray *images, NSInteger total
     return collage;
 }
 
+// Renders a single still (video poster / spoiler image) as a full-width,
+// aspect-preserving, rounded-corner image to match Apollo's media card look.
+// Pass image == nil to draw a neutral grey placeholder at `aspect` (falls back
+// to 16:9 when aspect is unknown).
+static UIImage *ApolloShareGalleryRenderSingle(UIImage *image, CGSize aspect) {
+    const CGFloat width = kApolloShareGalleryContentWidth;
+
+    CGFloat ratio;
+    if (image && image.size.width > 0.0 && image.size.height > 0.0) {
+        ratio = image.size.height / image.size.width;
+    } else if (aspect.width > 0.0 && aspect.height > 0.0) {
+        ratio = aspect.height / aspect.width;
+    } else {
+        ratio = 9.0 / 16.0; // default landscape video poster
+    }
+    // Clamp to a sane card height range so tall/pano stills don't explode.
+    ratio = MAX(0.3, MIN(ratio, 1.6));
+    CGFloat height = round(width * ratio);
+
+    UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat defaultFormat];
+    format.opaque = NO;
+    format.scale = UIScreen.mainScreen.scale > 0.0 ? UIScreen.mainScreen.scale : 2.0;
+
+    CGSize canvas = CGSizeMake(width, height);
+    UIGraphicsImageRenderer *renderer =
+        [[UIGraphicsImageRenderer alloc] initWithSize:canvas format:format];
+
+    return [renderer imageWithActions:^(UIGraphicsImageRendererContext *rendererContext) {
+        CGContextRef ctx = rendererContext.CGContext;
+        UIBezierPath *clip = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, width, height)
+                                                        cornerRadius:kApolloShareGalleryCornerRadius];
+        CGContextSaveGState(ctx);
+        [clip addClip];
+        ApolloShareGalleryDrawAspectFill(image, CGRectMake(0, 0, width, height));
+        CGContextRestoreGState(ctx);
+    }];
+}
+
 #pragma mark - Apply / relayout
 
 // Installs `image` into the preview node via Apollo's own single-image path and
@@ -379,9 +491,96 @@ static UIImage *ApolloShareGalleryRenderPlaceholder(NSInteger totalCount) {
     return ApolloShareGalleryRenderCollage(blanks, totalCount);
 }
 
+// Reads a 0-arg selector returning a double, guarded.
+static double ApolloShareCallDouble(id obj, SEL sel) {
+    if (!obj || !sel || ![obj respondsToSelector:sel]) return 0.0;
+    @try {
+        return ((double (*)(id, SEL))objc_msgSend)(obj, sel);
+    } @catch (__unused NSException *e) { return 0.0; }
+}
+
+// Returns the source-image aspect (width,height) for a non-gallery media post,
+// or CGSizeZero when unknown. Used to size the single-still placeholder.
+static CGSize ApolloShareResolvePosterAspect(id link) {
+    id candidates[2] = { link, ApolloShareCall(link, @selector(crosspostParent)) };
+    for (int i = 0; i < 2; i++) {
+        id src = candidates[i];
+        if (!src) continue;
+        id previewMedia = ApolloShareCall(src, @selector(previewMedia));
+        id sourceImage = ApolloShareCall(previewMedia, @selector(sourceImage));
+        if (sourceImage) {
+            double w = ApolloShareCallDouble(sourceImage, @selector(width));
+            double h = ApolloShareCallDouble(sourceImage, @selector(height));
+            if (w > 0.0 && h > 0.0) return CGSizeMake(w, h);
+        }
+    }
+    return CGSizeZero;
+}
+
+// Handles the single-still cases (video posts, spoiler/NSFW media) where Apollo
+// leaves imageForImagePost nil and falls back to the compact link card. Fetches
+// the post's poster/source still and installs it (un-obscured) as a full-width
+// rounded image. Leaves genuine text/self/external-link posts untouched.
+static void ApolloShareGalleryPrepareSingle(id previewNode, id link) {
+    // Only act on cards Apollo didn't fill itself — never override a real image.
+    if (ApolloShareIvarObject(previewNode, "imageForImagePost") != nil) {
+        objc_setAssociatedObject(previewNode, &kApolloShareGalleryStateKey,
+                                 @(ApolloShareGalleryStateApplied),
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return;
+    }
+
+    BOOL hasVideo = ApolloShareLinkHasVideo(link);
+    BOOL obscured = ApolloShareLinkIsObscured(link);
+    NSURL *posterURL = (hasVideo || obscured) ? ApolloShareResolvePosterURL(link) : nil;
+    if (!posterURL) {
+        // Genuine link/text/self post (or no still available): keep the card.
+        objc_setAssociatedObject(previewNode, &kApolloShareGalleryStateKey,
+                                 @(ApolloShareGalleryStateApplied),
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return;
+    }
+
+    CGSize aspect = ApolloShareResolvePosterAspect(link);
+    ApolloLog(@"[ShareGallery] single poster node=%p video=%d obscured=%d url=%@ — placeholder + fetch",
+              previewNode, hasVideo, obscured, posterURL.absoluteString);
+
+    // Install a placeholder immediately so the link card never flashes.
+    UIImage *placeholder = ApolloShareGalleryRenderSingle(nil, aspect);
+    if (placeholder) {
+        ApolloShareGalleryInstallImageOnMain(previewNode, placeholder, NO);
+    } else {
+        objc_setAssociatedObject(previewNode, &kApolloShareGalleryStateKey,
+                                 @(ApolloShareGalleryStatePlaceholder),
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+
+    __weak id weakNode = previewNode;
+    ApolloShareGalleryFetchImages(@[posterURL], ^(NSArray *images) {
+        id strongNode = weakNode;
+        if (!strongNode) return;
+
+        UIImage *fetched = nil;
+        for (id img in images) {
+            if ([img isKindOfClass:[UIImage class]]) { fetched = (UIImage *)img; break; }
+        }
+        UIImage *single = fetched ? ApolloShareGalleryRenderSingle(fetched, aspect) : nil;
+        ApolloLog(@"[ShareGallery] single fetch complete node=%p ok=%d image=%@",
+                  strongNode, fetched != nil, single ? @"built" : @"nil");
+        if (single) {
+            ApolloShareGalleryInstallImageOnMain(strongNode, single, YES);
+        } else {
+            objc_setAssociatedObject(strongNode, &kApolloShareGalleryStateKey,
+                                     @(ApolloShareGalleryStateApplied),
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+    });
+}
+
 // Examines a preview node once: if it's a gallery, immediately installs a
 // placeholder grid (so the link card never flashes), then fetches the real
-// images and swaps in the finished collage. Safe to call repeatedly
+// images and swaps in the finished collage. Non-gallery video/spoiler/NSFW
+// media is routed to the single-still handler. Safe to call repeatedly
 // (state-guarded) and from Texture's background layout thread.
 static void ApolloShareGalleryPrepare(id previewNode) {
     if (!previewNode) return;
@@ -394,11 +593,10 @@ static void ApolloShareGalleryPrepare(id previewNode) {
     id link = ApolloShareIvarObject(previewNode, "link");
     NSArray<NSURL *> *urls = ApolloShareGalleryImageURLs(link);
     if (urls.count < 2) {
-        // Not a multi-image gallery; mark applied to avoid re-checking every
-        // layout pass (cheap idempotency without a separate flag).
-        objc_setAssociatedObject(previewNode, &kApolloShareGalleryStateKey,
-                                 @(ApolloShareGalleryStateApplied),
-                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        // Not a multi-image gallery — try the single-still path (video /
+        // spoiler / NSFW). That handler decides whether to act or leave the
+        // card and sets the state accordingly.
+        ApolloShareGalleryPrepareSingle(previewNode, link);
         return;
     }
 
