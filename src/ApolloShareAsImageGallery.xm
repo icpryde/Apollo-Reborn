@@ -590,6 +590,19 @@ static void ApolloShareGalleryPrepare(id previewNode) {
                                              : ApolloShareGalleryStateNone;
     if (state != ApolloShareGalleryStateNone) return; // already placeholder/applied
 
+    // Comment-share mode: when the user is sharing a COMMENT (not the post),
+    // the node still carries the post's `link` ivar, but the shared image
+    // should be the comment itself — not the post's gallery/video/spoiler
+    // media. Injecting imageForImagePost here is what made the post images
+    // leak into comment shares, so leave Apollo's native comment rendering
+    // completely alone in this mode.
+    if (ApolloShareIvarObject(previewNode, "comment") != nil) {
+        objc_setAssociatedObject(previewNode, &kApolloShareGalleryStateKey,
+                                 @(ApolloShareGalleryStateApplied),
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return;
+    }
+
     id link = ApolloShareIvarObject(previewNode, "link");
     NSArray<NSURL *> *urls = ApolloShareGalleryImageURLs(link);
     if (urls.count < 2) {
