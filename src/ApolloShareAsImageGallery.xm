@@ -23,12 +23,11 @@
 #import <objc/message.h>
 #import "ApolloCommon.h"
 
-// ASSizeRange is { CGSize min; CGSize max; } — replicated so we can match the
-// -layoutSpecThatFits: selector ABI without pulling in AsyncDisplayKit headers.
-typedef struct ApolloASSizeRange {
-    CGSize min;
-    CGSize max;
-} ApolloASSizeRange;
+// ASSizeRange is { CGSize min; CGSize max; }. The rest of the repo matches the
+// -layoutSpecThatFits: selector ABI with `struct CDStruct_90e057aa` from the
+// class-dumped headers (see ApolloInlineImages.xm / ApolloInlineLinkPreviews.xm),
+// so reuse that name here for consistency.
+struct CDStruct_90e057aa { CGSize min; CGSize max; };
 
 // Per-preview-node state. Stored as an associated NSNumber on the node.
 typedef NS_ENUM(NSInteger, ApolloShareGalleryState) {
@@ -37,9 +36,12 @@ typedef NS_ENUM(NSInteger, ApolloShareGalleryState) {
     ApolloShareGalleryStateApplied,    // real collage injected, leave ivars as-is
 };
 
-static const char kApolloShareGalleryStateKey = 0;     // NSNumber(ApolloShareGalleryState)
-static const char kApolloShareGalleryCollageKey = 0;   // strong UIImage (collage)
-static const char kApolloShareGalleryImageNodeKey = 0; // strong ASImageNode
+// Associated-object keys. The repo idiom is `static char kKey;` (no const, no
+// initializer): only their addresses matter, and this form avoids any chance of
+// identical-valued const objects being merged/aliased under -fmerge-all-constants.
+static char kApolloShareGalleryStateKey;     // NSNumber(ApolloShareGalleryState)
+static char kApolloShareGalleryCollageKey;   // strong UIImage (collage)
+static char kApolloShareGalleryImageNodeKey; // strong ASImageNode
 
 // Visual constants for the collage. Point dimensions; rendered at screen scale.
 static const CGFloat kApolloShareGalleryContentWidth = 320.0;
@@ -68,6 +70,14 @@ static id ApolloShareIvarObject(id obj, const char *name) {
 // To balance that future release we CFRetain the new value (so the slot truly
 // owns +1), and CFRelease whatever was already in the slot (we're taking over
 // its ownership). This mirrors what an ARC strong-property setter does.
+//
+// NOTE: this balance intentionally relies on object_setIvar performing a RAW
+// store (no ARC retain/release) for these Swift `strong` ivars, which holds
+// while the runtime reports their memory management as "unknown". If a future
+// Swift/ObjC runtime ever reports them as strong, object_setIvar would itself
+// objc_storeStrong (retain new / release old), and the CFRetain/CFRelease here
+// would over-release `previous`. Re-check this assumption if it ever regresses
+// across iOS versions.
 static void ApolloShareSetIvarObject(id obj, const char *name, id value) {
     if (!obj || !name) return;
     Ivar ivar = class_getInstanceVariable(object_getClass(obj), name);
@@ -86,11 +96,13 @@ static void ApolloShareSetIvarBool(id obj, const char *name, BOOL value) {
     if (!obj || !name) return;
     Ivar ivar = class_getInstanceVariable(object_getClass(obj), name);
     if (!ivar) return;
+    // Safety here comes from the class_getInstanceVariable lookup above: a valid
+    // Ivar guarantees an in-bounds offset for this object. A raw out-of-bounds
+    // store would raise SIGSEGV/SIGBUS, which @try/@catch cannot intercept, so
+    // there is no exception guard to add — the lookup is the real safeguard.
     ptrdiff_t offset = ivar_getOffset(ivar);
-    @try {
-        unsigned char *base = (unsigned char *)(__bridge void *)obj;
-        base[offset] = value ? 1 : 0;
-    } @catch (__unused NSException *e) {}
+    unsigned char *base = (unsigned char *)(__bridge void *)obj;
+    base[offset] = value ? 1 : 0;
 }
 
 #pragma mark - Gallery model extraction
@@ -545,6 +557,13 @@ static void ApolloShareGalleryPrepareSingle(id previewNode, id link) {
     ApolloLog(@"[ShareGallery] single poster node=%p video=%d obscured=%d url=%@ — placeholder + fetch",
               previewNode, hasVideo, obscured, posterURL.absoluteString);
 
+    // Close the re-entrancy window (see ApolloShareGalleryPrepare): flip the
+    // state to Placeholder synchronously, on this (background layout) thread,
+    // BEFORE the async install + fetch. Associated-object writes are thread-safe.
+    objc_setAssociatedObject(previewNode, &kApolloShareGalleryStateKey,
+                             @(ApolloShareGalleryStatePlaceholder),
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
     // Install a placeholder immediately so the link card never flashes.
     UIImage *placeholder = ApolloShareGalleryRenderSingle(nil, aspect);
     if (placeholder) {
@@ -617,8 +636,20 @@ static void ApolloShareGalleryPrepare(id previewNode) {
     ApolloLog(@"[ShareGallery] gallery detected node=%p items=%ld — placeholder + fetch",
               previewNode, (long)totalCount);
 
+    // Close the re-entrancy window: flip to Placeholder synchronously here,
+    // BEFORE dispatching the install or starting the fetch.
+    // ApolloShareGalleryInstallImageOnMain also writes this state, but it does
+    // so asynchronously on the main queue; layoutSpecThatFits: runs on Texture's
+    // background layout threads and can fire several times in quick succession,
+    // so without this synchronous write a second pass could slip past the state
+    // guard at the top and launch a duplicate ApolloShareGalleryFetchImages
+    // (N more network requests). objc_setAssociatedObject is thread-safe.
+    objc_setAssociatedObject(previewNode, &kApolloShareGalleryStateKey,
+                             @(ApolloShareGalleryStatePlaceholder),
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
     // Install the placeholder grid right away so the compact link card is never
-    // shown. This also flips the state to Placeholder, blocking re-entry.
+    // shown.
     UIImage *placeholder = ApolloShareGalleryRenderPlaceholder(totalCount);
     if (placeholder) {
         ApolloShareGalleryInstallImageOnMain(previewNode, placeholder, NO);
@@ -654,7 +685,7 @@ static void ApolloShareGalleryPrepare(id previewNode) {
 
 %hook _TtC6Apollo22SaveAsImagePreviewNode
 
-- (id)layoutSpecThatFits:(ApolloASSizeRange)constrainedSize {
+- (id)layoutSpecThatFits:(struct CDStruct_90e057aa)constrainedSize {
     ApolloShareGalleryPrepare(self);
     return %orig;
 }
