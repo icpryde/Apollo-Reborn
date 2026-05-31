@@ -68,6 +68,7 @@ typedef NS_ENUM(unsigned char, ApolloFeedStackAlign) {
 - (void)setNeedsLayout;
 - (id)style;
 - (UIView *)view;
+- (CALayer *)layer;
 - (BOOL)isNodeLoaded;
 @property (nonatomic) BOOL userInteractionEnabled;
 @property (nonatomic, getter=isHidden) BOOL hidden;
@@ -85,7 +86,8 @@ typedef NS_ENUM(unsigned char, ApolloFeedStackAlign) {
 @property (nonatomic) CGFloat cornerRadius;
 @property (nonatomic) BOOL clipsToBounds;
 @property (nullable, nonatomic, copy) UIColor *placeholderColor;
-@property (nonatomic) BOOL placeholderEnabled;
+@property (nonatomic) BOOL placeholderEnabled;@property (nonatomic) NSTimeInterval placeholderFadeDuration;
+@property (nonatomic, weak) id delegate;
 @end
 
 @interface ASLayoutSpec : NSObject
@@ -135,6 +137,51 @@ static char kApolloFeedThumbRatioKey;
 // Associated-object: the ASNetworkImageNode we inject into a RichMediaNode's
 // layout for large-mode text/link posts (created once per node, reused).
 static char kApolloFeedHeroNodeKey;
+
+// Shared ASNetworkImageNode delegate that fades the hero image in once it
+// finishes loading. ASNetworkImageNode's placeholderFadeDuration only fades the
+// (near-transparent) placeholder layer out, so the downloaded image still
+// "pops" in. We add an explicit one-shot opacity animation on the node's layer
+// when the image lands, which reads as a real fade regardless of cache hits.
+@interface ApolloFeedHeroFadeDelegate : NSObject
+@end
+
+@implementation ApolloFeedHeroFadeDelegate
++ (instancetype)shared {
+    static ApolloFeedHeroFadeDelegate *sShared = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ sShared = [[ApolloFeedHeroFadeDelegate alloc] init]; });
+    return sShared;
+}
+
+- (void)fadeInNode:(id)node {
+    if (!node) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            ASDisplayNode *n = (ASDisplayNode *)node;
+            if (![n isNodeLoaded]) return;
+            CALayer *layer = [n layer];
+            if (!layer) return;
+            CABasicAnimation *fade = [CABasicAnimation animationWithKeyPath:@"opacity"];
+            fade.fromValue = @0.0;
+            fade.toValue = @1.0;
+            fade.duration = 0.3;
+            fade.removedOnCompletion = YES;
+            [layer addAnimation:fade forKey:@"apolloFeedHeroFade"];
+        } @catch (__unused NSException *e) {}
+    });
+}
+
+// Older delegate selector (image arg only).
+- (void)imageNode:(id)node didLoadImage:(id)image {
+    if (image) [self fadeInNode:node];
+}
+
+// Newer delegate selector (with info).
+- (void)imageNode:(id)node didLoadImage:(id)image info:(id)info {
+    if (image) [self fadeInNode:node];
+}
+@end
 
 // Master switch (always on for now; eligibility gate keeps it scoped).
 static BOOL sEnableFeedTextThumbnails = YES;
@@ -589,6 +636,15 @@ static void ApolloFeedReapplyCleanup(id node, BOOL triggerLayout) {
             return origSpec;
         }
 
+        // Inject the hero at its known aspect-ratio size on this very first
+        // layout pass. The ratio is resolved synchronously up front from the
+        // post's media metadata (see kApolloFeedThumbRatioKey), so the cell is
+        // its final height immediately — we never grow the cell after the table
+        // has settled. This is critical: any post-settle height change here
+        // would retrigger PostsViewController.viewDidLayoutSubviews and churn
+        // the subreddit banner header, which is what made the banner placeholder
+        // skip and the banner pop in after the feed.
+
         // The hero now shows the embedded image, so hide the redundant bare link
         // card and strip the raw image URL from the preview text. We are inside a
         // layout pass here, so do NOT trigger a relayout (would loop the main
@@ -609,8 +665,27 @@ static void ApolloFeedReapplyCleanup(id node, BOOL triggerLayout) {
                 hero.contentMode = UIViewContentModeScaleAspectFill;
                 hero.clipsToBounds = YES;
                 hero.cornerRadius = 10.0;
+                // Keep the reserved hero area transparent so it blends with the
+                // post card (any theme) instead of flashing a bright/grey box
+                // while the image downloads.
+                hero.backgroundColor = [UIColor clearColor];
                 if ([hero respondsToSelector:@selector(setPlaceholderEnabled:)]) {
                     hero.placeholderEnabled = YES;
+                }
+                // Faint translucent placeholder (theme-agnostic) rather than a
+                // hard light box, matching Apollo's own image-node placeholders.
+                if ([hero respondsToSelector:@selector(setPlaceholderColor:)]) {
+                    hero.placeholderColor = [UIColor colorWithWhite:1.0 alpha:0.04];
+                }
+                // Cross-fade the downloaded image in instead of popping.
+                if ([hero respondsToSelector:@selector(setPlaceholderFadeDuration:)]) {
+                    hero.placeholderFadeDuration = 0.3;
+                }
+                // Explicit opacity fade-in once the image lands, so the fade is
+                // perceptible even on cache hits (placeholder alone is nearly
+                // transparent and wouldn't read as a fade).
+                if ([hero respondsToSelector:@selector(setDelegate:)]) {
+                    hero.delegate = [ApolloFeedHeroFadeDelegate shared];
                 }
             } @catch (__unused NSException *e) {}
             [(ASDisplayNode *)self addSubnode:hero];
