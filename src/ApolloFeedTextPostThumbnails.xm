@@ -386,11 +386,14 @@ static NSURL *ApolloFeedThumbnailURLForLink(RDKLink *link) {
         NSDictionary *mm = link.mediaMetadata;
         NSString *st = link.selfText;
         if (isSelf) {
-            // For self/text posts we always try to surface the first embedded
-            // image — even when the link reports "native" media, because Apollo
-            // deliberately refuses to render a thumbnail for self posts.
-            // Priority: media_metadata > selftext link > link.URL > thumbnailURL
-            // > previewMedia.sourceImage.
+            // For self/text posts we only surface an image that actually lives
+            // in the post itself: an embedded media_metadata image, or a direct
+            // image URL pasted in the body / used as the link target. We do NOT
+            // use Apollo's scraped link preview (thumbnailURL / previewMedia
+            // sourceImage) — those are low-res website OG images that look awful
+            // blown up as a hero. A post that only contains a non-image link
+            // should just render as a normal text post (no thumbnail).
+            // Priority: media_metadata > selftext image link > link.URL image.
             result = ApolloFeedThumbURLFromMediaMetadata(mm, st, &ratio);
             if (!result) result = ApolloFeedThumbURLFromSelfText(st);
             if (!result) {
@@ -398,37 +401,6 @@ static NSURL *ApolloFeedThumbnailURLForLink(RDKLink *link) {
                 if ([u isKindOfClass:[NSURL class]] &&
                     ApolloFeedIsDirectImageURLString(u.absoluteString)) {
                     result = u;
-                }
-            }
-            if (!result) {
-                NSURL *t = link.thumbnailURL;
-                if ([t isKindOfClass:[NSURL class]]) {
-                    NSString *scheme = t.scheme.lowercaseString;
-                    if ([scheme isEqualToString:@"http"] || [scheme isEqualToString:@"https"]) {
-                        result = t;
-                    }
-                }
-            }
-            // previewMedia.sourceImage gives both a URL and reliable dimensions.
-            id pm = link.previewMedia;
-            if (pm) {
-                id src = nil;
-                @try { src = [pm valueForKey:@"sourceImage"]; } @catch (__unused NSException *e) {}
-                if (src) {
-                    NSURL *su = nil;
-                    @try { su = [src valueForKey:@"URL"]; } @catch (__unused NSException *e) {}
-                    double w = 0, h = 0;
-                    @try { w = [[src valueForKey:@"width"] doubleValue]; } @catch (__unused NSException *e) {}
-                    @try { h = [[src valueForKey:@"height"] doubleValue]; } @catch (__unused NSException *e) {}
-                    if (!result && [su isKindOfClass:[NSURL class]]) {
-                        NSString *scheme = su.scheme.lowercaseString;
-                        if ([scheme isEqualToString:@"http"] || [scheme isEqualToString:@"https"]) {
-                            result = su;
-                        }
-                    }
-                    // Only adopt this aspect ratio if we didn't already derive
-                    // one from the chosen media_metadata image.
-                    if (ratio <= 0.0 && w > 0 && h > 0) ratio = (CGFloat)(h / w);
                 }
             }
         }
