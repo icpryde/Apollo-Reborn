@@ -18,6 +18,14 @@ FOUNDATION_EXPORT NSString *ApolloSubredditFormattedMemberCount(NSInteger subscr
 @property(nonatomic) NSInteger subscriberCount;
 @property(nonatomic, strong) NSDate *fetchedAt;
 
+// Comment media permissions, derived from `allowed_media_in_comments` on the
+// subreddit's about.json. `commentMediaInfoAvailable` is NO for entries fetched
+// before this field was captured (older disk cache) — callers should treat that
+// as "unknown" and fail open while triggering a refetch.
+@property(nonatomic) BOOL commentMediaInfoAvailable;
+@property(nonatomic) BOOL allowsImageComments; // uploaded images/gifs ("static"/"animated")
+@property(nonatomic) BOOL allowsGifComments;   // Giphy GIFs ("giphy")
+
 - (instancetype)initWithSubredditName:(NSString *)subredditName
                           displayName:(NSString *)displayName
                             aboutText:(NSString *)aboutText
@@ -35,6 +43,11 @@ FOUNDATION_EXPORT NSString *ApolloSubredditFormattedMemberCount(NSInteger subscr
 - (ApolloSubredditInfo *)cachedInfoForSubreddit:(NSString *)subredditName;
 - (void)requestInfoForSubreddit:(NSString *)subredditName completion:(void (^)(ApolloSubredditInfo *info))completion;
 - (void)refetchInfoForSubreddit:(NSString *)subredditName completion:(void (^)(ApolloSubredditInfo *info))completion;
+
+// Like -requestInfoForSubreddit:, but guarantees the returned info carries
+// comment-media permissions: if a cached entry predates that field it forces a
+// refetch instead of returning stale data.
+- (void)requestCommentMediaInfoForSubreddit:(NSString *)subredditName completion:(void (^)(ApolloSubredditInfo *info))completion;
 - (void)clearAllCaches;
 
 @end

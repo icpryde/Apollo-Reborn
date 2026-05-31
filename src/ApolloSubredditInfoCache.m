@@ -142,6 +142,11 @@ NSString *ApolloSubredditFormattedMemberCount(NSInteger subscriberCount) {
     if (info.subscriberCount >= 0) {
         dict[@"subscriberCount"] = @(info.subscriberCount);
     }
+    if (info.commentMediaInfoAvailable) {
+        dict[@"commentMediaInfoAvailable"] = @(YES);
+        dict[@"allowsImageComments"] = @(info.allowsImageComments);
+        dict[@"allowsGifComments"] = @(info.allowsGifComments);
+    }
     return dict;
 }
 
@@ -164,13 +169,17 @@ NSString *ApolloSubredditFormattedMemberCount(NSInteger subscriberCount) {
     NSDate *fetchedAt = timestamp > 0 ? [NSDate dateWithTimeIntervalSince1970:timestamp] : [NSDate distantPast];
     if (!dict[@"displayName"] && !dict[@"aboutText"]) fetchedAt = [NSDate distantPast];
 
-    return [[ApolloSubredditInfo alloc] initWithSubredditName:subredditName
+    ApolloSubredditInfo *info = [[ApolloSubredditInfo alloc] initWithSubredditName:subredditName
                                                   displayName:displayName
                                                     aboutText:aboutText
                                                       iconURL:iconURL
                                                     bannerURL:bannerURL
                                               subscriberCount:subscriberCount
                                                     fetchedAt:fetchedAt];
+    info.commentMediaInfoAvailable = [dict[@"commentMediaInfoAvailable"] boolValue];
+    info.allowsImageComments = [dict[@"allowsImageComments"] boolValue];
+    info.allowsGifComments = [dict[@"allowsGifComments"] boolValue];
+    return info;
 }
 
 - (void)pruneDiskInfoLocked {
@@ -283,13 +292,34 @@ NSString *ApolloSubredditFormattedMemberCount(NSInteger subscriberCount) {
         subscriberCount = [subscriberValue integerValue];
     }
 
-    return [[ApolloSubredditInfo alloc] initWithSubredditName:subredditName
+    ApolloSubredditInfo *info = [[ApolloSubredditInfo alloc] initWithSubredditName:subredditName
                                                   displayName:displayName
                                                     aboutText:aboutText
                                                       iconURL:iconURL
                                                     bannerURL:bannerURL
                                               subscriberCount:subscriberCount
                                                     fetchedAt:[NSDate date]];
+
+    // `allowed_media_in_comments` is an array of permitted media kinds for
+    // comments. Absent/empty means no media is allowed. Values seen in the wild:
+    // "static" (uploaded images), "animated" (uploaded gifs), "giphy" (Giphy
+    // GIFs), "expression" (collectibles). The image-upload button covers
+    // static/animated; the Giphy button covers giphy.
+    id mediaValue = dataDict[@"allowed_media_in_comments"];
+    if ([mediaValue isKindOfClass:[NSArray class]]) {
+        info.commentMediaInfoAvailable = YES;
+        for (id entry in (NSArray *)mediaValue) {
+            if (![entry isKindOfClass:[NSString class]]) continue;
+            NSString *kind = [(NSString *)entry lowercaseString];
+            if ([kind isEqualToString:@"static"] || [kind isEqualToString:@"animated"]) {
+                info.allowsImageComments = YES;
+            } else if ([kind isEqualToString:@"giphy"]) {
+                info.allowsGifComments = YES;
+            }
+        }
+    }
+
+    return info;
 }
 
 - (void)finishRequestForKey:(NSString *)key info:(ApolloSubredditInfo *)info {
@@ -354,6 +384,18 @@ NSString *ApolloSubredditFormattedMemberCount(NSInteger subscriberCount) {
 
 - (void)refetchInfoForSubreddit:(NSString *)subredditName completion:(void (^)(ApolloSubredditInfo *info))completion {
     [self enqueueRequestForSubreddit:subredditName forceRefresh:YES completion:completion];
+}
+
+- (void)requestCommentMediaInfoForSubreddit:(NSString *)subredditName completion:(void (^)(ApolloSubredditInfo *info))completion {
+    ApolloSubredditInfo *cached = [self cachedInfoForSubreddit:subredditName];
+    if (cached && [self isFreshInfo:cached] && cached.commentMediaInfoAvailable) {
+        if (completion) completion(cached);
+        return;
+    }
+    // Fresh entry missing the comment-media field (older disk cache) → force a
+    // refetch so we don't keep serving incomplete data.
+    BOOL forceRefresh = (cached != nil && !cached.commentMediaInfoAvailable);
+    [self enqueueRequestForSubreddit:subredditName forceRefresh:forceRefresh completion:completion];
 }
 
 - (void)clearAllCaches {
