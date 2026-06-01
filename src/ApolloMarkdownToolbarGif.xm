@@ -57,6 +57,9 @@ static ApolloMarkdownGifTapTarget *sApolloMarkdownGifTapTarget;
 static BOOL sApolloMarkdownGifInstalled = NO;
 static BOOL sApolloMarkdownGifInjecting = NO;
 static BOOL sApolloMarkdownGifKeyboardVisible = NO;
+// Last known keyboard end frame in screen coordinates, captured from the keyboard
+// notifications so the gating toast can position itself just above the keyboard.
+static CGRect sApolloMarkdownGifKeyboardFrameEnd = (CGRect){ {0, 0}, {0, 0} };
 
 static void ApolloMarkdownGifCancelPendingInjections(UIViewController *composeController);
 static void ApolloMarkdownGifPresentMissingAPIKeyAlert(UIViewController *composeController);
@@ -1136,7 +1139,7 @@ static void ApolloMarkdownGifShowGatingToastImpl(UIViewController *host, NSStrin
     label.translatesAutoresizingMaskIntoConstraints = NO;
     [bubble addSubview:label];
 
-    [NSLayoutConstraint activateConstraints:@[
+    NSMutableArray<NSLayoutConstraint *> *constraints = [@[
         [label.topAnchor constraintEqualToAnchor:bubble.topAnchor constant:10.0],
         [label.bottomAnchor constraintEqualToAnchor:bubble.bottomAnchor constant:-10.0],
         [label.leadingAnchor constraintEqualToAnchor:bubble.leadingAnchor constant:16.0],
@@ -1144,8 +1147,36 @@ static void ApolloMarkdownGifShowGatingToastImpl(UIViewController *host, NSStrin
         [bubble.centerXAnchor constraintEqualToAnchor:window.centerXAnchor],
         [bubble.leadingAnchor constraintGreaterThanOrEqualToAnchor:window.safeAreaLayoutGuide.leadingAnchor constant:24.0],
         [bubble.trailingAnchor constraintLessThanOrEqualToAnchor:window.safeAreaLayoutGuide.trailingAnchor constant:-24.0],
-        [bubble.bottomAnchor constraintEqualToAnchor:window.safeAreaLayoutGuide.bottomAnchor constant:-100.0],
-    ]];
+    ] mutableCopy];
+
+    // Position the toast just above the keyboard. The compose UI is a sheet and
+    // the markdown toolbar/keyboard live in a separate input-accessory window, so
+    // window.keyboardLayoutGuide does not track them reliably here. Instead use
+    // the captured keyboard end frame, converted into this window's coordinate
+    // space, and pin the bubble above the keyboard top. The keyboard frame does
+    // NOT include the markdown toolbar (input accessory) that sits on top of the
+    // keyboard, so clear that toolbar's height plus padding to avoid covering it.
+    // When the keyboard is hidden, fall back to the bottom safe area.
+    const CGFloat kApolloMarkdownGifToastToolbarClearance = 64.0;
+    CGFloat bubbleBottomInWindow = -1.0;
+    if (sApolloMarkdownGifKeyboardVisible && !CGRectIsEmpty(sApolloMarkdownGifKeyboardFrameEnd)) {
+        CGRect kbInWindow = [window convertRect:sApolloMarkdownGifKeyboardFrameEnd fromWindow:nil];
+        CGFloat windowHeight = CGRectGetHeight(window.bounds);
+        // A hidden keyboard reports a frame at or below the bottom of the window;
+        // only treat it as on-screen when its top sits above the window bottom.
+        if (CGRectGetMinY(kbInWindow) < windowHeight - 1.0) {
+            bubbleBottomInWindow = CGRectGetMinY(kbInWindow) - kApolloMarkdownGifToastToolbarClearance;
+        }
+    }
+    if (bubbleBottomInWindow > 0.0) {
+        [constraints addObject:
+            [bubble.bottomAnchor constraintEqualToAnchor:window.topAnchor constant:bubbleBottomInWindow]];
+    } else {
+        [constraints addObject:
+            [bubble.bottomAnchor constraintEqualToAnchor:window.safeAreaLayoutGuide.bottomAnchor constant:-12.0]];
+    }
+
+    [NSLayoutConstraint activateConstraints:constraints];
 
     [UIView animateWithDuration:0.25 animations:^{
         bubble.alpha = 1.0;
@@ -1417,13 +1448,17 @@ static void ApolloMarkdownGifThrottledTryInject(UIViewController *controller, NS
     (void)reason;
 }
 
-static void ApolloMarkdownGifKeyboardShown(__unused NSNotification *note) {
+static void ApolloMarkdownGifKeyboardShown(NSNotification *note) {
     sApolloMarkdownGifKeyboardVisible = YES;
+    NSValue *frameValue = note.userInfo[UIKeyboardFrameEndUserInfoKey];
+    if (frameValue) sApolloMarkdownGifKeyboardFrameEnd = frameValue.CGRectValue;
     ApolloMarkdownGifScheduleInjection(ApolloMarkdownGifActiveComposeController(), @"keyboard");
 }
 
-static void ApolloMarkdownGifKeyboardHidden(__unused NSNotification *note) {
+static void ApolloMarkdownGifKeyboardHidden(NSNotification *note) {
     sApolloMarkdownGifKeyboardVisible = NO;
+    NSValue *frameValue = note.userInfo[UIKeyboardFrameEndUserInfoKey];
+    if (frameValue) sApolloMarkdownGifKeyboardFrameEnd = frameValue.CGRectValue;
 }
 
 static UIViewController *ApolloMarkdownGifComposeControllerForTextView(UITextView *textView) {
