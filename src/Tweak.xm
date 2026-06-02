@@ -974,6 +974,7 @@ static void initializeRandomSources() {
                                     UDKeyModernSubredditDividers: @YES,
                                     UDKeyShowDeletedComments: @NO,
                                     UDKeyTapToRevealDeletedComments: @NO,
+                                    UDKeyEnableFlairColors: @NO,
                                     UDKeyShowRecentlyReadThumbnails: @YES,
                                     UDKeyPreferredGIFFallbackFormat: @1,
                                     UDKeyUnmuteCommentsVideos: @0,
@@ -1059,6 +1060,7 @@ static void initializeRandomSources() {
     sAutoHideTabBarShowOnIdle = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyAutoHideTabBarShowOnIdle];
     sModernSubredditDividers = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyModernSubredditDividers];
     sSubredditListEnhancements = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeySubredditListEnhancements];
+    sEnableFlairColors = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyEnableFlairColors];
     sEnableBulkTranslation = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyEnableBulkTranslation];
     sAutoTranslateOnAppear = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyAutoTranslateOnAppear];
     sTranslatePostTitles = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyTranslatePostTitles];

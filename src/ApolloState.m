@@ -28,6 +28,7 @@ BOOL sShowSubredditHeaders = NO;
 BOOL sAutoHideTabBarShowOnIdle = NO;
 BOOL sModernSubredditDividers = YES;
 BOOL sSubredditListEnhancements = YES;
+BOOL sEnableFlairColors = NO;
 BOOL sEnableInlineImages = NO;
 NSInteger sInlineImageAlignment = ApolloInlineImageAlignmentCenter;
 NSInteger sLinkPreviewBodyMode = ApolloLinkPreviewModeOff;

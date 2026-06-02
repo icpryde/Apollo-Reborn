@@ -21,6 +21,9 @@ static NSString *const UDKeyTrendingSubredditsLimit = @"TrendingSubredditsLimit"
 static NSString *const UDKeySubredditListEnhancements = @"SubredditListEnhancements";
 static NSString *const UDKeyModernSubredditDividers = @"ModernSubredditDividers";
 static NSString *const ApolloModernSubredditDividersChangedNotification = @"ApolloModernSubredditDividersChangedNotification";
+// Color post (link) and user/author flairs with Reddit's assigned colors. Default NO.
+static NSString *const UDKeyEnableFlairColors = @"EnableFlairColors";
+static NSString *const ApolloFlairColorsChangedNotification = @"ApolloFlairColorsChangedNotification";
 static NSString *const UDKeyReadPostMaxCount = @"ReadPostMaxCount";
 static NSString *const UDKeyShowRecentlyReadThumbnails = @"ShowRecentlyReadThumbnails";
 static NSString *const UDKeyPreferredGIFFallbackFormat = @"PreferredGIFFallbackFormat";

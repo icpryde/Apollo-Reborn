@@ -31,6 +31,11 @@ extern BOOL sModernSubredditDividers;
 // Master toggle for subreddit list enhancements (see UDKeySubredditListEnhancements).
 extern BOOL sSubredditListEnhancements;
 
+// Color post (link) flairs and user/author flairs using Reddit's assigned
+// colors (filled pill + matching text color). When NO, Apollo's default grey
+// flair styling is preserved. See ApolloFlairColors.xm.
+extern BOOL sEnableFlairColors;
+
 // Render image URLs inline in post selftext and comments. Defaults to YES on
 // fresh installs (registerDefaults). When NO, Apollo's native behavior (text
 // link + optional link card) is preserved. See ApolloInlineImages.xm.

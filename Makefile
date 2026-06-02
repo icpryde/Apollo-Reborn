@@ -53,6 +53,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloRecentlyRead.xm \
     $(SRC_DIR)/ApolloSavedCategories.xm \
     $(SRC_DIR)/ApolloUserFlair.xm \
+    $(SRC_DIR)/ApolloFlairColors.xm \
     $(SRC_DIR)/ApolloNativeActionMenus.xm \
     $(SRC_DIR)/ApolloShareAsImageGallery.xm \
     $(SRC_DIR)/ApolloTranslation.xm \
