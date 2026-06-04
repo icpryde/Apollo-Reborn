@@ -2,6 +2,8 @@
 #import <objc/runtime.h>
 
 #import "ApolloCommon.h"
+#import "ApolloState.h"
+#import "UserDefaultConstants.h"
 #import "CustomAPIViewController.h"
 #import "SavedCategoriesViewController.h"
 #import "TranslationSettingsViewController.h"
@@ -204,7 +206,70 @@ static UIImage *createSettingsIcon(NSString *sfSymbolName, UIColor *bgColor) {
 
 %hook SettingsGeneralViewController
 
+// MARK: - Color Flairs row injection (General > Other)
+//
+// PR #360 review (JeffreyCA): the "Color Flairs" toggle should live in Apollo's
+// native Settings > General screen rather than the tweak's own options screen.
+// Apollo's General screen is a Eureka `FormViewController`, so the table is
+// driven by Eureka's internal form model. We append a single extra row to the
+// END of the "Other" section at the UITableView layer and guard that row in
+// every Eureka table method that indexes the form by row (cellForRow,
+// willDisplay, height, estimatedHeight, didSelect) so Eureka never reads its
+// own model out of bounds. Section-indexed Eureka methods (canEdit/canMove) are
+// unaffected because we don't add a section.
+
+static NSString *const kApolloFlairColorsCellReuse = @"ApolloRebornFlairColorsGeneralCell";
+
+// Locate the "Other" section of the General form by its header title. Falls
+// back to the last section if no explicit "Other" header is exposed.
+static NSInteger ApolloGeneralOtherSection(id self, UITableView *tableView) {
+    NSInteger count = [(id)self numberOfSectionsInTableView:tableView];
+    if (count <= 0) return NSNotFound;
+    for (NSInteger i = 0; i < count; i++) {
+        NSString *title = nil;
+        if ([self respondsToSelector:@selector(tableView:titleForHeaderInSection:)]) {
+            title = [(id)self tableView:tableView titleForHeaderInSection:i];
+        }
+        if (title && [title caseInsensitiveCompare:@"Other"] == NSOrderedSame) {
+            return i;
+        }
+    }
+    return count - 1;
+}
+
+// YES if indexPath is our injected Color Flairs row (last row of Other section).
+static BOOL ApolloIsFlairColorsRow(id self, UITableView *tableView, NSIndexPath *indexPath) {
+    NSInteger other = ApolloGeneralOtherSection(self, tableView);
+    if (other == NSNotFound || indexPath.section != other) return NO;
+    NSInteger rows = [(id)self tableView:tableView numberOfRowsInSection:other];
+    return indexPath.row == rows - 1;
+}
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    NSInteger n = %orig;
+    NSInteger other = ApolloGeneralOtherSection(self, tableView);
+    if (other != NSNotFound && section == other) return n + 1;
+    return n;
+}
+
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (ApolloIsFlairColorsRow(self, tableView, indexPath)) {
+        UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:kApolloFlairColorsCellReuse];
+        if (!cell) {
+            cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:kApolloFlairColorsCellReuse];
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        }
+        cell.textLabel.text = @"Color Flairs";
+        UISwitch *sw = [cell.accessoryView isKindOfClass:[UISwitch class]] ? (UISwitch *)cell.accessoryView : nil;
+        if (!sw) {
+            sw = [[UISwitch alloc] init];
+            cell.accessoryView = sw;
+        }
+        [sw removeTarget:nil action:NULL forControlEvents:UIControlEventValueChanged];
+        [sw addTarget:self action:@selector(apolloReborn_flairColorsSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+        sw.on = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyEnableFlairColors];
+        return cell;
+    }
     UITableViewCell *cell = %orig;
     NSString *text = cell.textLabel.text;
     NSMutableSet *hidden = ApolloHiddenRowsForTableView(tableView);
@@ -220,7 +285,51 @@ static UIImage *createSettingsIcon(NSString *sfSymbolName, UIColor *bgColor) {
     return cell;
 }
 
+%new
+- (void)apolloReborn_flairColorsSwitchChanged:(UISwitch *)sender {
+    BOOL on = sender.isOn;
+    sEnableFlairColors = on;
+    [[NSUserDefaults standardUserDefaults] setBool:on forKey:UDKeyEnableFlairColors];
+    [[NSNotificationCenter defaultCenter] postNotificationName:ApolloFlairColorsChangedNotification object:nil];
+    ApolloLog(@"[FlairColors] General > Other toggle -> %d", (int)on);
+}
+
+// Eureka's FormViewController also implements the editing/moving table methods,
+// each of which subscripts the form model by row (form[indexPath]). UIKit calls
+// canEditRowAt: during normal cell display, so these MUST be guarded for our
+// injected row or Eureka indexes its model out of bounds and crashes.
+
+- (BOOL)tableView:(UITableView *)tableView canEditRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (ApolloIsFlairColorsRow(self, tableView, indexPath)) return NO;
+    return %orig;
+}
+
+- (BOOL)tableView:(UITableView *)tableView canMoveRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (ApolloIsFlairColorsRow(self, tableView, indexPath)) return NO;
+    return %orig;
+}
+
+- (UITableViewCellEditingStyle)tableView:(UITableView *)tableView editingStyleForRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (ApolloIsFlairColorsRow(self, tableView, indexPath)) return UITableViewCellEditingStyleNone;
+    return %orig;
+}
+
+- (void)tableView:(UITableView *)tableView commitEditingStyle:(UITableViewCellEditingStyle)editingStyle forRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (ApolloIsFlairColorsRow(self, tableView, indexPath)) return;
+    %orig;
+}
+
+- (void)tableView:(UITableView *)tableView moveRowAtIndexPath:(NSIndexPath *)sourceIndexPath toIndexPath:(NSIndexPath *)destinationIndexPath {
+    if (ApolloIsFlairColorsRow(self, tableView, sourceIndexPath) || ApolloIsFlairColorsRow(self, tableView, destinationIndexPath)) return;
+    %orig;
+}
+
 - (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (ApolloIsFlairColorsRow(self, tableView, indexPath)) {
+        NSIndexPath *ref = [NSIndexPath indexPathForRow:0 inSection:indexPath.section];
+        CGFloat h = %orig(tableView, ref);
+        return h > 1.0 ? h : 44.0;
+    }
     NSMutableSet *hidden = ApolloHiddenRowsForTableView(tableView);
     if ([hidden containsObject:indexPath]) {
         return 0.0;
@@ -235,7 +344,20 @@ static UIImage *createSettingsIcon(NSString *sfSymbolName, UIColor *bgColor) {
     return %orig;
 }
 
+- (CGFloat)tableView:(UITableView *)tableView estimatedHeightForRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (ApolloIsFlairColorsRow(self, tableView, indexPath)) {
+        NSIndexPath *ref = [NSIndexPath indexPathForRow:0 inSection:indexPath.section];
+        CGFloat h = %orig(tableView, ref);
+        return h > 1.0 ? h : 44.0;
+    }
+    return %orig;
+}
+
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (ApolloIsFlairColorsRow(self, tableView, indexPath)) {
+        [tableView deselectRowAtIndexPath:indexPath animated:NO];
+        return;
+    }
     NSMutableSet *hidden = ApolloHiddenRowsForTableView(tableView);
     if ([hidden containsObject:indexPath]) {
         [tableView deselectRowAtIndexPath:indexPath animated:NO];
@@ -245,6 +367,11 @@ static UIImage *createSettingsIcon(NSString *sfSymbolName, UIColor *bgColor) {
 }
 
 - (void)tableView:(UITableView *)tableView willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (ApolloIsFlairColorsRow(self, tableView, indexPath)) {
+        // Our injected cell — skip Eureka's willDisplay (it would index the form
+        // model out of bounds for this extra row).
+        return;
+    }
     %orig;
     NSString *text = cell.textLabel.text;
     if (text && [text isEqualToString:kApolloAlwaysOfferTranslateLabel]) {

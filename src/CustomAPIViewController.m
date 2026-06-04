@@ -639,7 +639,7 @@ typedef NS_ENUM(NSInteger, Tag) {
         case SectionAPIKeys: return 9; // 7 text fields + Can't sign in? + API key setup guide
         case SectionGeneral: return sShowDeletedComments ? 10 : 9;
         case SectionMedia: return (sShowUserAvatars ? 13 : 12) + (sEnableInlineImages ? 0 : -1);
-        case SectionSubreddits: return sSubredditListEnhancements ? 10 : 9;
+        case SectionSubreddits: return sSubredditListEnhancements ? 9 : 8;
         case SectionNotificationBackend: return 3; // URL + Registration Token + Test Connection
         case SectionAbout: return 5; // GitHub + Reddit + Thanks To + Export Logs + Version
         default: return 0;
@@ -1192,42 +1192,36 @@ typedef NS_ENUM(NSInteger, Tag) {
                                                on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowSubredditHeaders]
                                            action:@selector(subredditHeadersSwitchToggled:)];
         case 3:
-            return [self switchCellWithIdentifier:@"Cell_Sub_FlairColors"
-                                            label:@"Color Flairs"
-                                           detail:@"Show post and user flairs with the colors set by each subreddit."
-                                               on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyEnableFlairColors]
-                                           action:@selector(flairColorsSwitchToggled:)];
-        case 4:
             return [self textFieldCellWithIdentifier:@"Cell_Sub_TrendLimit"
                                                label:@"Trending Subreddits Limit"
                                          placeholder:@"(unlimited)"
                                                 text:sTrendingSubredditsLimit
                                                  tag:TagTrendingLimit
                                            numerical:YES];
-        case 5:
+        case 4:
             return [self stackedTextFieldCellWithIdentifier:@"Cell_Sub_Trending"
                                                       label:@"Trending Source"
                                                 placeholder:defaultTrendingSubredditsSource
                                                        text:sTrendingSubredditsSource
                                                         tag:TagTrendingSubredditsSource];
-        case 6:
+        case 5:
             return [self stackedTextFieldCellWithIdentifier:@"Cell_Sub_Random"
                                                       label:@"Random Source"
                                                 placeholder:defaultRandomSubredditsSource
                                                        text:sRandomSubredditsSource
                                                         tag:TagRandomSubredditsSource];
-        case 7:
+        case 6:
             return [self switchCellWithIdentifier:@"Cell_Sub_RandNSFW"
                                             label:@"Show RandNSFW in Search"
                                                on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowRandNsfw]
                                            action:@selector(randNsfwSwitchToggled:)];
-        case 8:
+        case 7:
             return [self stackedTextFieldCellWithIdentifier:@"Cell_Sub_RandNSFW_Source"
                                                       label:@"RandNSFW Source"
                                                 placeholder:@"(empty)"
                                                        text:sRandNsfwSubredditsSource
                                                         tag:TagRandNsfwSubredditsSource];
-        case 9: {
+        case 8: {
             UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_Sub_ClearCustomBanners"];
             if (!cell) {
                 cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"Cell_Sub_ClearCustomBanners"];
@@ -1558,7 +1552,7 @@ typedef NS_ENUM(NSInteger, Tag) {
         }
     } else if (indexPath.section == SectionSubreddits) {
         NSInteger logicalRow = (indexPath.row >= 1 && !sSubredditListEnhancements) ? indexPath.row + 1 : indexPath.row;
-        if (logicalRow == 9) {
+        if (logicalRow == 8) {
             UITableViewCell *cell = [tableView cellForRowAtIndexPath:indexPath];
             [self promptClearCustomSubredditBannersFromSourceView:cell];
         }
@@ -1621,7 +1615,7 @@ typedef NS_ENUM(NSInteger, Tag) {
     if (indexPath.section == SectionAPIKeys && (indexPath.row == 7 || indexPath.row == 8)) return YES;
     if (indexPath.section == SectionSubreddits) {
         NSInteger logicalRow = (indexPath.row >= 1 && !sSubredditListEnhancements) ? indexPath.row + 1 : indexPath.row;
-        return logicalRow == 9;
+        return logicalRow == 8;
     }
     if (indexPath.section == SectionMedia) {
         NSInteger row = (indexPath.row >= 5 && !sEnableInlineImages) ? indexPath.row + 1 : indexPath.row;
@@ -1944,12 +1938,6 @@ typedef NS_ENUM(NSInteger, Tag) {
 - (void)showRecentlyReadThumbnailsSwitchToggled:(UISwitch *)sender {
     sShowRecentlyReadThumbnails = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:sShowRecentlyReadThumbnails forKey:UDKeyShowRecentlyReadThumbnails];
-}
-
-- (void)flairColorsSwitchToggled:(UISwitch *)sender {
-    sEnableFlairColors = sender.isOn;
-    [[NSUserDefaults standardUserDefaults] setBool:sEnableFlairColors forKey:UDKeyEnableFlairColors];
-    [[NSNotificationCenter defaultCenter] postNotificationName:ApolloFlairColorsChangedNotification object:nil];
 }
 
 - (void)steamAppSwitchToggled:(UISwitch *)sender {
