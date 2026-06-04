@@ -637,7 +637,7 @@ typedef NS_ENUM(NSInteger, Tag) {
     switch (section) {
         case SectionBackupRestore: return 2;
         case SectionAPIKeys: return 9; // 7 text fields + Can't sign in? + API key setup guide
-        case SectionGeneral: return sShowDeletedComments ? 10 : 9;
+        case SectionGeneral: return sShowDeletedComments ? 11 : 10;
         case SectionMedia: return (sShowUserAvatars ? 13 : 12) + (sEnableInlineImages ? 0 : -1);
         case SectionSubreddits: return sSubredditListEnhancements ? 9 : 8;
         case SectionNotificationBackend: return 3; // URL + Registration Token + Test Connection
@@ -1025,6 +1025,11 @@ typedef NS_ENUM(NSInteger, Tag) {
             cell.detailTextLabel.enabled = idleSupported;
             return cell;
         }
+        case 10:
+            return [self switchCellWithIdentifier:@"Cell_Gen_FlairColors"
+                                            label:@"Color Flairs"
+                                               on:[defaults boolForKey:UDKeyEnableFlairColors]
+                                           action:@selector(flairColorsSwitchToggled:)];
         default: return [[UITableViewCell alloc] init];
     }
 }
@@ -1906,6 +1911,13 @@ typedef NS_ENUM(NSInteger, Tag) {
 
 - (void)flexSwitchToggled:(UISwitch *)sender {
     [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyEnableFLEX];
+}
+
+- (void)flairColorsSwitchToggled:(UISwitch *)sender {
+    BOOL on = sender.isOn;
+    sEnableFlairColors = on;
+    [[NSUserDefaults standardUserDefaults] setBool:on forKey:UDKeyEnableFlairColors];
+    [[NSNotificationCenter defaultCenter] postNotificationName:ApolloFlairColorsChangedNotification object:nil];
 }
 
 - (void)randNsfwSwitchToggled:(UISwitch *)sender {
