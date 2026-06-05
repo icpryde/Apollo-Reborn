@@ -100,6 +100,8 @@ LIQUID_GLASS="false"
 LIQUID_GLASS_ICONS_ONLY="false"
 URL_SCHEMES=""
 OUTPUT_IPA_PATH=""
+FIX_SAFARI_EXTENSION="false"
+FIX_OPENIN_EXTENSION="false"
 
 print_usage() {
     echo "Usage: $0 <path_to_ipa> [options]"
@@ -108,6 +110,9 @@ print_usage() {
     echo "  -o, --output <file>           Output IPA filename (default: Apollo-Patched.ipa)"
     echo "  --remove-code-signature       Remove code signature from the binary"
     echo "  --liquid-glass                Apply Liquid Glass patch for iOS 26"
+    echo "  --fix-safari-extension        Repair the bundled 'Open in Apollo' Safari extension"
+    echo "  --fix-openin-extension        Repair the bundled 'Open in Apollo' share-sheet action"
+    echo "                                (needs the openin-extension dylib; run 'make package' first)"
     echo "  --liquid-glass-icons          Bundle the Liquid Glass icon catalog only,"
     echo "                                without the iOS 26 UI chrome (no vtool"
     echo "                                build-version bump). Cannot be combined"
@@ -134,6 +139,14 @@ while [[ "$#" -gt 0 ]]; do
             ;;
         --liquid-glass)
             LIQUID_GLASS="true"
+            shift
+            ;;
+        --fix-safari-extension)
+            FIX_SAFARI_EXTENSION="true"
+            shift
+            ;;
+        --fix-openin-extension)
+            FIX_OPENIN_EXTENSION="true"
             shift
             ;;
         --liquid-glass-icons)
@@ -184,6 +197,8 @@ echo "Input IPA: ${INPUT_IPA}"
 echo "Output IPA: ${OUTPUT_IPA}"
 echo "Remove code signature: ${REMOVE_CODE_SIGNATURE}"
 echo "Liquid Glass patch: ${LIQUID_GLASS}"
+echo "Fix Safari extension: ${FIX_SAFARI_EXTENSION}"
+echo "Fix Open-in-Apollo action: ${FIX_OPENIN_EXTENSION}"
 echo "Liquid Glass icons only: ${LIQUID_GLASS_ICONS_ONLY}"
 echo "URL schemes: ${URL_SCHEMES:-none}"
 
@@ -371,6 +386,23 @@ cd ../.. # Back to extract_temp directory
 echo "Repackaging modified IPA..."
 zip -qr "${OUTPUT_IPA_PATH}" Payload/
 cd .. # Back to original directory
+
+# --- 4. Fix Safari Extension ---
+# Done after repackaging so it operates on the finished IPA (it re-zips in
+# place). No-op if the IPA has no Apollofari.appex.
+if [ "${FIX_SAFARI_EXTENSION}" == "true" ]; then
+    echo "Repairing bundled Safari extension..."
+    bash "${SCRIPT_DIR}/scripts/fix-safari-extension.sh" "${OUTPUT_IPA_PATH}"
+fi
+
+# --- 4b. Fix Open-in-Apollo Action extension ---
+# Same timing/rationale as the Safari fix. No-op if the IPA has no
+# OpenInUIExtension.appex. Resolves the dylib from the openin-extension subproject
+# build output (run 'make package' first, or pass it via the script's --dylib).
+if [ "${FIX_OPENIN_EXTENSION}" == "true" ]; then
+    echo "Repairing bundled Open-in-Apollo action extension..."
+    bash "${SCRIPT_DIR}/scripts/fix-openin-extension.sh" "${OUTPUT_IPA_PATH}"
+fi
 
 # Note: Cleanup handled by trap on EXIT
 

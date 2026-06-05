@@ -242,6 +242,16 @@ rm -f "$STANDARD_IPA" "$NOEXT_IPA" "$GLASS_IPA" "$NOEXT_GLASS_IPA" \
 echo ""
 echo "[1/6] Building standard injected IPA..."
 bash "${REPO_DIR}/build-ipa.sh" --ipa "$IPA_PATH" --deb "$DEB_PATH" -o "$STANDARD_IPA"
+# Repair the bundled "Open in Apollo" Safari extension. The GLASS variant below
+# is derived from $STANDARD_IPA via patch.sh, so it inherits this fix; the two
+# no-extensions variants have no appex and the script no-ops on them.
+bash "${REPO_DIR}/scripts/fix-safari-extension.sh" "$STANDARD_IPA"
+# Repair the bundled "Open in Apollo" Action extension (OpenInUIExtension.appex):
+# inject ApolloOpenInFix.dylib (built by the openin-extension subproject) so the
+# share-sheet action opens links in Apollo from any browser. Same inheritance as
+# the Safari fix above — GLASS is derived from $STANDARD_IPA so it carries this
+# too, and the no-extensions variants have no appex (the script no-ops).
+bash "${REPO_DIR}/scripts/fix-openin-extension.sh" "$STANDARD_IPA"
 set_main_app_bundle_versions_in_ipa "$STANDARD_IPA" "$TWEAK_VERSION" "$APP_BUILD_VERSION"
 
 echo ""

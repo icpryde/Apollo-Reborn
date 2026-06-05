@@ -4,10 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixes
+
+- Fix the bundled **"Open in Apollo" Safari extension**, which stopped opening links on sideloaded builds. Its default "Automatic" mode redirected through `openinapollo.com`, whose auto-open relies on an iOS Smart App Banner bound to the App Store build — a sideloaded Apollo isn't that app, so it never opened. The extension now redirects straight to `apollo://`, handles `/s/` share links, and no longer references a missing background script. (Applied to the standard and Liquid Glass IPA variants at build time.)
+- Fix the bundled **"Open in Apollo" share-sheet action** (`OpenInUIExtension`) so it opens Reddit links in Apollo from **any** browser (Chrome, Firefox, Edge, Brave, …) — not just Safari. The stock action called the deprecated `-[UIApplication openURL:]`, which iOS 18+ force-fails, so it did nothing; an injected dylib (`ApolloOpenInFix`) now opens the `apollo://` link via a non-deprecated path. Applied to the standard and Liquid Glass variants at build time. **Note:** on iOS 26 the extension only launches if your installer sets the appex main-binary flag — **AltStore/SideStore** and `codesign` (`scripts/resign-ipa-codesign.sh`) do, **Sideloadly/Feather** currently don't, in which case the action does nothing and the Shortcut remains a signer-independent fallback. This corrects the earlier conclusion that the native action couldn't be fixed on modern iOS.
+
 ### Features
 
 - Add **GLASS Icons** and **No Extensions + GLASS Icons** distribution variants that bundle the Liquid Glass alternate icon catalog without opting the app into the iOS 26 UI runtime. The standard GLASS builds run `vtool -set-build-version ios 15.0 19.0`, which is what activates the new iOS 26 tab bar (whose horizontal swipe switches tabs); the icons-only variants skip that step so legacy UIKit behaviors — notably the bottom tab bar swipe-to-go-back/forward gesture — are preserved.
 - Add `--liquid-glass-icons` flag to `patch.sh` for producing the icons-only variant manually. `--liquid-glass` and `--liquid-glass-icons` are mutually exclusive.
+- Ship an Apollo-Reborn **userscript** (`userscript/open-in-apollo.user.js`) as an app-independent way to auto-open Reddit links in Apollo — handy for the no-extensions IPA variant and jailbreak installs. Install via the free **Userscripts** app.
+- Add an **"Open in Apollo" Shortcut** recipe (in the README) for opening Reddit links in Apollo from Chrome, Firefox, and other browsers via the share sheet — a signer-independent fallback for installs where the bundled share-sheet action's extension can't launch (e.g. iOS 26 builds signed by tools that don't set the appex main-binary flag).
 
 ## [v3.0.0] - 2026-05-29
 

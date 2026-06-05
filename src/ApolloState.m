@@ -31,6 +31,7 @@ BOOL sSubredditListEnhancements = YES;
 BOOL sEnableFlairColors = NO;
 BOOL sEnableInlineImages = NO;
 NSInteger sInlineImageAlignment = ApolloInlineImageAlignmentCenter;
+NSInteger sAutoplayInlineGIFMode = ApolloAutoplayInlineGIFModeDefault;
 NSInteger sLinkPreviewBodyMode = ApolloLinkPreviewModeOff;
 NSInteger sLinkPreviewCommentsMode = ApolloLinkPreviewModeOff;
 NSInteger sLinkPreviewCardColor = ApolloLinkPreviewCardColorNeutral;

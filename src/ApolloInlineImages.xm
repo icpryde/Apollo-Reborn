@@ -156,6 +156,18 @@ static char kApolloInlineGIFGenerationKey;     // NSNumber — bumped on clear/r
 static char kApolloStackedCardSyncerKey;       // ApolloStackedCardSyncer — keeps the multi-image card peeking behind imageNode
 static char kApolloImageChestItemsKey;         // NSArray<NSDictionary *> direct ImageChest CDN image entries for album pager
 
+// kApolloHostMarkdownNodeKey is an OBJC_ASSOCIATION_ASSIGN (unsafe unretained)
+// reference to the host MarkdownNode. The host can be deallocated before the
+// image node (e.g. during comments table teardown), leaving the association
+// slot pointing at freed memory. Reading it as an `id` lets ARC retain the
+// result, which crashes in objc_retain on the dangling pointer. Bridge-cast to
+// a raw void* so ARC performs no retain/release; we only ever need to know
+// whether the node is an inline-hosted image node, not to message the host.
+static inline BOOL ApolloImageNodeHasInlineHost(id node) {
+    if (!node) return NO;
+    return ((__bridge void *)objc_getAssociatedObject(node, &kApolloHostMarkdownNodeKey)) != NULL;
+}
+
 static void ApolloApplyInlineGIFPlaybackPolicyWithCover(ASNetworkImageNode *imageNode, UIImage *cover, NSUInteger retryIndex);
 static void ApolloStartInlineGIFPlayback(ASNetworkImageNode *imageNode);
 static BOOL ApolloResumeInlineGIFPlaybackIfPossible(ASNetworkImageNode *imageNode);
@@ -1495,7 +1507,7 @@ static BOOL ApolloPresentOrResolveImageChestAlbumURL(NSURL *url, UIView *sourceV
 %hook ASImageNode
 
 - (void)_locked_setAnimatedImage:(id)animatedImage {
-    BOOL hosted = objc_getAssociatedObject(self, &kApolloHostMarkdownNodeKey) != nil;
+    BOOL hosted = ApolloImageNodeHasInlineHost(self);
     if (hosted && animatedImage && !ApolloInlineGIFAnimatedImageArgumentIsUsable(animatedImage)) {
         ApolloLog(@"[InlineImages] _locked_setAnimatedImage rejecting unusable animatedImage node=%p", self);
         ApolloClearInlineGIFNodeState((ASNetworkImageNode *)self);
@@ -1587,7 +1599,7 @@ static BOOL ApolloPresentOrResolveImageChestAlbumURL(NSURL *url, UIView *sourceV
 }
 
 - (void)dealloc {
-    if (objc_getAssociatedObject(self, &kApolloHostMarkdownNodeKey)) {
+    if (ApolloImageNodeHasInlineHost(self)) {
         ApolloCancelInlineGIFPendingPolicyBlocks(self);
         ApolloInlineGIFBumpGeneration(self);
         id anim = objc_getAssociatedObject(self, &kApolloInlineGIFAnimatedImageKey);
@@ -1601,7 +1613,7 @@ static BOOL ApolloPresentOrResolveImageChestAlbumURL(NSURL *url, UIView *sourceV
 %hook ASNetworkImageNode
 
 - (void)setURL:(NSURL *)URL {
-    if (objc_getAssociatedObject(self, &kApolloHostMarkdownNodeKey)) {
+    if (ApolloImageNodeHasInlineHost(self)) {
         NSURL *previous = [self respondsToSelector:@selector(URL)] ? [self URL] : nil;
         if ((previous && URL && ![previous isEqual:URL]) || (previous && !URL)) {
             ApolloLog(@"[AutoplayGIF] clearing GIF state on URL change node=%p", self);
@@ -1612,7 +1624,7 @@ static BOOL ApolloPresentOrResolveImageChestAlbumURL(NSURL *url, UIView *sourceV
 }
 
 - (void)clearImage {
-    if (objc_getAssociatedObject(self, &kApolloHostMarkdownNodeKey)) {
+    if (ApolloImageNodeHasInlineHost(self)) {
         ApolloClearInlineGIFNodeState(self);
     }
     %orig;
@@ -1971,6 +1983,54 @@ static void ApolloInstallPlayOverlayOnView(UIView *v, ASDisplayNode *node) {
     [container recenter];
 
     objc_setAssociatedObject(node, &kApolloPlayOverlayViewKey, container, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+// The play overlay is first added in onDidLoad while the node still has
+// zero bounds, then relies on KVO to recenter once Texture assigns the
+// real frame. Two things break that for inline video thumbnails:
+//   1. When the async DASH/poster resolve triggers a relayout-from-above,
+//      Texture can recycle the node's backing view and silently drop our
+//      manually-added overlay subview (the association still points at the
+//      now-detached container).
+//   2. If the very first layout pass already gave the node real bounds,
+//      the KVO "new bounds" notification may have fired before the overlay
+//      was attached.
+// Re-assert the overlay a few times after load so it survives view
+// recycling and late sizing. Idempotent when the overlay is already
+// correctly attached.
+static void ApolloScheduleVideoPlayOverlayReassert(ASNetworkImageNode *imageNode, NSUInteger attempt) {
+    static const NSTimeInterval delays[] = {0.10, 0.25, 0.50, 1.0, 1.75, 2.5};
+    static const NSUInteger maxAttempts = sizeof(delays) / sizeof(delays[0]);
+    if (!imageNode || attempt >= maxAttempts) return;
+
+    __weak ASNetworkImageNode *weak = imageNode;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delays[attempt] * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        ASNetworkImageNode *node = weak;
+        if (!node) return;
+        BOOL loaded = [node respondsToSelector:@selector(isNodeLoaded)] && [node isNodeLoaded];
+        UIView *view = loaded ? [node view] : nil;
+        if (view) {
+            UIView *overlay = objc_getAssociatedObject(node, &kApolloPlayOverlayViewKey);
+            BOOL stale = overlay && overlay.superview != view;
+            if (stale) {
+                // Association points at a recycled/detached view — drop it
+                // and reinstall onto the live view.
+                [overlay removeFromSuperview];
+                objc_setAssociatedObject(node, &kApolloPlayOverlayViewKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                overlay = nil;
+            }
+            if (!overlay) {
+                ApolloInstallPlayOverlayOnView(view, node);
+            } else {
+                [view bringSubviewToFront:overlay];
+                if ([overlay isKindOfClass:[ApolloPlayOverlayContainer class]]) {
+                    [(ApolloPlayOverlayContainer *)overlay recenter];
+                }
+            }
+        }
+        ApolloScheduleVideoPlayOverlayReassert(node, attempt + 1);
+    });
 }
 
 // Pause inline GIF playback without clearing animatedImage via KVC — that path
@@ -2358,6 +2418,23 @@ static ASNetworkImageNode *ApolloMakeInlineVideoThumbnailNode(NSURL *videoURL,
             } else {
                 NSURL *dashURL = mm ? ApolloDashURLFromMediaMetadata(mm, videoURL) : nil;
                 NSString *assetID = ApolloMediaMetadataIDFromVideoURL(videoURL);
+                // Fallback when mediaMetadata isn't reachable up the supernode
+                // chain (a timing race on first layout that leaves hostMD=nil):
+                // Reddit hosted-video permalinks expose a stable DASH manifest
+                // at v.redd.it/<assetID>/DASHPlaylist.mpd. Deriving it directly
+                // from the asset id lets the poster — and the play-button
+                // overlay, which only becomes visible once the node has real
+                // bounds — resolve without metadata.
+                if (!dashURL && assetID.length) {
+                    NSString *host = [[videoURL host] lowercaseString] ?: @"";
+                    NSString *path = [[videoURL path] lowercaseString] ?: @"";
+                    BOOL isRedditPlayer = ([host isEqualToString:@"reddit.com"] || [host hasSuffix:@".reddit.com"])
+                        && [path hasPrefix:@"/link/"] && [path containsString:@"/video/"] && [path hasSuffix:@"/player"];
+                    if (isRedditPlayer) {
+                        dashURL = [NSURL URLWithString:[NSString stringWithFormat:
+                            @"https://v.redd.it/%@/DASHPlaylist.mpd", assetID]];
+                    }
+                }
                 if (dashURL && assetID.length) {
                     ApolloFetchDashPoster(assetID, dashURL, ^(UIImage *poster) {
                         ASNetworkImageNode *strong = weakImage;
@@ -2380,6 +2457,7 @@ static ASNetworkImageNode *ApolloMakeInlineVideoThumbnailNode(NSURL *videoURL,
         }
 
         if (v) ApolloInstallPlayOverlayOnView(v, img);
+        ApolloScheduleVideoPlayOverlayReassert(img, 0);
         if (v && ![objc_getAssociatedObject(img, &kApolloLongPressInstalledKey) boolValue]) {
             NSURL *u = objc_getAssociatedObject(img, &kApolloImageURLKey);
             objc_setAssociatedObject(v, &kApolloImageURLKey, u, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
