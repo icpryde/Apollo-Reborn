@@ -2642,6 +2642,15 @@ static void ApolloLPTriggerRelayoutForHost(ASDisplayNode *node, NSString *host) 
     ApolloLPTriggerRelayoutInternal(node, YES, host);
 }
 
+// V20: when a placeholder shrinks to a compact card while the node is still
+// detached (cell measured off-tree — the common case for fresh feed cells),
+// BOTH reload attempts below miss ("row-reload-miss no-scroll-cell") and the
+// row keeps its tall hero-placeholder height around a small compact card.
+// Geometry can't detect this oversize case (a card shorter than its cell is
+// normal), so remember the failure on the node and re-fire the reload from
+// didEnterVisibleState once the cell actually exists on screen.
+static char kApolloLPPendingRowReloadHostKey;
+
 static void ApolloLPTriggerPlaceholderContextRelayout(ASDisplayNode *node, NSString *host, ApolloLPContext fromContext, ApolloLPContext toContext) {
     if (!node) return;
 
@@ -2649,7 +2658,9 @@ static void ApolloLPTriggerPlaceholderContextRelayout(ASDisplayNode *node, NSStr
               host ?: @"(nohost)", ApolloLPContextLogName(fromContext), ApolloLPContextLogName(toContext));
     ApolloLPTriggerRelayoutInternal(node, NO, host);
     ASDisplayNode *cellNode = ApolloLPFindOwningCellNode(node);
-    ApolloLPInvokeRowReloadIfPossible(cellNode ?: node, host);
+    if (!ApolloLPInvokeRowReloadIfPossible(cellNode ?: node, host)) {
+        objc_setAssociatedObject(node, &kApolloLPPendingRowReloadHostKey, host ?: @"?", OBJC_ASSOCIATION_COPY_NONATOMIC);
+    }
 
     __weak ASDisplayNode *weakNode = node;
     NSString *hostCopy = [host copy];
@@ -2657,7 +2668,11 @@ static void ApolloLPTriggerPlaceholderContextRelayout(ASDisplayNode *node, NSStr
         ASDisplayNode *strongNode = weakNode;
         if (!strongNode) return;
         ASDisplayNode *strongCellNode = ApolloLPFindOwningCellNode(strongNode);
-        ApolloLPInvokeRowReloadIfPossible(strongCellNode ?: strongNode, hostCopy);
+        if (ApolloLPInvokeRowReloadIfPossible(strongCellNode ?: strongNode, hostCopy)) {
+            objc_setAssociatedObject(strongNode, &kApolloLPPendingRowReloadHostKey, nil, OBJC_ASSOCIATION_COPY_NONATOMIC);
+        } else {
+            objc_setAssociatedObject(strongNode, &kApolloLPPendingRowReloadHostKey, hostCopy ?: @"?", OBJC_ASSOCIATION_COPY_NONATOMIC);
+        }
     });
 }
 
@@ -3492,8 +3507,23 @@ static id ApolloLPNativeLinkSpecWithBannedHintIfNeeded(id linkButtonNode, NSURL 
 // V18: cards whose final content rendered while the node was detached could
 // never fix their row height (no owning cell at refresh time). Verify the
 // geometry whenever the card scrolls on screen; only broken rows reload.
+// V20: also re-fire a placeholder-shrink row reload that failed while the
+// node was detached — the oversized-row case geometry can't detect.
 - (void)didEnterVisibleState {
     %orig;
+    NSString *pendingHost = objc_getAssociatedObject(self, &kApolloLPPendingRowReloadHostKey);
+    if (pendingHost) {
+        objc_setAssociatedObject(self, &kApolloLPPendingRowReloadHostKey, nil, OBJC_ASSOCIATION_COPY_NONATOMIC);
+        ApolloLog(@"[LinkPreviews] V20-deferred-row-reload host=%@", pendingHost);
+        __weak ASDisplayNode *weakSelf = (ASDisplayNode *)self;
+        // Let the cell finish attaching before resolving its index path.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(50 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+            ASDisplayNode *strongSelf = weakSelf;
+            if (!strongSelf) return;
+            ASDisplayNode *cellNode = ApolloLPFindOwningCellNode(strongSelf);
+            ApolloLPInvokeRowReloadIfPossible(cellNode ?: strongSelf, pendingHost);
+        });
+    }
     ApolloLPScheduleOverflowHeightCheck((ASDisplayNode *)self, @"visible-check");
 }
 
@@ -3586,4 +3616,5 @@ static id ApolloLPNativeLinkSpecWithBannedHintIfNeeded(id linkButtonNode, NSURL 
     ApolloLog(@"[LinkPreviews] V15 targeted translation refresh active");
     ApolloLog(@"[LinkPreviews] V18 stale row-height watchdog active (late twitter/bsky cards)");
     ApolloLog(@"[LinkPreviews] V19 bluesky multiline body active");
+    ApolloLog(@"[LinkPreviews] V20 deferred compact-shrink row reload active");
 }
