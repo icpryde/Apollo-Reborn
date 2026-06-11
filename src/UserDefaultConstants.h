@@ -19,6 +19,10 @@ static NSString *const UDKeyTrendingSubredditsLimit = @"TrendingSubredditsLimit"
 // Master toggle (short-term fix) for all subreddit list polish/enhancements. Default
 // YES. Modern Subreddit Dividers depends on it — that row hides when this is off.
 static NSString *const UDKeySubredditListEnhancements = @"SubredditListEnhancements";
+// Subreddits the user moderates but chose to hide from the Subreddits list
+// (Reddit offers no way to leave or delete some dead subreddits). Array of
+// display names, compared case-insensitively.
+static NSString *const UDKeyHiddenModeratorSubreddits = @"HiddenModeratorSubreddits";
 static NSString *const UDKeyModernSubredditDividers = @"ModernSubredditDividers";
 static NSString *const ApolloModernSubredditDividersChangedNotification = @"ApolloModernSubredditDividersChangedNotification";
 // Color post (link) and user/author flairs with Reddit's assigned colors. Default NO.
