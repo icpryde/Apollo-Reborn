@@ -1206,6 +1206,26 @@ static NSString *ApolloLPCleanDisplayText(NSString *text) {
     return clean.length > 0 ? clean : text;
 }
 
+// Like ApolloLPCleanDisplayText, but preserves the text's line structure —
+// used for the Bluesky post body, where paragraph breaks are part of the
+// post (the fetcher already normalized them). Collapsing \s+ would squish
+// a multi-paragraph post into one run-on blob.
+static NSString *ApolloLPCleanMultilineDisplayText(NSString *text) {
+    if (![text isKindOfClass:[NSString class]] || text.length == 0) return text;
+    NSString *clean = [text stringByReplacingOccurrencesOfString:@"&nbsp;" withString:@" "];
+    NSRegularExpression *tagRegex = [NSRegularExpression regularExpressionWithPattern:@"<[^>]+>" options:0 error:nil];
+    clean = [tagRegex stringByReplacingMatchesInString:clean options:0 range:NSMakeRange(0, clean.length) withTemplate:@" "];
+    // \x0B (vertical tab), NOT \v: in ICU regex \v is a class shorthand for
+    // ALL vertical whitespace including \n — it silently ate the very line
+    // breaks this function exists to preserve.
+    NSRegularExpression *inlineWhitespace = [NSRegularExpression regularExpressionWithPattern:@"[\\t\\f\\x0B ]+" options:0 error:nil];
+    clean = [inlineWhitespace stringByReplacingMatchesInString:clean options:0 range:NSMakeRange(0, clean.length) withTemplate:@" "];
+    NSRegularExpression *blankRuns = [NSRegularExpression regularExpressionWithPattern:@"\\n{3,}" options:0 error:nil];
+    clean = [blankRuns stringByReplacingMatchesInString:clean options:0 range:NSMakeRange(0, clean.length) withTemplate:@"\n\n"];
+    clean = [clean stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return clean.length > 0 ? clean : text;
+}
+
 static NSString *ApolloLPDisplayTitleForPreview(ApolloLinkPreview *preview) {
     return ApolloLPCleanDisplayText(preview.title);
 }
@@ -2004,7 +2024,16 @@ static id ApolloLPBuildBlueskyPostCardSpec(ASDisplayNode *hostNode, NSURL *url, 
 
     NSString *displayName = preview.authorDisplayName.length > 0 ? preview.authorDisplayName : (ApolloLPDisplayTitleForPreview(preview).length > 0 ? ApolloLPDisplayTitleForPreview(preview) : @"Bluesky");
     NSString *handleText = ApolloLPBlueskyHandleText(preview);
-    NSString *postText = preview.postText.length > 0 ? ApolloLPCleanDisplayText(preview.postText) : ApolloLPDisplayDescriptionForPreview(preview);
+    // Keep the post's own paragraph breaks — squashing them reads terribly
+    // for multi-line posts. Bluesky posts are capped at ~300 chars, so the
+    // body is naturally bounded even without a line limit.
+    NSString *postText = preview.postText.length > 0 ? ApolloLPCleanMultilineDisplayText(preview.postText) : ApolloLPCleanMultilineDisplayText(preview.desc);
+    NSUInteger bodyNewlines = postText.length > 0 ? [postText componentsSeparatedByString:@"\n"].count - 1 : 0;
+    NSUInteger rawNewlines = preview.postText.length > 0 ? [preview.postText componentsSeparatedByString:@"\n"].count - 1 : 0;
+    ApolloLPLogOncePerHost(ApolloLPHost(url),
+        [NSString stringWithFormat:@"V19-bluesky-body source=%@ len=%lu newlines=%lu rawNewlines=%lu",
+         preview.postText.length > 0 ? @"postText" : @"desc",
+         (unsigned long)postText.length, (unsigned long)bodyNewlines, (unsigned long)rawNewlines]);
     BOOL imageIsAvatar = preview.avatarURL.absoluteString.length > 0
         && [preview.imageURL.absoluteString isEqualToString:preview.avatarURL.absoluteString];
     BOOL hasPostImage = preview.imageURL.absoluteString.length > 0 && !imageIsAvatar && !preview.imageIsFallbackIcon;
@@ -2037,7 +2066,9 @@ static id ApolloLPBuildBlueskyPostCardSpec(ASDisplayNode *hostNode, NSURL *url, 
 
     titleNode.maximumNumberOfLines = 1;
     siteNode.maximumNumberOfLines = 1;
-    descriptionNode.maximumNumberOfLines = 10;
+    // No line cap: let the card grow to fit the whole post, like the native
+    // tweet card does.
+    descriptionNode.maximumNumberOfLines = 0;
     ApolloLPSetTextNodeAttributedTextIfChanged(titleNode, ApolloLPAttributedString(displayName, [UIFont systemFontOfSize:15.0 weight:UIFontWeightSemibold], [UIColor labelColor]));
     ApolloLPSetTextNodeAttributedTextIfChanged(siteNode, ApolloLPAttributedString(handleText, [UIFont systemFontOfSize:13.0 weight:UIFontWeightRegular], [UIColor secondaryLabelColor]));
     ApolloLPSetTextNodeAttributedTextIfChanged(descriptionNode, ApolloLPAttributedString(postText, [UIFont systemFontOfSize:15.0 weight:UIFontWeightRegular], [UIColor labelColor]));
@@ -2630,6 +2661,74 @@ static void ApolloLPTriggerPlaceholderContextRelayout(ASDisplayNode *node, NSStr
     });
 }
 
+// MARK: - V18: stale row-height fix for late twitter/bsky card content
+//
+// When a link card's real content lands after the owning cell was measured
+// (slow TweetBuddy / Bluesky fetches), the card redraws at full size but the
+// feed row keeps its placeholder height — the card bleeds over the post's
+// footer. The relayout triggers above are no-ops in the common failure mode
+// because the LinkButtonNode is still detached (supernode == nil) while the
+// cell is measured off-tree, so no owning cell can be found at refresh time.
+// Instead of trusting the triggers, verify geometry after the fact: if the
+// card's rendered content sticks out the bottom of its row's cell view,
+// reload that row. Pure geometry — healthy rows are never reloaded.
+static void ApolloLPRunOverflowHeightCheck(ASDisplayNode *node, NSString *host, NSInteger remainingAttempts) {
+    if (!node) return;
+    @try {
+        BOOL loaded = [node respondsToSelector:@selector(isNodeLoaded)] && [node isNodeLoaded];
+        UIView *nodeView = loaded ? ApolloLPViewForNode(node) : nil;
+        UIView *cellView = nil;
+        if (nodeView.window) {
+            for (UIView *current = nodeView; current; current = current.superview) {
+                if ([current isKindOfClass:[UITableViewCell class]] ||
+                    [current isKindOfClass:[UICollectionViewCell class]]) {
+                    cellView = current;
+                    break;
+                }
+            }
+        }
+        if (!cellView) {
+            // Node not on screen (yet) — retry briefly in case it is mid-attach.
+            if (remainingAttempts > 0) {
+                __weak ASDisplayNode *weakNode = node;
+                NSString *hostCopy = [host copy];
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(400 * NSEC_PER_MSEC)),
+                               dispatch_get_main_queue(), ^{
+                    ASDisplayNode *strongNode = weakNode;
+                    if (strongNode) ApolloLPRunOverflowHeightCheck(strongNode, hostCopy, remainingAttempts - 1);
+                });
+            }
+            return;
+        }
+
+        // Views don't clip by default, so a stale row shows content drawn
+        // beyond the node's frame — include one level of subview frames.
+        CGRect content = nodeView.bounds;
+        for (UIView *subview in nodeView.subviews) {
+            content = CGRectUnion(content, subview.frame);
+        }
+        CGRect frameInCell = [nodeView convertRect:content toView:cellView];
+        CGFloat overflow = CGRectGetMaxY(frameInCell) - CGRectGetHeight(cellView.bounds);
+        if (overflow > 8.0) {
+            ApolloLog(@"[LinkPreviews] V18-stale-row-height host=%@ overflow=%.0fpt -> reloading row",
+                      host ?: @"?", overflow);
+            ApolloLPInvokeRowReloadIfPossible(node, host);
+        }
+    } @catch (__unused NSException *exception) {}
+}
+
+// Let layout settle before measuring; runs on main.
+static void ApolloLPScheduleOverflowHeightCheck(ASDisplayNode *node, NSString *host) {
+    if (!node) return;
+    __weak ASDisplayNode *weakNode = node;
+    NSString *hostCopy = [host copy];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(150 * NSEC_PER_MSEC)),
+                   dispatch_get_main_queue(), ^{
+        ASDisplayNode *strongNode = weakNode;
+        if (strongNode) ApolloLPRunOverflowHeightCheck(strongNode, hostCopy, 1);
+    });
+}
+
 static ASDisplayNode *ApolloLPNodeForViewIfPossible(UIView *view) {
     if (!view) return nil;
     SEL nodeSelectors[] = { NSSelectorFromString(@"asyncdisplaykit_node"), NSSelectorFromString(@"node") };
@@ -3218,7 +3317,11 @@ static id ApolloLPNativeLinkSpecWithBannedHintIfNeeded(id linkButtonNode, NSURL 
     ApolloLPInstallContextMenuForNode((ASDisplayNode *)self, url);
 
     ApolloLinkPreview *cached = [[ApolloLinkPreviewCache sharedCache] cachedPreviewForURL:url];
-    if (cached && ApolloLPIsBlueskyPostURL(url) && !ApolloLPIsBlueskyPostPreview(url, cached)) {
+    // Match the fetcher's staleness rule: a bsky-post preview without
+    // postText renders its flattened desc as the body, so refetch it rather
+    // than reuse it forever (the render gate alone accepts handle-only).
+    if (cached && ApolloLPIsBlueskyPostURL(url) &&
+        (!ApolloLPIsBlueskyPostPreview(url, cached) || cached.postText.length == 0)) {
         ApolloLPLogOncePerHost(host, @"stale-bluesky-inline-refetch");
         cached = nil;
     }
@@ -3354,6 +3457,10 @@ static id ApolloLPNativeLinkSpecWithBannedHintIfNeeded(id linkButtonNode, NSURL 
                 } else {
                     ApolloLPTriggerRelayoutForHost(strongSelf, hostCopy);
                 }
+                // V18: the trigger above is a no-op when this node is still
+                // detached (cell measured off-tree); verify the row height by
+                // geometry once things settle.
+                ApolloLPScheduleOverflowHeightCheck(strongSelf, hostCopy);
             });
         }
         ApolloLPClearHostShell((ASDisplayNode *)self);
@@ -3380,6 +3487,28 @@ static id ApolloLPNativeLinkSpecWithBannedHintIfNeeded(id linkButtonNode, NSURL 
             objc_setAssociatedObject(self, &kApolloLinkPreviewAreaKey, @(resolved), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
     }
+}
+
+// V18: cards whose final content rendered while the node was detached could
+// never fix their row height (no owning cell at refresh time). Verify the
+// geometry whenever the card scrolls on screen; only broken rows reload.
+- (void)didEnterVisibleState {
+    %orig;
+    ApolloLPScheduleOverflowHeightCheck((ASDisplayNode *)self, @"visible-check");
+}
+
+%end
+
+// V18: Apollo's native tweet card (data via the TweetBuddy shim) hits the
+// same stale-row-height race when the tweet arrives after the row was
+// measured — the info node materializes late and bleeds over the footer.
+// Its didLoad is the earliest point with real geometry; the overflow check
+// keeps healthy rows untouched.
+%hook _TtC6Apollo23LinkButtonTweetInfoNode
+
+- (void)didLoad {
+    %orig;
+    ApolloLPScheduleOverflowHeightCheck((ASDisplayNode *)self, @"tweet-info");
 }
 
 %end
@@ -3455,4 +3584,6 @@ static id ApolloLPNativeLinkSpecWithBannedHintIfNeeded(id linkButtonNode, NSURL 
     ApolloLog(@"[LinkPreviews] V12 hero image ratio cap 0.6 + nature/client-challenge bypass active");
     ApolloLog(@"[LinkPreviews] V14 translation-aware metadata text active");
     ApolloLog(@"[LinkPreviews] V15 targeted translation refresh active");
+    ApolloLog(@"[LinkPreviews] V18 stale row-height watchdog active (late twitter/bsky cards)");
+    ApolloLog(@"[LinkPreviews] V19 bluesky multiline body active");
 }
