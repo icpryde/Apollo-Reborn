@@ -140,6 +140,8 @@ typedef struct {
 
 static void ApolloLPLogOncePerHost(NSString *host, NSString *event);
 static void ApolloLPTriggerRelayoutForHost(ASDisplayNode *node, NSString *host);
+static BOOL ApolloLPInvokeRowReloadIfPossible(ASDisplayNode *startNode, NSString *host);
+static ASDisplayNode *ApolloLPFindOwningCellNode(ASDisplayNode *node);
 static BOOL ApolloLPIsRedditUserProfileURL(NSURL *url);
 static NSString *ApolloLPRedditUsernameFromProfileURL(NSURL *url);
 static BOOL ApolloLPIsRedditSubredditURL(NSURL *url);
@@ -902,6 +904,47 @@ static void ApolloLPSetAvatarNodeVisible(ASNetworkImageNode *avatarNode, BOOL vi
     avatarNode.hidden = !visible;
 }
 
+// V21: dead preview images. Clip hosts (streamin, streamff, ...) publish an
+// og:image URL before the thumbnail file actually exists — fresh clips 404
+// for the first few minutes. Remember definitive 4xx failures per URL so the
+// card can render compact instead of a hero with a big blank image area; the
+// mark expires so the card upgrades itself once the thumbnail is generated.
+static const NSTimeInterval kApolloLPDeadImageRetryCooldown = 300.0;
+
+// Declared here (used by both the dead-image path and the V20 shrink path):
+// host string of a row reload that failed while the node was detached, to be
+// re-fired from didEnterVisibleState.
+static char kApolloLPPendingRowReloadHostKey;
+
+static NSMutableDictionary<NSString *, NSDate *> *ApolloLPDeadImageURLs(void) {
+    static NSMutableDictionary *map;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ map = [NSMutableDictionary dictionary]; });
+    return map;
+}
+
+static void ApolloLPMarkImageURLDead(NSURL *url) {
+    NSString *key = url.absoluteString;
+    if (key.length == 0) return;
+    @synchronized (ApolloLPDeadImageURLs()) {
+        ApolloLPDeadImageURLs()[key] = [NSDate date];
+    }
+}
+
+static BOOL ApolloLPImageURLIsDead(NSURL *url) {
+    NSString *key = url.absoluteString;
+    if (key.length == 0) return NO;
+    @synchronized (ApolloLPDeadImageURLs()) {
+        NSDate *diedAt = ApolloLPDeadImageURLs()[key];
+        if (!diedAt) return NO;
+        if ([[NSDate date] timeIntervalSinceDate:diedAt] > kApolloLPDeadImageRetryCooldown) {
+            [ApolloLPDeadImageURLs() removeObjectForKey:key];
+            return NO;
+        }
+        return YES;
+    }
+}
+
 static void ApolloLPApplyFallbackImage(ASNetworkImageNode *imageNode, NSURL *imageURL, UIImage *image, NSString *host) {
     if (!imageNode || !image || image.size.width <= 0.0 || image.size.height <= 0.0) return;
     NSURL *currentURL = objc_getAssociatedObject(imageNode, &kApolloLinkPreviewImageFallbackURLKey);
@@ -923,6 +966,10 @@ static void ApolloLPApplyFallbackImage(ASNetworkImageNode *imageNode, NSURL *ima
 
 static void ApolloLPStartFallbackImageFetch(ASNetworkImageNode *imageNode, NSURL *imageURL, NSString *host) {
     if (!imageNode || !ApolloLPURLIsHTTP(imageURL)) return;
+    // Dead-marked URLs don't get re-fetched during the cooldown — refetching
+    // on every re-render loops: 404 -> reflow -> row reload -> re-render ->
+    // fetch -> 404 ... (one reload per second, visible as flickering cells).
+    if (ApolloLPImageURLIsDead(imageURL)) return;
     NSString *key = imageURL.absoluteString;
     if (key.length == 0) return;
 
@@ -943,6 +990,7 @@ static void ApolloLPStartFallbackImageFetch(ASNetworkImageNode *imageNode, NSURL
     NSString *hostCopy = [host copy];
     [[[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
         UIImage *image = data.length > 0 ? [UIImage imageWithData:data scale:UIScreen.mainScreen.scale] : nil;
+        BOOL definitivelyDead = NO;
         if (image) {
             NSUInteger cost = (NSUInteger)(image.size.width * image.size.height * image.scale * image.scale * 4.0);
             [ApolloLPFallbackImageCache() setObject:image forKey:key cost:cost];
@@ -954,6 +1002,11 @@ static void ApolloLPStartFallbackImageFetch(ASNetworkImageNode *imageNode, NSURL
                       (unsigned long)data.length,
                       error.localizedDescription ?: @"nil",
                       imageURL.absoluteString);
+            // 4xx = the file genuinely isn't there (clip hosts publish og:image
+            // before generating the thumbnail). Transient network errors and
+            // 5xx don't dead-mark, so flaky connectivity can't compact-ify
+            // every card.
+            definitivelyDead = httpResponse.statusCode >= 400 && httpResponse.statusCode < 500;
         }
 
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -961,12 +1014,37 @@ static void ApolloLPStartFallbackImageFetch(ASNetworkImageNode *imageNode, NSURL
             if (!strongImageNode) return;
             objc_setAssociatedObject(strongImageNode, &kApolloLinkPreviewImageFallbackInFlightKey, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             ApolloLPApplyFallbackImage(strongImageNode, imageURL, image, hostCopy);
+
+            if (definitivelyDead && !ApolloLPImageURLIsDead(imageURL)) {
+                // V21: re-render the host card as compact instead of leaving a
+                // dead hero image area, and fix the row height (or defer the
+                // reload to visibility if the node is detached, as in V20).
+                // The reflow fires only on the FIRST death of a URL — the
+                // dead-mark suppresses further fetches, so repeats mean a
+                // race, and reflowing again would loop the row reload.
+                ApolloLPMarkImageURLDead(imageURL);
+                ASDisplayNode *hostNode = (ASDisplayNode *)strongImageNode;
+                for (int hops = 0; hostNode && hops < 24; hops++) {
+                    if ([NSStringFromClass([hostNode class]) containsString:@"LinkButtonNode"]) break;
+                    hostNode = hostNode.supernode;
+                }
+                if (hostNode) {
+                    ApolloLog(@"[LinkPreviews] V21-dead-image-compact-reflow host=%@", hostCopy ?: ApolloLPHost(imageURL));
+                    ApolloLPTriggerRelayoutForHost(hostNode, hostCopy);
+                    ASDisplayNode *cellNode = ApolloLPFindOwningCellNode(hostNode);
+                    if (!ApolloLPInvokeRowReloadIfPossible(cellNode ?: hostNode, hostCopy)) {
+                        objc_setAssociatedObject(hostNode, &kApolloLPPendingRowReloadHostKey,
+                                                 hostCopy ?: @"?", OBJC_ASSOCIATION_COPY_NONATOMIC);
+                    }
+                }
+            }
         });
     }] resume];
 }
 
 static void ApolloLPScheduleImageFallbackIfNeeded(ASNetworkImageNode *imageNode, NSURL *imageURL, NSString *host) {
     if (!imageNode || !ApolloLPURLIsHTTP(imageURL)) return;
+    if (ApolloLPImageURLIsDead(imageURL)) return;
     objc_setAssociatedObject(imageNode, &kApolloLinkPreviewImageFallbackURLKey, imageURL, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
     NSString *cacheKey = imageURL.absoluteString;
@@ -1870,7 +1948,9 @@ static id ApolloLPBuildCompactCardSpec(ASDisplayNode *hostNode, NSURL *url, Apol
     [[textStack style] setValue:@1.0 forKey:@"flexShrink"];
 
     NSMutableArray *rowChildren = [NSMutableArray array];
-    if (preview.imageURL.absoluteString.length > 0) {
+    // Dead-marked images (V21) render text-only — an 84pt square that will
+    // never load is just a blank box next to the title.
+    if (preview.imageURL.absoluteString.length > 0 && !ApolloLPImageURLIsDead(preview.imageURL)) {
         imageNode.contentMode = UIViewContentModeScaleAspectFill;
         imageNode.cornerRadius = 8.0;
         ApolloLPApplyStyleSize([imageNode style], CGSizeMake(84.0, 84.0));
@@ -2647,10 +2727,9 @@ static void ApolloLPTriggerRelayoutForHost(ASDisplayNode *node, NSString *host) 
 // BOTH reload attempts below miss ("row-reload-miss no-scroll-cell") and the
 // row keeps its tall hero-placeholder height around a small compact card.
 // Geometry can't detect this oversize case (a card shorter than its cell is
-// normal), so remember the failure on the node and re-fire the reload from
+// normal), so remember the failure on the node (kApolloLPPendingRowReloadHostKey,
+// declared with the dead-image helpers) and re-fire the reload from
 // didEnterVisibleState once the cell actually exists on screen.
-static char kApolloLPPendingRowReloadHostKey;
-
 static void ApolloLPTriggerPlaceholderContextRelayout(ASDisplayNode *node, NSString *host, ApolloLPContext fromContext, ApolloLPContext toContext) {
     if (!node) return;
 
@@ -3436,6 +3515,16 @@ static id ApolloLPNativeLinkSpecWithBannedHintIfNeeded(id linkButtonNode, NSURL 
         }
     }
 
+    // V21: the preview scraped an image URL but the file 404s (clip hosts
+    // publish og:image before the thumbnail exists). Render compact instead
+    // of a hero with a dead image area; the mark expires (5 min) so the card
+    // upgrades itself once the host generates the thumbnail.
+    if (context == ApolloLPContextSelfText && !isBlueskyPost && !isRedditUser && !isRedditSubreddit &&
+        ApolloLPImageURLIsDead(displayPreview.imageURL)) {
+        context = ApolloLPContextCompact;
+        ApolloLPLogOncePerHost(host, @"V21-dead-image-compact");
+    }
+
     ApolloLPLogMetadataOnce(host, displayPreview, area, selectedMode, context);
     if (!isBlueskyPost && !isRedditUser && !isRedditSubreddit && displayPreview.imageIsFallbackIcon) {
         ApolloLPRememberCompactPlaceholderHost(url);
@@ -3617,4 +3706,5 @@ static id ApolloLPNativeLinkSpecWithBannedHintIfNeeded(id linkButtonNode, NSURL 
     ApolloLog(@"[LinkPreviews] V18 stale row-height watchdog active (late twitter/bsky cards)");
     ApolloLog(@"[LinkPreviews] V19 bluesky multiline body active");
     ApolloLog(@"[LinkPreviews] V20 deferred compact-shrink row reload active");
+    ApolloLog(@"[LinkPreviews] V21 dead-image compact reflow active (clip-host thumbnails)");
 }
