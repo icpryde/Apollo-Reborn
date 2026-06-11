@@ -660,7 +660,7 @@ typedef NS_ENUM(NSInteger, Tag) {
         case SectionBackupRestore: return 2;
         case SectionAPIKeys: return 9; // 7 text fields + Can't sign in? + API key setup guide
         case SectionGeneral: return sShowDeletedComments ? 11 : 10;
-        case SectionMedia: return (sShowUserAvatars ? 14 : 13) + (sEnableInlineImages ? 0 : -kApolloMediaInlineDependentRows);
+        case SectionMedia: return (sShowUserAvatars ? 15 : 14) + (sEnableInlineImages ? 0 : -kApolloMediaInlineDependentRows);
         case SectionSubreddits: return sSubredditListEnhancements ? 9 : 8;
         case SectionNotificationBackend: return 3; // URL + Registration Token + Test Connection
         case SectionAbout: return 5; // GitHub + Reddit + Thanks To + Export Logs + Version
@@ -1158,16 +1158,21 @@ typedef NS_ENUM(NSInteger, Tag) {
             return cell;
         }
         case 10:
+            return [self switchCellWithIdentifier:@"Cell_Media_TextPostThumbnails"
+                                            label:@"Text Post Thumbnails"
+                                               on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyFeedTextPostThumbnails]
+                                           action:@selector(textPostThumbnailsSwitchToggled:)];
+        case 11:
             return [self switchCellWithIdentifier:@"Cell_Media_UserAvatars"
                                             label:@"Show User Profile Pictures"
                                                on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowUserAvatars]
                                            action:@selector(userAvatarsSwitchToggled:)];
-        case 11:
+        case 12:
             return [self switchCellWithIdentifier:@"Cell_Media_ProfileTabAvatar"
                                             label:@"Profile Picture Tab Icon"
                                                on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyUseProfileAvatarTabIcon]
                                            action:@selector(profileTabAvatarSwitchToggled:)];
-        case 12: {
+        case 13: {
             BOOL avatarsOn = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowUserAvatars];
             if (avatarsOn) {
                 UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_Media_ClearAvatarCache"];
@@ -1188,7 +1193,7 @@ typedef NS_ENUM(NSInteger, Tag) {
             cell.selectionStyle = UITableViewCellSelectionStyleDefault;
             return cell;
         }
-        case 13: {
+        case 14: {
             UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_Media_ClearLinkPreviewCache"];
             if (!cell) {
                 cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"Cell_Media_ClearLinkPreviewCache"];
@@ -1605,9 +1610,9 @@ typedef NS_ENUM(NSInteger, Tag) {
             [self presentLinkPreviewModeSheetFromSourceView:cell body:NO];
         } else if (row == 9) {
             [self presentLinkPreviewCardColorSheetFromSourceView:cell];
-        } else if (row == 12 && sShowUserAvatars) {
+        } else if (row == 13 && sShowUserAvatars) {
             [self promptClearProfilePictureCacheFromSourceView:cell];
-        } else if ((row == 12 && !sShowUserAvatars) || (row == 13 && sShowUserAvatars)) {
+        } else if ((row == 13 && !sShowUserAvatars) || (row == 14 && sShowUserAvatars)) {
             [self promptClearLinkPreviewCacheFromSourceView:cell];
         }
     } else if (indexPath.section == SectionNotificationBackend && indexPath.row == 2) {
@@ -1651,7 +1656,7 @@ typedef NS_ENUM(NSInteger, Tag) {
     }
     if (indexPath.section == SectionMedia) {
         NSInteger row = ApolloMediaLogicalRow(indexPath.row);
-        return (row == 0 || row == 1 || row == 2 || row == 5 || row == 6 || row == 7 || row == 8 || row == 9 || row == 12 || row == 13);
+        return (row == 0 || row == 1 || row == 2 || row == 5 || row == 6 || row == 7 || row == 8 || row == 9 || row == 13 || row == 14);
     }
     if (indexPath.section == SectionAbout && (indexPath.row == 0 || indexPath.row == 1 || indexPath.row == 2 || indexPath.row == 3)) return YES;
     if (indexPath.section == SectionNotificationBackend && indexPath.row == 2) return YES;
@@ -2035,19 +2040,24 @@ typedef NS_ENUM(NSInteger, Tag) {
     [[NSNotificationCenter defaultCenter] postNotificationName:@"ApolloSubredditHeaderToggleChangedNotification" object:nil];
 }
 
+- (void)textPostThumbnailsSwitchToggled:(UISwitch *)sender {
+    sFeedTextPostThumbnails = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sFeedTextPostThumbnails forKey:UDKeyFeedTextPostThumbnails];
+}
+
 - (void)userAvatarsSwitchToggled:(UISwitch *)sender {
     BOOL wasOn = sShowUserAvatars;
     sShowUserAvatars = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:sShowUserAvatars forKey:UDKeyShowUserAvatars];
     [[NSNotificationCenter defaultCenter] postNotificationName:@"ApolloUserAvatarsToggleChangedNotification" object:nil];
     if (sShowUserAvatars == wasOn) return;
-    NSArray<NSIndexPath *> *paths = @[[NSIndexPath indexPathForRow:ApolloMediaPhysicalRow(12) inSection:SectionMedia]];
+    NSArray<NSIndexPath *> *paths = @[[NSIndexPath indexPathForRow:ApolloMediaPhysicalRow(13) inSection:SectionMedia]];
     if (sShowUserAvatars) {
         [self.tableView insertRowsAtIndexPaths:paths withRowAnimation:UITableViewRowAnimationFade];
     } else {
         [self.tableView deleteRowsAtIndexPaths:paths withRowAnimation:UITableViewRowAnimationFade];
     }
-    [self.tableView reloadRowsAtIndexPaths:@[[NSIndexPath indexPathForRow:ApolloMediaPhysicalRow(sShowUserAvatars ? 13 : 12) inSection:SectionMedia]]
+    [self.tableView reloadRowsAtIndexPaths:@[[NSIndexPath indexPathForRow:ApolloMediaPhysicalRow(sShowUserAvatars ? 14 : 13) inSection:SectionMedia]]
                           withRowAnimation:UITableViewRowAnimationNone];
 }
 
