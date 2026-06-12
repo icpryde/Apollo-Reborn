@@ -21,6 +21,44 @@ make package
 The Makefile automatically generates `src/Version.h` from the `control` file and links FFmpegKit libraries.
 `THEOS` is available at `~/theos`. Do not rely on Azule/Cyan living in `/tmp`; `build-ipa.sh` uses the repo-local `scripts/inject-deb-local.sh` first for this repo's already-injected `Apollo-base.ipa` flow, then falls back to `azule`/`cyan` only for truly stock IPAs.
 
+### Fast iteration in the iOS Simulator
+
+For UI/settings/nav-bar/Liquid Glass work, `scripts/run-in-sim.sh` runs the tweak inside the iOS Simulator so you can test a change in seconds without building an IPA, signing, or sideloading. **Use this as the default inner loop**; fall back to a device IPA only for the things the simulator can't do (see limits below).
+
+```bash
+scripts/run-in-sim.sh              # build the sim tweak, (re)prepare Apollo, launch it injected
+scripts/run-in-sim.sh --no-build   # relaunch without rebuilding the tweak
+scripts/run-in-sim.sh --logs       # also stream ApolloLog (os_log subsystem "apollofix") after launch
+scripts/run-in-sim.sh --drive      # after launch, capture the idb accessibility tree + a screenshot to ./.sim/
+scripts/run-in-sim.sh --fresh-app  # re-patch the base IPA from scratch (after a new apollo-base.ipa)
+scripts/run-in-sim.sh --dark       # boot the simulator in dark mode (--light forces light)
+scripts/run-in-sim.sh --glass      # apply the iOS 26 Liquid Glass patch (--no-glass disables)
+scripts/run-in-sim.sh --backup B.zip  # preload an Apollo settings backup (API keys + account)
+BUNDLE_ID=com.you.Build scripts/run-in-sim.sh   # run under a custom (rebranded) bundle id
+```
+
+How it works (and why each piece is needed):
+
+- **Apollo runs in the sim** because the script patches every Mach-O in `Payload/Apollo.app` (main binary + appex + frameworks) from `LC_BUILD_VERSION` platform iOS (2) to iOS-Simulator (7) and re-signs ad-hoc. The arm64 code is identical on an Apple Silicon Mac; only the platform tag blocks loading. This shell is cached under `./.sim/` and only re-prepared on `--fresh-app`.
+- **The tweak is built for the sim** with `make TARGET=simulator:clang:latest:14.0 LOGOS_DEFAULT_GENERATOR=internal APOLLO_SIM_BUILD=1`. The *internal* Logos generator swizzles via the ObjC runtime, so the dylib has **no CydiaSubstrate dependency** (the shipped device build links CydiaSubstrate, which can't load in the sim). `APOLLO_SIM_BUILD=1` makes the Makefile skip device-only **FFmpegKit** and the FLEX/openin subprojects, and `ApolloMedia.xm` stubs its FFmpeg v.redd.it audio fix under the same macro. `MSHookIvar` still works (it's a header-only ObjC-runtime template, force-included via `-include substrate.h`).
+- **The tweak is injected** via `SIMCTL_CHILD_DYLD_INSERT_LIBRARIES` pointing at `./.sim/ApolloReborn.dylib`. Code-only changes are just `scripts/run-in-sim.sh` again (rebuild + relaunch); no reinstall.
+- **The bundle id is configurable** via `BUNDLE_ID=...` (defaults to `com.christianselig.Apollo`). When it differs from the cached shell's id, the script re-prepares and rebrands the app + every appex `CFBundleIdentifier` (mirroring `scripts/rebrand-ipa.sh`; the `apollo://` scheme and the `group.com.christianselig.apollo` app group are left intact). Switching ids forces one re-prep (~15s), then caches. Device/runtime are overridable via `SIM_NAME`, `SIM_DEVICE_TYPE`, `SIM_RUNTIME`.
+- **Settings backups preload via `--backup file.zip`** (or `BACKUP_ZIP=...`, or by dropping the zip at `./.sim/backup.zip`, which is auto-loaded when no `--backup` is given): the script uninstalls first (wiping the data container + cfprefsd cache), reinstalls, then copies the backup's `preferences.plist` to `<container>/Library/Preferences/<BUNDLE_ID>.plist`, `group.plist` to `…/group.com.christianselig.apollo.plist`, and (if present) `keychain.plist` to `…/Library/Caches/ApolloKeychainSeed.plist`. In the simulator both the app and app-group domains live in the app data container (the group suite falls back there without full app-group provisioning), matching the tweak's own `NSHomeDirectory()`-based restore path. **A backup contains live account credentials; keep test zips out of the repo** (`./.sim/` is gitignored).
+  - **What loads:** the API keys (Reddit/Imgur/Giphy/ImageChest), the app-only OAuth session, **and your signed-in Reddit user account** — so profile, inbox, and voting work, not just browsing.
+  - **How the account restore works (and why it used to fail):** Apollo's `AccountManager` loads logged-in accounts on launch from the **keychain via Valet** (key `2RedditAccounts2`), and the *whole* load is gated behind `Valet.canAccessKeychain()`. An ad-hoc-signed simulator app has no `application-identifier`/`keychain-access-groups` entitlement, so securityd rejects every `Sec*` call with `errSecMissingEntitlement` (-34018) even after we strip `kSecAttrAccessGroup` — `canAccessKeychain()` returns NO, the load is skipped, and the restored account is pruned (`RedditAccounts2` ~50KB → ~219-byte empty array). Adding the entitlement is a dead end (the iOS-26 simulator refuses to launch an ad-hoc app carrying it). **Fix:** the tweak virtualizes Valet's keychain in the sim (`#if APOLLO_SIM_BUILD` in `Tweak.xm` — a plist-backed store under `Library/Caches/ApolloSimKeychain.plist` that backs `SecItemAdd/CopyMatching/Update/Delete` for Valet queries, so `canAccessKeychain()` passes and reads/writes work). The account blob can't be synthesized from the NSUserDefaults mirror — Apollo's keychain format is an array of `[String:String]` dicts, not the `[RDKClient]` archive the defaults hold — so `Backup Settings` now **captures Apollo's real Valet keychain items** (`CustomAPIViewController.m` → `keychain.plist`), and the sim seeds the virtual store from them. **Requires a backup exported by a build with this feature**; older backups have no `keychain.plist` and the account won't restore (the script prints a note). Device restore replays the same items into the real keychain.
+- **Appearance** is set with `xcrun simctl ui <DEV> appearance dark|light` via `--dark`/`--light` (or `APPEARANCE=`); it persists on the device until changed.
+- **Liquid Glass** is off by default (the raw `apollo-base.ipa` links against the iOS 16 SDK, so `IsLiquidGlass()` is NO and both UIKit's iOS-26 chrome and the tweak's LG hooks stay dormant). `--glass` (or `GLASS=1`) prepares the shell from a `patch.sh --liquid-glass` base — the canonical glass patcher, reused so it stays in sync: it bumps the main binary's linked SDK to iOS 26 (which flips `IsLiquidGlass()`, since `GetLinkedSDKVersion()` reads that field), drops the duplicate `@executable_path/Frameworks` LC_RPATH (iOS-26 dyld rejects it — otherwise the launch dies with an `SBMainWorkspace` denial), swaps in the prebuilt `Assets.car`, and writes the `CFBundleAlternateIcons` metadata that turns on the in-app icon picker. The glass base is cached at `./.sim/glass-base.ipa` (regenerated only when `apollo-base.ipa` changes); toggling `--glass`/`--no-glass` re-prepares the app shell (detected from the cached main binary's SDK). Needs the Git-LFS `liquid-glass/prebuilt/Assets.car` pulled (`git lfs pull`).
+
+**Verify the tweak actually loaded** (don't assume from a clean launch): check os_log for the `apollofix` subsystem — module load lines and `... hook installed ...` confirm the internal-generator hooks took:
+
+```bash
+xcrun simctl spawn "$(cat .sim/device.txt)" log show --last 2m --predicate 'subsystem == "apollofix"' | grep ApolloFix
+```
+
+**Driving the UI yourself (idb):** `brew install facebook/fb/idb-companion`. The `fb-idb` Python client breaks on Python 3.12+ (`asyncio.get_event_loop()` was removed), so install it into a **Python 3.11 venv** and point the script at it: `IDB=/path/to/venv/bin/idb scripts/run-in-sim.sh --drive`. Useful idb commands: `idb ui describe-all --udid <DEV>` (accessibility tree with labels + frames), `idb ui tap <x> <y>`, `idb ui text "..."`, `idb screenshot --udid <DEV> out.png`. Read screenshots back to confirm visual changes.
+
+**Simulator limits — use a device IPA for these:** APNs push (so Live Activities push-to-start can't be exercised in the sim), the FFmpeg v.redd.it CMAF/MPEG-TS audio remux (stubbed out), and anything genuinely device-only. (A signed-in user account *does* work in the sim now, via the keychain-capture backup above — provided the backup was exported by a build with that feature.) The sim *is* the same iOS 26.x family as the test device, so Liquid Glass nav-bar/tab-bar behavior reproduces faithfully.
+
 ## Project Structure
 
 ### Core Tweak Modules

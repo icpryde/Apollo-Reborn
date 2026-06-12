@@ -7,8 +7,10 @@
 #import "ApolloSubredditCustomBannerCache.h"
 #import "ApolloSubredditCustomIconCache.h"
 #import "ApolloSubredditInfoCache.h"
+#import "ApolloBannedProfile.h"
 #import "UserDefaultConstants.h"
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#import <Security/Security.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import "B64ImageEncodings.h"
@@ -657,11 +659,11 @@ typedef NS_ENUM(NSInteger, Tag) {
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     switch (section) {
-        case SectionBackupRestore: return 2;
+        case SectionBackupRestore: return 4;
         case SectionAPIKeys: return 9; // 7 text fields + Can't sign in? + API key setup guide
         case SectionGeneral: return sShowDeletedComments ? 11 : 10;
-        case SectionMedia: return (sShowUserAvatars ? 15 : 14) + (sEnableInlineImages ? 0 : -kApolloMediaInlineDependentRows);
-        case SectionSubreddits: return sSubredditListEnhancements ? 9 : 8;
+        case SectionMedia: return 13 + (sEnableInlineImages ? 0 : -kApolloMediaInlineDependentRows);
+        case SectionSubreddits: return sSubredditListEnhancements ? 8 : 7;
         case SectionNotificationBackend: return 3; // URL + Registration Token + Test Connection
         case SectionAbout: return 5; // GitHub + Reddit + Thanks To + Export Logs + Version
         default: return 0;
@@ -670,7 +672,7 @@ typedef NS_ENUM(NSInteger, Tag) {
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
     switch (section) {
-        case SectionBackupRestore: return @"Backup / Restore";
+        case SectionBackupRestore: return @"Data";
         case SectionAPIKeys: return @"API Keys";
         case SectionGeneral: return @"General";
         case SectionMedia: return @"Media";
@@ -1172,37 +1174,6 @@ typedef NS_ENUM(NSInteger, Tag) {
                                             label:@"Profile Picture Tab Icon"
                                                on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyUseProfileAvatarTabIcon]
                                            action:@selector(profileTabAvatarSwitchToggled:)];
-        case 13: {
-            BOOL avatarsOn = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowUserAvatars];
-            if (avatarsOn) {
-                UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_Media_ClearAvatarCache"];
-                if (!cell) {
-                    cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"Cell_Media_ClearAvatarCache"];
-                }
-                cell.textLabel.text = @"Clear Profile Picture Cache";
-                cell.textLabel.textColor = self.view.tintColor;
-                cell.selectionStyle = UITableViewCellSelectionStyleDefault;
-                return cell;
-            }
-            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_Media_ClearLinkPreviewCache"];
-            if (!cell) {
-                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"Cell_Media_ClearLinkPreviewCache"];
-            }
-            cell.textLabel.text = @"Clear Link Preview Cache";
-            cell.textLabel.textColor = self.view.tintColor;
-            cell.selectionStyle = UITableViewCellSelectionStyleDefault;
-            return cell;
-        }
-        case 14: {
-            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_Media_ClearLinkPreviewCache"];
-            if (!cell) {
-                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"Cell_Media_ClearLinkPreviewCache"];
-            }
-            cell.textLabel.text = @"Clear Link Preview Cache";
-            cell.textLabel.textColor = self.view.tintColor;
-            cell.selectionStyle = UITableViewCellSelectionStyleDefault;
-            return cell;
-        }
         default: return [[UITableViewCell alloc] init];
     }
 }
@@ -1256,16 +1227,6 @@ typedef NS_ENUM(NSInteger, Tag) {
                                                 placeholder:@"(empty)"
                                                        text:sRandNsfwSubredditsSource
                                                         tag:TagRandNsfwSubredditsSource];
-        case 8: {
-            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_Sub_ClearCustomBanners"];
-            if (!cell) {
-                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"Cell_Sub_ClearCustomBanners"];
-            }
-            cell.textLabel.text = @"Clear Custom Banners & Icons";
-            cell.textLabel.textColor = self.view.tintColor;
-            cell.selectionStyle = UITableViewCellSelectionStyleDefault;
-            return cell;
-        }
         default: return [[UITableViewCell alloc] init];
     }
 }
@@ -1321,15 +1282,23 @@ typedef NS_ENUM(NSInteger, Tag) {
 }
 
 - (UITableViewCell *)backupRestoreCellForRow:(NSInteger)row tableView:(UITableView *)tableView {
-    UITableViewCell *cell = [self.tableView dequeueReusableCellWithIdentifier:@"Cell_Backup"];
+    if (row == 0 || row == 1) {
+        UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_Backup"];
+        if (!cell) {
+            cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"Cell_Backup"];
+        }
+        cell.textLabel.text = (row == 0) ? @"Backup Settings" : @"Restore Settings";
+        cell.textLabel.textColor = self.view.tintColor;
+        cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+        return cell;
+    }
+
+    NSString *identifier = (row == 2) ? @"Cell_Data_ClearCaches" : @"Cell_Data_ClearCustomBanners";
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:identifier];
     if (!cell) {
-        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"Cell_Backup"];
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:identifier];
     }
-    if (row == 0) {
-        cell.textLabel.text = @"Backup Settings";
-    } else {
-        cell.textLabel.text = @"Restore Settings";
-    }
+    cell.textLabel.text = (row == 2) ? @"Clear Tweak Caches" : @"Clear Custom Banners & Icons";
     cell.textLabel.textColor = self.view.tintColor;
     cell.selectionStyle = UITableViewCellSelectionStyleDefault;
     return cell;
@@ -1561,10 +1530,15 @@ typedef NS_ENUM(NSInteger, Tag) {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
 
     if (indexPath.section == SectionBackupRestore) {
+        UITableViewCell *cell = [tableView cellForRowAtIndexPath:indexPath];
         if (indexPath.row == 0) {
             [self backupSettings];
-        } else {
+        } else if (indexPath.row == 1) {
             [self restoreSettings];
+        } else if (indexPath.row == 2) {
+            [self promptClearAllCachesFromSourceView:cell];
+        } else if (indexPath.row == 3) {
+            [self promptClearCustomSubredditBannersFromSourceView:cell];
         }
     } else if (indexPath.section == SectionAPIKeys) {
         if (indexPath.row == 7) {
@@ -1585,12 +1559,6 @@ typedef NS_ENUM(NSInteger, Tag) {
         } else if (indexPath.row == 3) {
             [self exportLogs];
         }
-    } else if (indexPath.section == SectionSubreddits) {
-        NSInteger logicalRow = (indexPath.row >= 1 && !sSubredditListEnhancements) ? indexPath.row + 1 : indexPath.row;
-        if (logicalRow == 8) {
-            UITableViewCell *cell = [tableView cellForRowAtIndexPath:indexPath];
-            [self promptClearCustomSubredditBannersFromSourceView:cell];
-        }
     } else if (indexPath.section == SectionMedia) {
         UITableViewCell *cell = [tableView cellForRowAtIndexPath:indexPath];
         NSInteger row = ApolloMediaLogicalRow(indexPath.row);
@@ -1610,10 +1578,6 @@ typedef NS_ENUM(NSInteger, Tag) {
             [self presentLinkPreviewModeSheetFromSourceView:cell body:NO];
         } else if (row == 9) {
             [self presentLinkPreviewCardColorSheetFromSourceView:cell];
-        } else if (row == 13 && sShowUserAvatars) {
-            [self promptClearProfilePictureCacheFromSourceView:cell];
-        } else if ((row == 13 && !sShowUserAvatars) || (row == 14 && sShowUserAvatars)) {
-            [self promptClearLinkPreviewCacheFromSourceView:cell];
         }
     } else if (indexPath.section == SectionNotificationBackend && indexPath.row == 2) {
         [self testNotificationBackendConnection];
@@ -1650,13 +1614,9 @@ typedef NS_ENUM(NSInteger, Tag) {
 - (BOOL)tableView:(UITableView *)tableView shouldHighlightRowAtIndexPath:(NSIndexPath *)indexPath {
     if (indexPath.section == SectionBackupRestore) return YES;
     if (indexPath.section == SectionAPIKeys && (indexPath.row == 7 || indexPath.row == 8)) return YES;
-    if (indexPath.section == SectionSubreddits) {
-        NSInteger logicalRow = (indexPath.row >= 1 && !sSubredditListEnhancements) ? indexPath.row + 1 : indexPath.row;
-        return logicalRow == 8;
-    }
     if (indexPath.section == SectionMedia) {
         NSInteger row = ApolloMediaLogicalRow(indexPath.row);
-        return (row == 0 || row == 1 || row == 2 || row == 5 || row == 6 || row == 7 || row == 8 || row == 9 || row == 13 || row == 14);
+        return (row == 0 || row == 1 || row == 2 || row == 5 || row == 6 || row == 7 || row == 8 || row == 9);
     }
     if (indexPath.section == SectionAbout && (indexPath.row == 0 || indexPath.row == 1 || indexPath.row == 2 || indexPath.row == 3)) return YES;
     if (indexPath.section == SectionNotificationBackend && indexPath.row == 2) return YES;
@@ -2046,19 +2006,9 @@ typedef NS_ENUM(NSInteger, Tag) {
 }
 
 - (void)userAvatarsSwitchToggled:(UISwitch *)sender {
-    BOOL wasOn = sShowUserAvatars;
     sShowUserAvatars = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:sShowUserAvatars forKey:UDKeyShowUserAvatars];
     [[NSNotificationCenter defaultCenter] postNotificationName:@"ApolloUserAvatarsToggleChangedNotification" object:nil];
-    if (sShowUserAvatars == wasOn) return;
-    NSArray<NSIndexPath *> *paths = @[[NSIndexPath indexPathForRow:ApolloMediaPhysicalRow(13) inSection:SectionMedia]];
-    if (sShowUserAvatars) {
-        [self.tableView insertRowsAtIndexPaths:paths withRowAnimation:UITableViewRowAnimationFade];
-    } else {
-        [self.tableView deleteRowsAtIndexPaths:paths withRowAnimation:UITableViewRowAnimationFade];
-    }
-    [self.tableView reloadRowsAtIndexPaths:@[[NSIndexPath indexPathForRow:ApolloMediaPhysicalRow(sShowUserAvatars ? 14 : 13) inSection:SectionMedia]]
-                          withRowAnimation:UITableViewRowAnimationNone];
 }
 
 - (void)profileTabAvatarSwitchToggled:(UISwitch *)sender {
@@ -2067,16 +2017,26 @@ typedef NS_ENUM(NSInteger, Tag) {
     [[NSNotificationCenter defaultCenter] postNotificationName:@"ApolloProfileTabAvatarIconChangedNotification" object:nil];
 }
 
-- (void)promptClearProfilePictureCacheFromSourceView:(UIView *)sourceView {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Clear Profile Picture Cache?"
-                                                                   message:@"Cached user avatars, banners, and profile metadata will be removed. They'll be re-downloaded the next time they're shown."
+- (void)promptClearAllCachesFromSourceView:(UIView *)sourceView {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Clear Tweak Caches?"
+                                                                   message:@"This removes cached profile pictures, banners, link previews, and remembered banned-profile dismissals."
                                                             preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [alert addAction:[UIAlertAction actionWithTitle:@"Clear" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *action) {
         [[ApolloUserProfileCache sharedCache] clearAllCaches];
+        [[ApolloLinkPreviewCache sharedCache] flushCache];
+        [[ApolloSubredditInfoCache sharedCache] clearAllCaches];
+        ApolloBannedProfileClearDismissedOverlays();
         // Re-broadcast the avatars-toggle notification so visible profile headers reload immediately.
         [[NSNotificationCenter defaultCenter] postNotificationName:@"ApolloUserAvatarsToggleChangedNotification" object:nil];
     }]];
+
+    UIPopoverPresentationController *popover = alert.popoverPresentationController;
+    if (popover && sourceView) {
+        popover.sourceView = sourceView;
+        popover.sourceRect = sourceView.bounds;
+    }
+
     [self presentViewController:alert animated:YES completion:nil];
 }
 
@@ -2205,23 +2165,75 @@ typedef NS_ENUM(NSInteger, Tag) {
     [self presentViewController:alert animated:YES completion:nil];
 }
 
-- (void)promptClearLinkPreviewCacheFromSourceView:(__unused UIView *)sourceView {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Clear Link Preview Cache?"
-                                                                   message:@"Cached link preview titles, descriptions, and thumbnails will be removed."
-                                                            preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Clear" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *action) {
-        [[ApolloLinkPreviewCache sharedCache] flushCache];
-    }]];
-    [self presentViewController:alert animated:YES completion:nil];
-}
-
 #pragma mark - Backup / Restore
 
 static NSString *const kMainPlistFilename = @"preferences.plist";
 static NSString *const kGroupPlistFilename = @"group.plist";
 static NSString *const kAccountsFilename = @"accounts.txt";
+static NSString *const kKeychainPlistFilename = @"keychain.plist";
 static NSString *const kGroupSuiteName = @"group.com.christianselig.apollo";
+
+// Apollo stores logged-in account credentials in the keychain via Valet, whose internal
+// service name embeds the app's bundle id. Match on that substring to capture only Apollo's
+// own keychain items (account blobs, the application-only account, Ultra/Pro flags, etc.).
+static NSString *const kValetServiceSubstring = @"com.christianselig.Apollo";
+
+// Capture Apollo's Valet keychain items so a backup can fully restore a signed-in session —
+// not just the NSUserDefaults mirror. Returns an array of { service, account, data } dicts.
+// The accounts blob lives only in the keychain in Apollo's load path, so without this a
+// restored backup can't sign the user back in. Pairs with ApolloReplayValetKeychainItems and,
+// in the simulator, with the tweak's keychain shim (which serves these on launch).
+static NSArray<NSDictionary *> *ApolloCaptureValetKeychainItems(void) {
+    NSMutableArray *items = [NSMutableArray array];
+    NSDictionary *query = @{
+        (__bridge id)kSecClass:            (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecMatchLimit:       (__bridge id)kSecMatchLimitAll,
+        (__bridge id)kSecReturnAttributes: @YES,
+        (__bridge id)kSecReturnData:       @YES,
+    };
+    CFTypeRef result = NULL;
+    OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)query, &result);
+    if (st != errSecSuccess || !result) {
+        if (result) CFRelease(result);
+        return items;
+    }
+    NSArray *found = (__bridge_transfer NSArray *)result;
+    for (NSDictionary *item in found) {
+        NSString *service = item[(__bridge id)kSecAttrService];
+        NSData *data = item[(__bridge id)kSecValueData];
+        if (![service isKindOfClass:[NSString class]] || ![service containsString:kValetServiceSubstring]) continue;
+        if (![data isKindOfClass:[NSData class]]) continue;
+        NSString *account = item[(__bridge id)kSecAttrAccount];
+        [items addObject:@{
+            @"service": service,
+            @"account": ([account isKindOfClass:[NSString class]] ? account : @""),
+            @"data":    data,
+        }];
+    }
+    return items;
+}
+
+// Replay captured Valet keychain items back into the keychain. On a device this writes the
+// real keychain (our SecItem hooks strip the access group so the unsigned/sideloaded app can
+// store them); in the simulator the tweak's keychain shim intercepts these adds.
+static void ApolloReplayValetKeychainItems(NSArray<NSDictionary *> *items) {
+    for (NSDictionary *item in items) {
+        NSData *data = item[@"data"];
+        if (![data isKindOfClass:[NSData class]]) continue;
+        NSDictionary *identity = @{
+            (__bridge id)kSecClass:        (__bridge id)kSecClassGenericPassword,
+            (__bridge id)kSecAttrService:  (item[@"service"] ?: @""),
+            (__bridge id)kSecAttrAccount:  (item[@"account"] ?: @""),
+        };
+        NSMutableDictionary *add = [identity mutableCopy];
+        add[(__bridge id)kSecValueData] = data;
+        OSStatus st = SecItemAdd((__bridge CFDictionaryRef)add, NULL);
+        if (st == errSecDuplicateItem) {
+            SecItemUpdate((__bridge CFDictionaryRef)identity,
+                          (__bridge CFDictionaryRef)@{ (__bridge id)kSecValueData: data });
+        }
+    }
+}
 
 // Default: Library/Preferences/com.christianselig.Apollo.plist, depending on bundle ID.
 // Contains: most Apollo settings
@@ -2295,6 +2307,16 @@ static NSString *const kGroupSuiteName = @"group.com.christianselig.apollo";
             NSString *accountsPath = [backupDir stringByAppendingPathComponent:kAccountsFilename];
             [accountsContent writeToFile:accountsPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
         }
+    }
+
+    // Capture Apollo's keychain account credentials (the accounts blob, application-only
+    // account, etc.). These live only in the keychain in Apollo's load path, so this is what
+    // lets a restore — or a simulator run — sign the user back in. Written as a plist of
+    // { service, account, data } items. (Same sensitivity as accounts.txt: keep the zip private.)
+    NSArray *keychainItems = ApolloCaptureValetKeychainItems();
+    if (keychainItems.count > 0) {
+        NSString *keychainDestPath = [backupDir stringByAppendingPathComponent:kKeychainPlistFilename];
+        [keychainItems writeToFile:keychainDestPath atomically:YES];
     }
 
     NSDateFormatter *dateFormatter = [[NSDateFormatter alloc] init];
@@ -2453,16 +2475,11 @@ static NSString *const kGroupSuiteName = @"group.com.christianselig.apollo";
     NSString *libreAPIKey = [defaults stringForKey:UDKeyLibreTranslateAPIKey];
     sLibreTranslateAPIKey = libreAPIKey.length > 0 ? libreAPIKey : nil;
 
-    // Restore group preferences, including logged-in accounts.
-    //
-    // The account keys (RedditAccounts2, RedditApplicationOnlyAccount2,
-    // CurrentRedditAccountIndex, LoggedInAccountDetails) hold the Reddit OAuth tokens as
-    // self-contained NSKeyedArchiver blobs (RDKClient -> RDKOAuthCredential ->
-    // RDKAccessToken). They carry no keychain dependency and no device binding, so writing
-    // them here and relaunching (exit(0) below) lets AccountManager reload them on next
-    // launch — the user is signed back in without reauthenticating. The restored API keys
-    // (main prefs) match the keys the tokens were minted under, keeping token refresh
-    // consistent.
+    // Restore group preferences, including the NSUserDefaults account state
+    // (LoggedInAccountDetails, CurrentRedditAccountIndex, and the RedditAccounts2 /
+    // RedditApplicationOnlyAccount2 mirrors). Apollo's AccountManager actually loads accounts
+    // from the *keychain* via Valet on launch — gated behind Valet.canAccessKeychain() — so
+    // these defaults alone don't sign the user in; the keychain replay below is what does.
     //
     // Non-destructive by design: only keys present in the backup are written. A backup made
     // while logged out has no account keys, so the current install's accounts are left
@@ -2478,6 +2495,15 @@ static NSString *const kGroupSuiteName = @"group.com.christianselig.apollo";
             }
             [groupDefaults synchronize];
         }
+    }
+
+    // Replay the captured keychain account credentials. This is the part that signs the user
+    // back in: AccountManager reads these on the next launch (after exit(0) below). Backups
+    // made before this feature shipped have no keychain.plist and simply skip it.
+    NSString *keychainBackupPath = [extractDir stringByAppendingPathComponent:kKeychainPlistFilename];
+    NSArray *keychainItems = [NSArray arrayWithContentsOfFile:keychainBackupPath];
+    if (keychainItems.count > 0) {
+        ApolloReplayValetKeychainItems(keychainItems);
     }
 
     [fileManager removeItemAtPath:extractDir error:nil];
