@@ -3691,20 +3691,4 @@ static id ApolloLPNativeLinkSpecWithBannedHintIfNeeded(id linkButtonNode, NSURL 
     }];
 
     ApolloLog(@"[LinkPreviews] ctor: hook installed for _TtC6Apollo14LinkButtonNode bodyMode=%ld commentsMode=%ld cardColor=%ld", (long)sLinkPreviewBodyMode, (long)sLinkPreviewCommentsMode, (long)sLinkPreviewCardColor);
-    ApolloLog(@"[LinkPreviews] V5 polish active");
-    ApolloLog(@"[LinkPreviews] V6 image-kind polish active");
-    ApolloLog(@"[LinkPreviews] V7 display modes and placeholders active");
-    ApolloLog(@"[LinkPreviews] V8 borderless cards active");
-    ApolloLog(@"[LinkPreviews] V9 split body/comment modes active");
-    ApolloLog(@"[LinkPreviews] V10 preview text restore active");
-    ApolloLog(@"[LinkPreviews] V11 hero-card stability and naked-URL hiding active");
-    ApolloLog(@"[LinkPreviews] V13 preset card colors and instant color refresh active");
-    ApolloLog(@"[LinkPreviews] V12 cleanup hero sizing active");
-    ApolloLog(@"[LinkPreviews] V12 hero image ratio cap 0.6 + nature/client-challenge bypass active");
-    ApolloLog(@"[LinkPreviews] V14 translation-aware metadata text active");
-    ApolloLog(@"[LinkPreviews] V15 targeted translation refresh active");
-    ApolloLog(@"[LinkPreviews] V18 stale row-height watchdog active (late twitter/bsky cards)");
-    ApolloLog(@"[LinkPreviews] V19 bluesky multiline body active");
-    ApolloLog(@"[LinkPreviews] V20 deferred compact-shrink row reload active");
-    ApolloLog(@"[LinkPreviews] V21 dead-image compact reflow active (clip-host thumbnails)");
 }
