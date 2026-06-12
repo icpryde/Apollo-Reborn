@@ -189,6 +189,9 @@ static char kApolloFeedHeroLinkKey;
 // (NSArray<NSDictionary *> with @"url"), used when the hero is tapped.
 static char kApolloFeedViewerItemsKey;
 
+// NSNumber(BOOL) on a compact thumbnail node: our tap target is attached.
+static char kApolloFeedCompactTapWiredKey;
+
 // Shared ASNetworkImageNode delegate that fades the hero image in once it
 // finishes loading. ASNetworkImageNode's placeholderFadeDuration only fades the
 // (near-transparent) placeholder layer out, so the downloaded image still
@@ -545,6 +548,8 @@ static BOOL ApolloFeedRouteURLToNativeHandler(id startNode, NSURL *url) {
 // Shared tap handler: opens the tapped text post's embedded image the same
 // way a normal image post opens its media, instead of confusingly opening
 // the thread.
+static id ApolloFeedIvar(id obj, const char *name);
+
 @interface ApolloFeedHeroTapHandler : NSObject
 @end
 
@@ -563,16 +568,11 @@ static BOOL ApolloFeedRouteURLToNativeHandler(id startNode, NSURL *url) {
         ASDisplayNode *node = (ASDisplayNode *)sender;
         UIView *sourceView = [node isNodeLoaded] ? [node view] : nil;
 
-        // Multi-image posts use the tweak's album viewer so every embedded
-        // image is swipeable — Apollo's native viewer can only take a single
-        // ad-hoc URL through the link-tap route.
-        if (items.count > 1) {
-            ApolloLog(@"[FeedThumb] hero tapped: presenting %lu-image album", (unsigned long)items.count);
-            if (ApolloPresentImageChestItems(items, sourceView, 0)) return;
-        }
-
-        // Single image: Apollo's native MediaViewer via the link-tap handler
-        // on the hero's supernode chain.
+        // Open the hero's image in Apollo's NATIVE media viewer via the
+        // link-tap handler on the supernode chain (review feedback on the
+        // PR: native viewer with its bottom toolbar and flick-to-dismiss
+        // beats a custom gallery; the hero shows the first image, so that's
+        // the one that opens).
         NSURL *url = [items.firstObject[@"url"] isKindOfClass:[NSURL class]] ? items.firstObject[@"url"] : nil;
         if (ApolloFeedRouteURLToNativeHandler(sender, url)) return;
 
@@ -582,6 +582,29 @@ static BOOL ApolloFeedRouteURLToNativeHandler(id startNode, NSURL *url) {
         if (items.count > 0) {
             ApolloPresentImageChestItems(items, sourceView, 0);
         }
+    } @catch (__unused NSException *e) {}
+}
+
+// Compact thumbnails we filled have no Apollo-wired tap action (Apollo only
+// wires one for posts with media), so we attach this. Walks to the cell and
+// replays its thumbnailTappedWithSender: — intercepted by the hook below,
+// which points the link at the image so Apollo presents its native viewer.
+// No-ops unless the post is still an eligible self post, so a reused
+// thumbnail node on a media post can't double-fire Apollo's own action.
+- (void)compactThumbTapped:(id)sender {
+    @try {
+        id target = sender;
+        for (int hops = 0; target && hops < 24; hops++) {
+            if ([target respondsToSelector:@selector(thumbnailTappedWithSender:)]) break;
+            target = [target respondsToSelector:@selector(supernode)] ? [target supernode] : nil;
+        }
+        if (!target) {
+            ApolloLog(@"[FeedThumb] compact thumb tap: no cell handler in chain");
+            return;
+        }
+        RDKLink *link = ApolloFeedIvar(target, "link");
+        if (!(link.selfPost && ApolloFeedThumbnailURLForLink(link))) return;
+        ((void (*)(id, SEL, id))objc_msgSend)(target, @selector(thumbnailTappedWithSender:), sender);
     } @catch (__unused NSException *e) {}
 }
 @end
@@ -763,6 +786,22 @@ static void ApolloFeedReapplyCleanup(id node, BOOL triggerLayout) {
         if (url) {
             id thumb = MSHookIvar<id>(self, "thumbnailNode");
             ApolloFeedApplyThumbnailURL(thumb, url);
+            // Apollo wires the thumbnail's tap action only for posts with
+            // media, so the squares we fill are inert — taps fell through to
+            // the cell and opened the thread (review feedback on the PR).
+            // Wire our own target once per node; the handler re-checks
+            // eligibility, so node reuse on media posts stays Apollo's.
+            if (![objc_getAssociatedObject(thumb, &kApolloFeedCompactTapWiredKey) boolValue] &&
+                [thumb respondsToSelector:@selector(addTarget:action:forControlEvents:)]) {
+                objc_setAssociatedObject(thumb, &kApolloFeedCompactTapWiredKey, (id)kCFBooleanTrue, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    ASNetworkImageNode *thumbNode = (ASNetworkImageNode *)thumb;
+                    thumbNode.userInteractionEnabled = YES;
+                    [thumbNode addTarget:[ApolloFeedHeroTapHandler shared]
+                                  action:@selector(compactThumbTapped:)
+                        forControlEvents:ApolloFeedControlEventTouchUpInside];
+                });
+            }
         }
     } @catch (__unused NSException *e) {}
     return spec;
@@ -770,10 +809,14 @@ static void ApolloFeedReapplyCleanup(id node, BOOL triggerLayout) {
 
 %end
 
-// Compact cells route thumbnail taps through the cell node. For text posts we
-// filled the thumbnail ourselves, so route the tap to the fullscreen image
-// viewer (matching image posts) instead of whatever Apollo would do with a
-// medialess self post. Everything else falls through to the native handler.
+// Compact cells: Apollo only wires a thumbnail tap action when the post has
+// media, so for our filled-in text post thumbnails the tap fell through to
+// the cell and opened the thread (review feedback on the PR). Intercept the
+// tap and replay Apollo's own handler with the link temporarily pointed at
+// the embedded image: Apollo then presents its native media viewer — bottom
+// toolbar wired to the post's votes/comments, flick-to-dismiss — exactly as
+// if this were an image post. URL and selfPost are restored immediately
+// after the synchronous presentation.
 %hook _TtC6Apollo19CompactPostCellNode
 
 - (void)thumbnailTappedWithSender:(id)sender {
@@ -782,23 +825,19 @@ static void ApolloFeedReapplyCleanup(id node, BOOL triggerLayout) {
             RDKLink *link = MSHookIvar<RDKLink *>(self, "link");
             if (link && link.selfPost && ApolloFeedThumbnailURLForLink(link)) {
                 NSArray<NSDictionary *> *items = ApolloFeedViewerItemsForLink(link);
-                ASDisplayNode *node = (ASDisplayNode *)self;
-                UIView *sourceView = [node isNodeLoaded] ? [node view] : nil;
-
-                // Multi-image posts: swipeable album viewer (see heroTapped).
-                if (items.count > 1) {
-                    ApolloLog(@"[FeedThumb] compact thumbnail tapped: presenting %lu-image album",
-                              (unsigned long)items.count);
-                    if (ApolloPresentImageChestItems(items, sourceView, 0)) return;
-                }
-
-                // Single image: native MediaViewer when a handler is reachable.
-                NSURL *url = [items.firstObject[@"url"] isKindOfClass:[NSURL class]] ? items.firstObject[@"url"] : nil;
-                if (ApolloFeedRouteURLToNativeHandler(self, url)) return;
-
-                ApolloLog(@"[FeedThumb] compact thumbnail tapped on text post: presenting %lu image(s)",
-                          (unsigned long)items.count);
-                if (items.count > 0 && ApolloPresentImageChestItems(items, sourceView, 0)) {
+                NSURL *imageURL = [items.firstObject[@"url"] isKindOfClass:[NSURL class]] ? items.firstObject[@"url"] : nil;
+                if (imageURL) {
+                    ApolloLog(@"[FeedThumb] compact thumbnail tapped: replaying native handler with %@", imageURL.host);
+                    NSURL *originalURL = link.URL;
+                    BOOL originalSelfPost = link.selfPost;
+                    link.URL = imageURL;
+                    link.selfPost = NO;
+                    @try {
+                        %orig;
+                    } @finally {
+                        link.URL = originalURL;
+                        link.selfPost = originalSelfPost;
+                    }
                     return;
                 }
             }
