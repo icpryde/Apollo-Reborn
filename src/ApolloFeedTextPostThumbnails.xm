@@ -789,17 +789,40 @@ static void ApolloFeedReapplyCleanup(id node, BOOL triggerLayout) {
             // Apollo wires the thumbnail's tap action only for posts with
             // media, so the squares we fill are inert — taps fell through to
             // the cell and opened the thread (review feedback on the PR).
-            // Wire our own target once per node; the handler re-checks
+            // Wire our own target once per wrapper; the handler re-checks
             // eligibility, so node reuse on media posts stays Apollo's.
-            if (![objc_getAssociatedObject(thumb, &kApolloFeedCompactTapWiredKey) boolValue] &&
-                [thumb respondsToSelector:@selector(addTarget:action:forControlEvents:)]) {
-                objc_setAssociatedObject(thumb, &kApolloFeedCompactTapWiredKey, (id)kCFBooleanTrue, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            //
+            // The wiring must run on the main queue, and `thumbnailNode` must
+            // be RE-READ there: layoutSpecThatFits runs on Texture's
+            // background layout threads, and a raw ivar pointer captured
+            // across the async hop can dangle if the cell is torn down first
+            // (crashed as doesNotRecognizeSelector on a reincarnated pointer).
+            // Only the wrapper crosses the boundary, weakly.
+            if (![objc_getAssociatedObject(self, &kApolloFeedCompactTapWiredKey) boolValue]) {
+                objc_setAssociatedObject(self, &kApolloFeedCompactTapWiredKey, (id)kCFBooleanTrue, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                __weak ASDisplayNode *weakWrapper = (ASDisplayNode *)self;
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    ASNetworkImageNode *thumbNode = (ASNetworkImageNode *)thumb;
-                    thumbNode.userInteractionEnabled = YES;
-                    [thumbNode addTarget:[ApolloFeedHeroTapHandler shared]
-                                  action:@selector(compactThumbTapped:)
-                        forControlEvents:ApolloFeedControlEventTouchUpInside];
+                    @try {
+                        ASDisplayNode *wrapper = weakWrapper;
+                        if (!wrapper) return;
+                        id thumbNode = ApolloFeedIvar(wrapper, "thumbnailNode");
+                        if (![thumbNode respondsToSelector:@selector(addTarget:action:forControlEvents:)] ||
+                            ![thumbNode respondsToSelector:@selector(setUserInteractionEnabled:)]) {
+                            ApolloLog(@"[FeedThumb] compact wiring skipped: thumb=%@ lacks control surface",
+                                      NSStringFromClass([thumbNode class]));
+                            return;
+                        }
+                        // Apollo leaves the whole thumbnail chain inert for
+                        // media-less posts; touches need every ancestor enabled.
+                        wrapper.userInteractionEnabled = YES;
+                        [(ASNetworkImageNode *)thumbNode setUserInteractionEnabled:YES];
+                        [(ASNetworkImageNode *)thumbNode addTarget:[ApolloFeedHeroTapHandler shared]
+                                                            action:@selector(compactThumbTapped:)
+                                                  forControlEvents:ApolloFeedControlEventTouchUpInside];
+                        ApolloLog(@"[FeedThumb] compact tap target wired (thumb=%@)", NSStringFromClass([thumbNode class]));
+                    } @catch (NSException *e) {
+                        ApolloLog(@"[FeedThumb] compact wiring failed: %@", e.reason);
+                    }
                 });
             }
         }
