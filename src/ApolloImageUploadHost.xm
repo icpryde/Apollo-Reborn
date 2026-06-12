@@ -10,6 +10,7 @@
 #import "ApolloCommon.h"
 #import "ApolloRedditMediaUpload.h"
 #import "ApolloImageUploadHost.h"
+#import "ApolloImgChestUpload.h"
 #import "ApolloMarkdownToolbarGif.h"
 #import "ApolloMediaMetadata.h"
 #import "ApolloState.h"
@@ -543,7 +544,11 @@ static NSUInteger ApolloSubmitFirstTrimmedValueLength(NSDictionary<NSString *, N
 }
 
 static NSString *ApolloMediaPostBodyProviderName(void) {
-    return sImageUploadProvider == ImageUploadProviderReddit ? @"reddit" : @"imgur";
+    switch (sImageUploadProvider) {
+        case ImageUploadProviderReddit:   return @"reddit";
+        case ImageUploadProviderImgChest: return @"imgchest";
+        default:                          return @"imgur";
+    }
 }
 
 static void ApolloMediaPostBodyLogSubmitDecision(NSString *stage, NSDictionary<NSString *, NSArray<NSString *> *> *formValues, NSString *composerBodyText, BOOL hostedMedia, NSString *skipReason) {
@@ -2669,6 +2674,10 @@ static void ApolloCompleteRedditNativeMediaUpload(NSData *mediaData, NSURL *medi
             NSDictionary *info = ApolloRedditUploadInfoForAssetID(assetID);
             NSString *posterURL = [info[@"posterURL"] isKindOfClass:[NSString class]] ? info[@"posterURL"] : nil;
             ApolloLog(@"[RedditUpload] Completed Reddit native %@ upload (assetID=%@, websocket=%@, poster=%@)", isVideo ? @"video" : @"image", assetID, webSocketURL.length > 0 ? @"yes" : @"no", isVideo ? (posterURL.length > 0 ? @"yes" : @"no") : @"n/a");
+            // Manage Uploads (issue #414): remember the upload so a delete of
+            // this entry can be acknowledged (Reddit has no delete API) and
+            // its list thumbnail can resolve to the real media URL.
+            ApolloUploadRegistryRecordRedditUpload(mediaURL);
             NSData *jsonData = ApolloSyntheticImgurUploadResponseData(mediaURL, resolvedMIMEType);
             NSHTTPURLResponse *response = ApolloSyntheticImgurHTTPResponse(originalURL ?: mediaURL);
             completionHandler(jsonData, response, nil);
@@ -2754,6 +2763,37 @@ static void ApolloCompleteRedditNativeMediaUpload(NSData *mediaData, NSURL *medi
 - (NSURLSessionUploadTask *)uploadTaskWithRequest:(NSURLRequest *)request fromData:(NSData *)bodyData completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
     ApolloRedditCaptureBearerTokenFromRequest(request, @"NSURLSession uploadTaskWithRequest:fromData:");
 
+    // ImgChest host: divert Apollo's Imgur image upload to the ImgChest API
+    // and answer with a synthetic Imgur response carrying the ImgChest link.
+    if (sImageUploadProvider == ImageUploadProviderImgChest && completionHandler && ApolloIsImgurImageUploadRequest(request)) {
+        NSString *chestMIMEType = ApolloMediaMIMETypeForFilename(nil, [request valueForHTTPHeaderField:@"Content-Type"]);
+        if (!ApolloImgChestUploadAvailable() || ApolloMediaMIMETypeIsVideo(chestMIMEType)) {
+            ApolloLog(@"[ImgChestUpload] %@ — falling back to Imgur (fromData)",
+                      !ApolloImgChestUploadAvailable() ? @"no ImgChest API key" : @"video uploads not supported by ImgChest");
+            return %orig;
+        }
+        NSString *chestExtension = ApolloRedditUploadExtensionForMIMEType(chestMIMEType);
+        NSString *chestFilename = [@"apollo-upload" stringByAppendingPathExtension:chestExtension];
+        NSData *chestData = bodyData ?: [NSData data];
+        NSURL *requestURL = request.URL;
+        ApolloLog(@"[ImgChestUpload] Intercepting Imgur data upload (%lu bytes)", (unsigned long)chestData.length);
+        void (^chestWrapped)(NSData *, NSURLResponse *, NSError *) = ^(__unused NSData *d, __unused NSURLResponse *r, __unused NSError *e) {
+            ApolloImgChestUploadData(chestData, chestFilename, chestMIMEType, ^(NSURL *link, NSError *uploadError) {
+                if (!link) {
+                    completionHandler(nil, nil, uploadError);
+                    return;
+                }
+                NSData *synthetic = ApolloSyntheticImgurUploadResponseData(link, chestMIMEType);
+                NSHTTPURLResponse *fake = [[NSHTTPURLResponse alloc] initWithURL:requestURL
+                                                                      statusCode:200
+                                                                     HTTPVersion:@"HTTP/1.1"
+                                                                    headerFields:@{@"Content-Type": @"application/json"}];
+                completionHandler(synthetic, fake, nil);
+            });
+        };
+        return %orig(ApolloRedditUploadFastFailRequest(), bodyData ?: [NSData data], chestWrapped);
+    }
+
     if (sImageUploadProvider != ImageUploadProviderReddit || !completionHandler || !ApolloIsImgurImageUploadRequest(request)) {
         if (sImageUploadProvider == ImageUploadProviderReddit && completionHandler) ApolloLogUnhandledImgurUploadRequestOnce(request, @"fromData");
         return %orig;
@@ -2829,6 +2869,35 @@ static void ApolloCompleteRedditNativeMediaUpload(NSData *mediaData, NSURL *medi
 
 - (NSURLSessionUploadTask *)uploadTaskWithRequest:(NSURLRequest *)request fromFile:(NSURL *)fileURL completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
     ApolloRedditCaptureBearerTokenFromRequest(request, @"NSURLSession uploadTaskWithRequest:fromFile:");
+
+    if (sImageUploadProvider == ImageUploadProviderImgChest && completionHandler && ApolloIsImgurImageUploadRequest(request)) {
+        NSString *chestFilename = fileURL.lastPathComponent.length > 0 ? fileURL.lastPathComponent : @"apollo-upload.jpg";
+        NSString *chestMIMEType = ApolloMediaMIMETypeForFilename(chestFilename, [request valueForHTTPHeaderField:@"Content-Type"]);
+        NSData *chestData = [NSData dataWithContentsOfURL:fileURL];
+        if (!ApolloImgChestUploadAvailable() || ApolloMediaMIMETypeIsVideo(chestMIMEType) || chestData.length == 0) {
+            ApolloLog(@"[ImgChestUpload] %@ — falling back to Imgur (fromFile)",
+                      !ApolloImgChestUploadAvailable() ? @"no ImgChest API key"
+                          : (chestData.length == 0 ? @"could not read file" : @"video uploads not supported by ImgChest"));
+            return %orig;
+        }
+        NSURL *requestURL = request.URL;
+        ApolloLog(@"[ImgChestUpload] Intercepting Imgur file upload (%lu bytes, %@)", (unsigned long)chestData.length, chestFilename);
+        void (^chestWrapped)(NSData *, NSURLResponse *, NSError *) = ^(__unused NSData *d, __unused NSURLResponse *r, __unused NSError *e) {
+            ApolloImgChestUploadData(chestData, chestFilename, chestMIMEType, ^(NSURL *link, NSError *uploadError) {
+                if (!link) {
+                    completionHandler(nil, nil, uploadError);
+                    return;
+                }
+                NSData *synthetic = ApolloSyntheticImgurUploadResponseData(link, chestMIMEType);
+                NSHTTPURLResponse *fake = [[NSHTTPURLResponse alloc] initWithURL:requestURL
+                                                                      statusCode:200
+                                                                     HTTPVersion:@"HTTP/1.1"
+                                                                    headerFields:@{@"Content-Type": @"application/json"}];
+                completionHandler(synthetic, fake, nil);
+            });
+        };
+        return %orig(ApolloRedditUploadFastFailRequest(), fileURL, chestWrapped);
+    }
 
     if (sImageUploadProvider != ImageUploadProviderReddit || !completionHandler || !ApolloIsImgurImageUploadRequest(request)) {
         if (sImageUploadProvider == ImageUploadProviderReddit && completionHandler) ApolloLogUnhandledImgurUploadRequestOnce(request, @"fromFile");
@@ -2910,6 +2979,223 @@ static void ApolloCompleteRedditNativeMediaUpload(NSData *mediaData, NSURL *medi
     ApolloRedditNativeUploadAttempt *attempt = objc_getAssociatedObject(self, &kApolloRedditNativeUploadAttemptKey);
     if (attempt) [attempt cancelWithReason:@"NSURLSessionTask cancel"];
     %orig;
+}
+
+%end
+
+// MARK: - Manage Uploads screen (footer wording + thumbnails)
+//
+// Thumbnails: Apollo's uploads cell derives its thumbnail from an
+// Imgur-shaped URL, so Reddit/ImgChest uploads silently get none — no
+// request is ever issued (confirmed by logging every NSURLSession and
+// NSData entry point while the screen loads). Apollo persists the uploads
+// (with their real URLs) in Documents/imgur-uploads.plist in display order;
+// load the row's media ourselves and set it on the cell's thumbnail slot.
+// Imgur rows are left entirely native.
+
+static NSCache<NSString *, UIImage *> *ApolloUploadsThumbCache(void) {
+    static NSCache *cache;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [[NSCache alloc] init]; });
+    return cache;
+}
+
+static NSArray<NSDictionary *> *ApolloUploadsListFromDisk(void) {
+    NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/imgur-uploads.plist"];
+    NSData *data = [NSData dataWithContentsOfFile:path];
+    if (data.length == 0) return nil;
+    id plist = [NSPropertyListSerialization propertyListWithData:data options:NSPropertyListImmutable format:NULL error:NULL];
+    return [plist isKindOfClass:[NSArray class]] ? plist : nil;
+}
+
+static NSDictionary *ApolloUploadsEntryForRow(NSInteger row, NSInteger totalRows) {
+    NSArray<NSDictionary *> *uploads = ApolloUploadsListFromDisk();
+    // Guard against an order mismatch: only trust the mapping when the table
+    // row count matches the persisted list.
+    if ((NSInteger)uploads.count != totalRows || row < 0 || row >= (NSInteger)uploads.count) return nil;
+    NSDictionary *entry = uploads[(NSUInteger)row];
+    return [entry isKindOfClass:[NSDictionary class]] ? entry : nil;
+}
+
+static NSURL *ApolloUploadsMediaURLFromEntry(NSDictionary *entry) {
+    id urlValue = entry[@"url"];
+    NSString *urlString = [urlValue isKindOfClass:[NSDictionary class]] ? urlValue[@"relative"]
+                        : ([urlValue isKindOfClass:[NSString class]] ? urlValue : nil);
+    return [urlString isKindOfClass:[NSString class]] && [urlString length] > 0 ? [NSURL URLWithString:urlString] : nil;
+}
+
+static NSString *ApolloUploadsProviderNameForURL(NSURL *url) {
+    NSString *host = url.host.lowercaseString ?: @"";
+    if ([host containsString:@"imgchest"]) return @"Img Chest";
+    if ([host containsString:@"redd.it"] || [host containsString:@"reddit"]) return @"Reddit";
+    if ([host containsString:@"imgur"]) return @"Imgur";
+    return host.length > 0 ? host : nil;
+}
+
+// The thumbnail slot: the leftmost UIImageView of meaningful size in the
+// cell, excluding control imagery (the trash button's icon). Only valid
+// once the cell has been laid out — at cellForRow time every frame is zero.
+static UIImageView *ApolloUploadsThumbImageViewInCell(UITableViewCell *cell) {
+    UIImageView *best = nil;
+    CGFloat bestX = CGFLOAT_MAX;
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:cell.contentView ?: cell];
+    while (stack.count > 0) {
+        UIView *view = stack.lastObject;
+        [stack removeLastObject];
+        if ([view isKindOfClass:[UIControl class]]) continue; // skip the trash button subtree
+        if ([view isKindOfClass:[UIImageView class]] && view.bounds.size.width >= 30.0) {
+            CGFloat x = [view convertRect:view.bounds toView:cell].origin.x;
+            if (x < bestX) { best = (UIImageView *)view; bestX = x; }
+        }
+        [stack addObjectsFromArray:view.subviews];
+    }
+    return best;
+}
+
+// Apply `image` to the row's thumbnail slot once layout has produced real
+// frames; key checks guard against cell reuse races.
+static char kApolloUploadsCellURLKey;
+
+static void ApolloUploadsApplyThumb(UITableViewCell *cell, NSString *key, UIImage *image) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSString *currentKey = objc_getAssociatedObject(cell, &kApolloUploadsCellURLKey);
+        if (![currentKey isEqualToString:key]) return;
+        UIImageView *thumbView = ApolloUploadsThumbImageViewInCell(cell);
+        if (!thumbView) {
+            ApolloLog(@"[ImgChestUpload] uploads thumbnail: no image view found in laid-out cell (key=%@)", key);
+            return;
+        }
+        thumbView.contentMode = UIViewContentModeScaleAspectFill;
+        thumbView.clipsToBounds = YES;
+        thumbView.image = image;
+        ApolloLog(@"[ImgChestUpload] uploads thumbnail set (view=%@ frame=%@)",
+                  NSStringFromClass([thumbView class]), NSStringFromCGRect(thumbView.frame));
+    });
+}
+
+// Augment the row's "2h Ago" label with the upload host and the exact upload
+// date — with three possible hosts, "where did this go?" matters.
+//
+// Apollo's cell re-runs its own manual layout after any frame we set on its
+// label (it pins the label's top back to y=16), so a two-line frame never
+// sticks and the date line draws past the row bottom. Instead, hide Apollo's
+// label and render the text in our own overlay label spanning the full row
+// height — UILabel vertically centers its text, and Apollo's layout never
+// touches a view it doesn't know about.
+static char kApolloUploadsDetailLabelKey;
+
+static void ApolloUploadsApplyDetail(UITableViewCell *cell, NSString *key, NSString *provider, NSDate *date) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSString *currentKey = objc_getAssociatedObject(cell, &kApolloUploadsCellURLKey);
+        if (![currentKey isEqualToString:key]) return;
+
+        UILabel *overlay = objc_getAssociatedObject(cell, &kApolloUploadsDetailLabelKey);
+        UILabel *label = nil;
+        NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:cell.contentView ?: cell];
+        while (stack.count > 0) {
+            UIView *view = stack.lastObject;
+            [stack removeLastObject];
+            if (view == overlay || [view isKindOfClass:[UIControl class]]) continue;
+            if ([view isKindOfClass:[UILabel class]] && [(UILabel *)view text].length > 0) { label = (UILabel *)view; break; }
+            [stack addObjectsFromArray:view.subviews];
+        }
+        if (!label) return;
+
+        static NSDateFormatter *formatter;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            formatter = [[NSDateFormatter alloc] init];
+            formatter.dateStyle = NSDateFormatterMediumStyle;
+            formatter.timeStyle = NSDateFormatterShortStyle;
+        });
+
+        NSMutableString *text = [NSMutableString stringWithString:label.text];
+        if (provider.length > 0) [text appendFormat:@" · %@", provider];
+        if (date) [text appendFormat:@"\n%@", [formatter stringFromDate:date]];
+
+        UIView *container = label.superview ?: cell.contentView;
+        if (!overlay) {
+            overlay = [[UILabel alloc] init];
+            overlay.numberOfLines = 2;
+            objc_setAssociatedObject(cell, &kApolloUploadsDetailLabelKey, overlay, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        if (overlay.superview != container) {
+            [overlay removeFromSuperview];
+            [container addSubview:overlay];
+        }
+        overlay.font = label.font;
+        overlay.textColor = label.textColor;
+        overlay.text = text;
+        CGFloat x = label.frame.origin.x;
+        overlay.frame = CGRectMake(x, 0, container.bounds.size.width - x - 56.0, container.bounds.size.height); // keep clear of the trash button
+        overlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        label.hidden = YES;
+    });
+}
+
+%hook _TtC6Apollo40SettingsDeleteImgurUploadsViewController
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = %orig;
+    @try {
+        NSInteger totalRows = [tableView numberOfRowsInSection:indexPath.section];
+        NSDictionary *entry = ApolloUploadsEntryForRow(indexPath.row, totalRows);
+        NSURL *mediaURL = entry ? ApolloUploadsMediaURLFromEntry(entry) : nil;
+        if (!mediaURL) return cell;
+
+        NSString *key = mediaURL.absoluteString;
+        objc_setAssociatedObject(cell, &kApolloUploadsCellURLKey, key, OBJC_ASSOCIATION_COPY_NONATOMIC);
+
+        // Provider + exact date detail, for every host including Imgur.
+        NSDate *uploadedAt = [entry[@"dateUploaded"] isKindOfClass:[NSDate class]] ? entry[@"dateUploaded"] : nil;
+        ApolloUploadsApplyDetail(cell, key, ApolloUploadsProviderNameForURL(mediaURL), uploadedAt);
+
+        // Imgur uploads keep Apollo's native thumbnail pipeline.
+        if ([mediaURL.host.lowercaseString containsString:@"imgur"]) return cell;
+
+        UIImage *cached = [ApolloUploadsThumbCache() objectForKey:key];
+        if (cached) {
+            ApolloUploadsApplyThumb(cell, key, cached);
+            return cell;
+        }
+
+        NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:mediaURL
+                                                               cachePolicy:NSURLRequestReturnCacheDataElseLoad
+                                                           timeoutInterval:30.0];
+        // imgchest's CDN rejects UA-less requests with 403.
+        [request setValue:@"Apollo/1.15.11 (iOS)" forHTTPHeaderField:@"User-Agent"];
+        __weak UITableViewCell *weakCell = cell;
+        [[[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+            UIImage *full = data.length > 0 ? [UIImage imageWithData:data] : nil;
+            if (!full) {
+                NSHTTPURLResponse *http = [response isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)response : nil;
+                ApolloLog(@"[ImgChestUpload] uploads thumbnail load failed status=%ld err=%@ url=%@",
+                          (long)http.statusCode, error.localizedDescription ?: @"nil", key);
+                return;
+            }
+            // Downscale to thumbnail size off-main; full uploads can be huge.
+            CGFloat maxDimension = 160.0;
+            CGFloat scale = MIN(1.0, maxDimension / MAX(full.size.width, full.size.height));
+            CGSize thumbSize = CGSizeMake(MAX(full.size.width * scale, 1.0), MAX(full.size.height * scale, 1.0));
+            UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:thumbSize];
+            UIImage *thumb = [renderer imageWithActions:^(UIGraphicsImageRendererContext *context) {
+                [full drawInRect:CGRectMake(0, 0, thumbSize.width, thumbSize.height)];
+            }];
+            [ApolloUploadsThumbCache() setObject:thumb forKey:key];
+            UITableViewCell *strongCell = weakCell;
+            if (strongCell) ApolloUploadsApplyThumb(strongCell, key, thumb);
+        }] resume];
+    } @catch (__unused NSException *e) {}
+    return cell;
+}
+
+// The native footer only mentions Imgur, but with the upload-host options the
+// list can also contain Reddit and Img Chest uploads.
+- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
+    NSString *original = %orig;
+    if (original.length == 0) return original;
+    return @"Media you've uploaded from Apollo — to Imgur, Reddit, or Img Chest depending on your Media Upload Host. "
+           @"Deleting removes Imgur and Img Chest uploads from their host; Reddit uploads are only removed from this list.";
 }
 
 %end

@@ -96,10 +96,12 @@ extern NSInteger sLinkPreviewCommentsMode;
 extern NSInteger sLinkPreviewCardColor;
 
 // Media upload host selection. Imgur is the default; Reddit uses Apollo's signed-in
-// session to upload directly to Reddit's media storage.
+// session to upload directly to Reddit's media storage; ImgChest uploads to
+// imgchest.com via the user's API token (see ApolloImgChestUpload.m).
 typedef NS_ENUM(NSInteger, ImageUploadProvider) {
     ImageUploadProviderImgur = 0,
     ImageUploadProviderReddit = 1,
+    ImageUploadProviderImgChest = 2,
 };
 extern NSInteger sImageUploadProvider;
 

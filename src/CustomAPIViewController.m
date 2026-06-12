@@ -351,9 +351,10 @@ typedef NS_ENUM(NSInteger, Tag) {
 
 - (NSString *)mediaUploadProviderText {
     switch (sImageUploadProvider) {
-        case ImageUploadProviderReddit: return @"Reddit";
+        case ImageUploadProviderReddit:   return @"Reddit";
+        case ImageUploadProviderImgChest: return @"Img Chest";
         case ImageUploadProviderImgur:
-        default:                        return @"Imgur";
+        default:                          return @"Imgur";
     }
 }
 
@@ -374,12 +375,23 @@ typedef NS_ENUM(NSInteger, Tag) {
 
     NSString *imgurTitle = (sImageUploadProvider == ImageUploadProviderImgur) ? @"Imgur (Current)" : @"Imgur";
     NSString *redditTitle = (sImageUploadProvider == ImageUploadProviderReddit) ? @"Reddit (Current)" : @"Reddit";
+    NSString *imgChestTitle = (sImageUploadProvider == ImageUploadProviderImgChest) ? @"Img Chest (Current)" : @"Img Chest";
 
     [sheet addAction:[UIAlertAction actionWithTitle:imgurTitle style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
         [self setImageUploadProvider:ImageUploadProviderImgur];
     }]];
     [sheet addAction:[UIAlertAction actionWithTitle:redditTitle style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
         [self setImageUploadProvider:ImageUploadProviderReddit];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:imgChestTitle style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+        // Uploading requires an API token (free at imgchest.com); without one
+        // there is nothing to authenticate the POST with.
+        if (sImageChestAPIToken.length == 0) {
+            [self showAlertWithTitle:@"Img Chest API Key Required"
+                             message:@"Add your Img Chest API key in the API Keys section first, then select Img Chest as the upload host."];
+            return;
+        }
+        [self setImageUploadProvider:ImageUploadProviderImgChest];
     }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
 
