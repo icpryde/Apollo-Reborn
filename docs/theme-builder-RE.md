@@ -161,6 +161,28 @@ vote green, link blue) are excluded by the neutrality test. Theme-tinted
 bluish text grays (`9399A6`, `94969D`) come through the background getter
 `0x10068b014` and aren't neutral, so they ride the background remap instead.
 
+## Known limitation: baked chrome glyph icons
+
+Some chrome glyphs — most visibly the **profile menu icons** (Posts, Comments,
+Saved, Friends, …) and a few hairline separators — are **not** recolorable by
+the builder. A third RE pass ruled out every color path the engine can hook:
+
+- `UIColor` RGB/white constructors — fire, but never produce these glyphs'
+  color (text/chevrons on the same screen *do* recolor).
+- `-[UIImageView setTintColor:]` — fires for them with `#EBEBEB`, but remapping
+  it has no visible effect.
+- `-[UIImage imageWithTintColor:…]` — fires (white), remapping it has no effect.
+
+Combined with the glyphs being gray in light mode and the accent color in dark
+mode, this strongly indicates they are **pre-rendered asset-catalog images with
+baked light/dark appearance variants**, not runtime-tinted. Baked pixels can't
+be reached by color interception; recoloring them would require intercepting
+image *loading* and rewriting bitmaps (heavy, fragile, and prone to recoloring
+non-chrome imagery), so it's intentionally out of scope. These icons stay at
+Apollo's stock tint — fine on muted/Apollo-style palettes, faint on bold light
+backgrounds. The text, background, accent, bar and separator-role theming is
+unaffected.
+
 ## Persistence
 
 - Tweak settings (standard defaults, ride into Backup/Restore zips):
