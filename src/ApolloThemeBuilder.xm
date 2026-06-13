@@ -442,6 +442,41 @@ void ApolloThemeBuilderActivateDonorLive(void) {
 
 %end
 
+#if APOLLO_THEME_TINTTEST
+%hook UIImageView
+- (void)setImage:(UIImage *)image {
+    if (sRemapActive && image) {
+        uintptr_t c = (uintptr_t)__builtin_return_address(0);
+        if (c >= sApolloStart && c < sApolloEnd) {
+            %orig([image imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate]);
+            return;
+        }
+    }
+    %orig;
+}
+%end
+%hook UIView
+- (void)setTintColor:(UIColor *)color {
+    if (sRemapActive && color && [self isKindOfClass:[UIImageView class]]) {
+        uintptr_t caller = (uintptr_t)__builtin_return_address(0);
+        if (caller >= sApolloStart && caller < sApolloEnd) {
+            CGFloat r=0,g=0,b=0,a=1,w=0; int ri=-1,gi=-1,bi=-1;
+            if ([color getRed:&r green:&g blue:&b alpha:&a]) { ri=(int)lround(r*255);gi=(int)lround(g*255);bi=(int)lround(b*255); }
+            else if ([color getWhite:&w alpha:&a]) { ri=gi=bi=(int)lround(w*255); }
+            int mx = ri>gi?(ri>bi?ri:bi):(gi>bi?gi:bi), mn = ri<gi?(ri<bi?ri:bi):(gi<bi?gi:bi);
+            if (ri>=0 && mx-mn<=8) { // neutral gray icon tint -> RED
+                ApolloLog(@"TINTTEST UIImageView neutral #%02X%02X%02X caller=0x%lx -> red",
+                          ri,gi,bi,(unsigned long)(0x100000000+(caller-sApolloStart)));
+                %orig([UIColor redColor]);
+                return;
+            }
+        }
+    }
+    %orig;
+}
+%end
+#endif
+
 %hook NSUserDefaults
 
 // Keep the enabled flag truthful: if the user picks a different theme in
