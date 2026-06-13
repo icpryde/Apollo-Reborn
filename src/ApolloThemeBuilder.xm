@@ -81,31 +81,27 @@ static os_unfair_lock sLock = OS_UNFAIR_LOCK_INIT;
 static uint8_t sRByteFilter[256];
 
 // ---------------------------------------------------------------------------
-// Auto-contrast text grays
+// Auto-contrast neutral grays
 // ---------------------------------------------------------------------------
 //
 // Apollo's tinted themes (outrun, sepia…) only retint backgrounds + accent;
-// the secondary/tertiary *text* grays are theme-independent neutral grays
-// (verified via backtrace: getter 0x1002cbad8 emits 919191 in light / 84878C
-// in dark for every theme). Apollo's themes stay legible because their
-// backgrounds are light/muted — but the builder lets the user pick saturated
-// or dark backgrounds, against which a fixed gray goes low-contrast. So we
-// intercept those exact text-gray constants and derive a legible neutral gray
-// from the luminance of the user's chosen primary background for that mode.
-typedef struct {
-    uint8_t r, g, b;   // theme-independent text-gray constant Apollo emits
-    uint8_t mode;      // 0 = light, 1 = dark (which primaryBG to contrast with)
-    uint8_t tier;      // 0 = secondary, 1 = tertiary
-} TextGray;
-
-#define KTEXTGRAYCOUNT 4
-static const TextGray kTextGrays[KTEXTGRAYCOUNT] = {
-    {0x91, 0x91, 0x91, 0, 0}, // light secondary text
-    {0x84, 0x87, 0x8C, 1, 0}, // dark  secondary text
-    {0x66, 0x66, 0x66, 0, 1}, // light tertiary/metadata
-    {0x85, 0x85, 0x85, 1, 1}, // dark  tertiary/metadata
-};
-static uint8_t sTextByteFilter[256];
+// everything else — secondary/tertiary text, icon tints, faint usernames,
+// timestamps, quoted text, separators — is drawn with a *family* of
+// theme-independent neutral grays (verified via backtrace: e.g. getter
+// 0x1002cbad8 emits 919191 light / 84878C dark for every theme; many more
+// grays come through other shared getters). Apollo stays legible only because
+// its own backgrounds are light/muted. The builder lets the user pick
+// saturated or dark backgrounds, against which fixed grays go low-contrast or
+// vanish (illegible labels, "missing" icons).
+//
+// Rather than enumerate every gray constant (brittle, never complete), we
+// detect *any* near-neutral gray Apollo creates and re-map it onto a contrast
+// ramp against the user's chosen background — preserving the gray's relative
+// prominence (a faint gray stays subtle, a strong gray stays strong) while
+// guaranteeing it lands on the readable side of the background. Near-black and
+// near-white are left alone (structural: primary text, white-on-accent, glyph
+// fills), as are saturated colors (real theme/content colors).
+//
 // Effective primary-background luminance per mode (user color or donor),
 // recomputed in ApolloThemeBuilderReloadOverrides.
 static CGFloat sPrimaryLum[2] = {0.85, 0.05}; // light, dark donor defaults
@@ -258,10 +254,6 @@ void ApolloThemeBuilderReloadOverrides(void) {
         }
         sPrimaryLum[m] = 0.2126 * rr + 0.7152 * gg + 0.0722 * bb;
     }
-    // Text grays are theme-independent constants, so always filter for them
-    // when the remap is on (they don't depend on per-slot customization).
-    memset(sTextByteFilter, 0, sizeof(sTextByteFilter));
-    for (int i = 0; i < KTEXTGRAYCOUNT; i++) sTextByteFilter[kTextGrays[i].r] = 1;
 
     sRemapActive = enabled && donorActive;
     os_unfair_lock_unlock(&sLock);
@@ -316,26 +308,45 @@ static inline int SlotForComponents(int ri, int gi, int bi, uintptr_t caller) {
     return -1;
 }
 
-// If (ri,gi,bi) is one of Apollo's theme-independent text grays, fills out[3]
-// with an auto-contrast neutral gray derived from the user's primary
-// background luminance for that constant's mode, and returns true.
-static inline bool TextGrayReplacement(int ri, int gi, int bi, uintptr_t caller, CGFloat out[3]) {
-    if (ri < 0 || ri > 255 || !sTextByteFilter[ri]) return false;
+// If (ri,gi,bi) is a near-neutral gray (low saturation, not near black/white)
+// created by Apollo, fills out[3] with an auto-contrast gray derived from the
+// active mode's primary-background luminance and returns true. Preserves the
+// gray's relative prominence so the text/icon hierarchy is kept.
+static inline bool NeutralGrayReplacement(int ri, int gi, int bi, uintptr_t caller, CGFloat out[3]) {
     if (caller < sApolloStart || caller >= sApolloEnd) return false;
-    for (int i = 0; i < KTEXTGRAYCOUNT; i++) {
-        if (kTextGrays[i].r == ri && kTextGrays[i].g == gi && kTextGrays[i].b == bi) {
-            CGFloat lum = sPrimaryLum[kTextGrays[i].mode];
-            bool lightText = lum < 0.5; // light text on dark bg, dark on light
-            // Push toward a high-contrast endpoint (mid-grays disappear on
-            // medium backgrounds); secondary stronger, tertiary a touch softer.
-            CGFloat level;
-            if (kTextGrays[i].tier == 0) level = lightText ? 0.92 : 0.20;
-            else                         level = lightText ? 0.78 : 0.38;
-            out[0] = out[1] = out[2] = level;
-            return true;
-        }
-    }
-    return false;
+    // Neutral = all channels within a tight band (allow a hair of tint).
+    int mx = ri > gi ? (ri > bi ? ri : bi) : (gi > bi ? gi : bi);
+    int mn = ri < gi ? (ri < bi ? ri : bi) : (gi < bi ? gi : bi);
+    if (mx - mn > 8) return false;
+    // Gray level 0..1 (channels are ~equal; use the mean).
+    CGFloat Lg = (ri + gi + bi) / (3.0 * 255.0);
+    // Leave structural near-black / near-white (primary text, white-on-accent,
+    // glyph fills) untouched.
+    if (Lg < 0.10 || Lg > 0.92) return false;
+
+    // Active appearance picks which background we contrast against. During a
+    // theme repaint / cell layout the current trait reflects the render mode;
+    // fall back to light if unspecified.
+    UIUserInterfaceStyle style = UITraitCollection.currentTraitCollection.userInterfaceStyle;
+    int mode = (style == UIUserInterfaceStyleDark) ? 1 : 0;
+    CGFloat Lb = sPrimaryLum[mode];
+    bool lightBg = Lb >= 0.5;
+
+    // Prominence: how much contrast the gray "wanted" against Apollo's own
+    // reference background (white in light, black in dark). Darker-on-white /
+    // lighter-on-black = more prominent. Floor it so faint stays visible.
+    CGFloat prominence = lightBg ? (1.0 - Lg) : Lg;
+    if (prominence < 0.20) prominence = 0.20;
+    if (prominence > 0.95) prominence = 0.95;
+    // Place the new gray on the readable side of the background by an amount
+    // proportional to that prominence.
+    CGFloat delta = 0.30 + 0.55 * prominence;
+    CGFloat target = lightBg ? (Lb - delta) : (Lb + delta);
+    if (target < 0.05) target = 0.05;
+    if (target > 0.97) target = 0.97;
+
+    out[0] = out[1] = out[2] = target;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -390,7 +401,7 @@ void ApolloThemeBuilderActivateDonorLive(void) {
         int slot = SlotForComponents(ri, gi, bi, caller);
         if (slot >= 0) return %orig(sRepl[slot][0], sRepl[slot][1], sRepl[slot][2], a);
         CGFloat tg[3];
-        if (TextGrayReplacement(ri, gi, bi, caller, tg)) return %orig(tg[0], tg[1], tg[2], a);
+        if (NeutralGrayReplacement(ri, gi, bi, caller, tg)) return %orig(tg[0], tg[1], tg[2], a);
     }
     return %orig;
 }
@@ -402,7 +413,29 @@ void ApolloThemeBuilderActivateDonorLive(void) {
         int slot = SlotForComponents(ri, gi, bi, caller);
         if (slot >= 0) return %orig(sRepl[slot][0], sRepl[slot][1], sRepl[slot][2], a);
         CGFloat tg[3];
-        if (TextGrayReplacement(ri, gi, bi, caller, tg)) return %orig(tg[0], tg[1], tg[2], a);
+        if (NeutralGrayReplacement(ri, gi, bi, caller, tg)) return %orig(tg[0], tg[1], tg[2], a);
+    }
+    return %orig;
+}
+
+// Grays Apollo builds via colorWithWhite: are inherently neutral — route them
+// through the same auto-contrast path (the white value is the gray level).
++ (UIColor *)colorWithWhite:(CGFloat)w alpha:(CGFloat)a {
+    if (sRemapActive) {
+        uintptr_t caller = (uintptr_t)__builtin_return_address(0);
+        int wi = (int)lround(w * 255.0);
+        CGFloat tg[3];
+        if (NeutralGrayReplacement(wi, wi, wi, caller, tg)) return %orig(tg[0], a);
+    }
+    return %orig;
+}
+
+- (UIColor *)initWithWhite:(CGFloat)w alpha:(CGFloat)a {
+    if (sRemapActive) {
+        uintptr_t caller = (uintptr_t)__builtin_return_address(0);
+        int wi = (int)lround(w * 255.0);
+        CGFloat tg[3];
+        if (NeutralGrayReplacement(wi, wi, wi, caller, tg)) return %orig(tg[0], a);
     }
     return %orig;
 }

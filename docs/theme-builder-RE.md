@@ -137,24 +137,29 @@ backgrounds are light/muted. The builder lets the user pick saturated or dark
 backgrounds, against which a fixed gray goes low-contrast (the original
 illegible-secondary-text bug).
 
-Fix (`ApolloThemeBuilder.xm`, both RGB-keyed so they're version-robust — no
-hardcoded getter addresses on the hot path):
+There are *many* such grays (secondary/tertiary text, icon tints, faint
+usernames, timestamps, quoted text, separators), so enumerating constants is
+brittle and never complete. Instead the fix is **generic** (`ApolloThemeBuilder.xm`,
+all RGB-keyed — no hardcoded getter addresses on the hot path):
 
-- **Auto-contrast text** (`TextGrayReplacement`): intercept the
-  theme-independent text-gray constants (`919191`/`84878C` secondary,
-  `666666`/`858585` tertiary) and replace with a neutral gray whose lightness
-  is derived from the luminance of the user's chosen `primaryBG` for that mode
-  (`sPrimaryLum[]`, Rec.709 weights). Dark background → light text, light
-  background → dark text, pushed to a high-contrast endpoint (mid-grays vanish
-  on medium backgrounds). Secondary uses stronger contrast than tertiary.
+- **Auto-contrast neutral grays** (`NeutralGrayReplacement`): any color Apollo
+  builds that is *near-neutral* (`max-min channel ≤ 8/255`) and not
+  near-black/near-white (`0.10 < L < 0.92`) is re-mapped onto a contrast ramp
+  against the user's `primaryBG` for the active mode (`sPrimaryLum[]`, Rec.709;
+  mode from `UITraitCollection.currentTraitCollection`). The gray's relative
+  prominence is preserved (faint stays subtle, strong stays strong) but it's
+  forced onto the readable side of the background. Covers text *and* icon
+  template tints in one rule. Also hooks `colorWithWhite:`/`initWithWhite:`
+  (inherently neutral) through the same path.
 - **Opacity**: the RGB match no longer requires `alpha == 1.0`. Role colors
   used at reduced opacity (overlays, pressed states) now remap too, with the
   original alpha preserved (`%orig(r,g,b, a)`).
 
-Primary text and pure black/white are intentionally left alone (they read
-fine and remapping them is risky). Theme-tinted bluish text grays seen in the
-capture (`9399A6`, `94969D`) come through the background getter `0x10068b014`
-and are not separately remapped.
+Near-black/near-white are intentionally left alone (primary text,
+white-on-accent, glyph fills); saturated colors (real theme/content colors,
+vote green, link blue) are excluded by the neutrality test. Theme-tinted
+bluish text grays (`9399A6`, `94969D`) come through the background getter
+`0x10068b014` and aren't neutral, so they ride the background remap instead.
 
 ## Persistence
 
