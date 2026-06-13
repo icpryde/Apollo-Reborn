@@ -57,6 +57,16 @@ Pre-built IPAs and AltStore Classic/SideStore/Feather sources are now available 
 - **User Profile Pictures**: Show Reddit user avatars next to usernames in feeds, comments, and user profiles (Settings > Custom API > Media > Show User Profile Pictures)
 - **Self-hosted Notifications** (advanced): Optionally route push registrations, watchers, and inbox checks through your own forked [apollo-backend](https://github.com/nickclyde/apollo-backend) instance instead of having those requests silently dropped (Settings > Custom API > Notification Backend)
 
+### Not seeing thumbnails or inline previews?
+
+> [!TIP]
+> If thumbnails or inline media previews aren't showing up, it's usually a Reddit account setting rather than a tweak issue. Open [old.reddit.com/prefs](https://old.reddit.com/prefs) and log in, then under the **Media** section:
+>
+> - Set **Thumbnails** to *"show thumbnails next to links"*
+> - Set **Media previews** to *"auto-expand media previews"*
+>
+> Save your preferences and relaunch Apollo.
+
 ### Self-hosted notifications (advanced)
 
 The legacy Apollo push backends went dark in June 2023 and are otherwise blocked by the tweak. If you run your own instance of [nickclyde/apollo-backend](https://github.com/nickclyde/apollo-backend) (with your own Reddit OAuth `CLIENT_ID` / `CLIENT_SECRET` baked into its env vars), you can set the URL under **Settings > Custom API > Notification Backend** and the tweak will route all `apollopushserver.xyz`, `beta.apollonotifications.com`, and `apolloreq.com` traffic to that host instead. Leave the field empty to keep the current "silently dropped" behavior.
