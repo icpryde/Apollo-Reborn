@@ -27,6 +27,7 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
 @property (nonatomic, copy) NSString *editingRole;
 @property (nonatomic, copy) NSString *editingMode;
 @property (nonatomic, strong) NSTimer *repaintDebounce;
+@property (nonatomic, assign) CGFloat lastPreviewWidth;
 @end
 
 @implementation ApolloThemeBuilderViewController
@@ -34,6 +35,134 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"Theme Builder";
+    [self refreshPreview];
+}
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    // Rebuild the preview header when the table width changes (rotation, first
+    // layout) — tableHeaderView needs an explicit, correct width.
+    CGFloat w = self.tableView.bounds.size.width;
+    if (w > 0 && fabs(w - self.lastPreviewWidth) > 0.5) {
+        [self refreshPreview];
+    }
+}
+
+- (void)traitCollectionDidChange:(UITraitCollection *)previous {
+    [super traitCollectionDidChange:previous];
+    if (self.traitCollection.userInterfaceStyle != previous.userInterfaceStyle) {
+        [self refreshPreview];
+    }
+}
+
+#pragma mark - Live preview
+
+// Which appearance the preview (and the live app behind us) is currently
+// showing — picks the matching saved color set.
+- (NSString *)previewMode {
+    return (self.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) ? @"dark" : @"light";
+}
+
+- (UIColor *)previewColorForRole:(NSString *)role {
+    return ApolloThemeBuilderColorFromHex(ApolloThemeBuilderSavedHex(role, [self previewMode]))
+        ?: UIColor.systemGrayColor;
+}
+
+- (void)refreshPreview {
+    CGFloat width = self.tableView.bounds.size.width;
+    if (width <= 0) width = self.view.bounds.size.width;
+    if (width <= 0) return;
+    self.lastPreviewWidth = width;
+    self.tableView.tableHeaderView = [self makePreviewViewWithWidth:width];
+}
+
+// A mock Apollo post card rendered with the current role colors, so the user
+// sees their theme update in place (this settings screen itself is not painted
+// by Apollo's theme system, so without this nothing visibly changes here).
+- (UIView *)makePreviewViewWithWidth:(CGFloat)width {
+    UIColor *page      = [self previewColorForRole:kApolloThemeRoleSecondaryBG];
+    UIColor *card      = [self previewColorForRole:kApolloThemeRolePrimaryBG];
+    UIColor *accent    = [self previewColorForRole:kApolloThemeRoleAccent];
+    UIColor *separator = [self previewColorForRole:kApolloThemeRoleSeparator];
+    UIColor *bar       = [self previewColorForRole:kApolloThemeRoleBar];
+    UIColor *tertiary  = [self previewColorForRole:kApolloThemeRoleTertiaryBG];
+    UIColor *gray      = [self previewColorForRole:kApolloThemeRoleGray];
+
+    BOOL dark = [[self previewMode] isEqualToString:@"dark"];
+    UIColor *primaryText = dark ? UIColor.whiteColor : [UIColor colorWithWhite:0.1 alpha:1.0];
+
+    CGFloat margin = 16, cardInset = 16;
+    UIView *container = [[UIView alloc] initWithFrame:CGRectMake(0, 0, width, 210)];
+    container.backgroundColor = page;
+
+    // Faux nav/tab bar strip (chrome color).
+    UIView *barStrip = [[UIView alloc] initWithFrame:CGRectMake(0, 0, width, 8)];
+    barStrip.backgroundColor = bar;
+    [container addSubview:barStrip];
+
+    UILabel *caption = [[UILabel alloc] initWithFrame:CGRectMake(margin, 14, width - 2 * margin, 16)];
+    caption.text = [NSString stringWithFormat:@"Live preview · %@ mode", dark ? @"Dark" : @"Light"];
+    caption.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
+    caption.textColor = gray;
+    [container addSubview:caption];
+
+    CGFloat cardX = margin, cardY = 38, cardW = width - 2 * margin, cardH = 152;
+    UIView *postCard = [[UIView alloc] initWithFrame:CGRectMake(cardX, cardY, cardW, cardH)];
+    postCard.backgroundColor = card;
+    postCard.layer.cornerRadius = 12;
+    [container addSubview:postCard];
+
+    // Header row: accent avatar + subreddit/title.
+    UIView *avatar = [[UIView alloc] initWithFrame:CGRectMake(cardInset, 14, 34, 34)];
+    avatar.backgroundColor = accent;
+    avatar.layer.cornerRadius = 17;
+    [postCard addSubview:avatar];
+
+    UILabel *sub = [[UILabel alloc] initWithFrame:CGRectMake(cardInset + 44, 14, cardW - cardInset * 2 - 44, 18)];
+    sub.text = @"r/apolloapp";
+    sub.font = [UIFont systemFontOfSize:15 weight:UIFontWeightBold];
+    sub.textColor = accent;
+    [postCard addSubview:sub];
+
+    UILabel *meta = [[UILabel alloc] initWithFrame:CGRectMake(cardInset + 44, 32, cardW - cardInset * 2 - 44, 16)];
+    meta.text = @"u/christianselig · 2h";
+    meta.font = [UIFont systemFontOfSize:13];
+    meta.textColor = gray;
+    [postCard addSubview:meta];
+
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(cardInset, 58, cardW - cardInset * 2, 38)];
+    title.text = @"Your custom theme, live as you build it";
+    title.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    title.textColor = primaryText;
+    title.numberOfLines = 2;
+    [postCard addSubview:title];
+
+    UIView *line = [[UIView alloc] initWithFrame:CGRectMake(cardInset, 104, cardW - cardInset * 2, 1)];
+    line.backgroundColor = separator;
+    [postCard addSubview:line];
+
+    // Footer: accent vote pill + tertiary comment chip.
+    UILabel *vote = [[UILabel alloc] initWithFrame:CGRectMake(cardInset, 116, 92, 26)];
+    vote.text = @"▲ 1.2k";
+    vote.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
+    vote.textColor = UIColor.whiteColor;
+    vote.textAlignment = NSTextAlignmentCenter;
+    vote.backgroundColor = accent;
+    vote.layer.cornerRadius = 13;
+    vote.clipsToBounds = YES;
+    [postCard addSubview:vote];
+
+    UILabel *comments = [[UILabel alloc] initWithFrame:CGRectMake(cardInset + 100, 116, 96, 26)];
+    comments.text = @"💬 42";
+    comments.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+    comments.textColor = primaryText;
+    comments.textAlignment = NSTextAlignmentCenter;
+    comments.backgroundColor = tertiary;
+    comments.layer.cornerRadius = 13;
+    comments.clipsToBounds = YES;
+    [postCard addSubview:comments];
+
+    return container;
 }
 
 #pragma mark - Presets
@@ -247,6 +376,7 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
     } else {
         ApolloThemeBuilderForceRepaint();
     }
+    [self refreshPreview];
 }
 
 - (void)presentPresetPicker {
@@ -261,6 +391,7 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
                 ApolloThemeBuilderSaveHex(parts[0], parts[1], preset.colors[key]);
             }
             [self.tableView reloadData];
+            [self refreshPreview];
             ApolloThemeBuilderForceRepaint();
         }]];
     }
@@ -278,6 +409,7 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
         [[NSUserDefaults standardUserDefaults] removeObjectForKey:kApolloCustomThemeColorsKey];
         ApolloThemeBuilderReloadOverrides();
         [self.tableView reloadData];
+        [self refreshPreview];
         ApolloThemeBuilderForceRepaint();
     }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
@@ -290,6 +422,7 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
     if (!self.editingRole || !self.editingMode) return;
     ApolloThemeBuilderSaveHex(self.editingRole, self.editingMode,
                               ApolloThemeBuilderHexFromColor(picker.selectedColor));
+    [self refreshPreview];
     // Live preview behind the sheet, debounced so continuous drags don't
     // thrash the trait-flip repaint.
     [self.repaintDebounce invalidate];
@@ -303,6 +436,7 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
     [self.repaintDebounce invalidate];
     self.repaintDebounce = nil;
     [self.tableView reloadData];
+    [self refreshPreview];
     ApolloThemeBuilderForceRepaint();
 }
 
