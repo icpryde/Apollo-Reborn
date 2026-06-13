@@ -63,6 +63,8 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloMediaPreviewErrorFix.xm \
     $(SRC_DIR)/ApolloSubredditIndexPolish.xm \
     $(SRC_DIR)/ApolloTagFilters.xm \
+    $(SRC_DIR)/ApolloThemeBuilder.xm \
+    $(SRC_DIR)/ApolloThemeBuilderViewController.m \
     $(SRC_DIR)/ApolloImageChestResolver.m \
     $(SRC_DIR)/ApolloLinkPreviewModel.m \
     $(SRC_DIR)/ApolloLinkPreviewCache.m \
@@ -87,6 +89,13 @@ ApolloReborn_LIBRARIES = z iconv
 ApolloReborn_CFLAGS = -fobjc-arc -Wno-unguarded-availability-new -Wno-module-import-in-extern-c -I$(THEOS_PROJECT_DIR)/$(SRC_DIR) -I$(THEOS_PROJECT_DIR)/liquid-glass/generated -I$(THEOS_PROJECT_DIR)/$(MODULES_DIR) -I$(THEOS_PROJECT_DIR)/$(SSZIPARCHIVE_DIR) -I$(THEOS_PROJECT_DIR)/$(SSZIPARCHIVE_DIR)/minizip -DHAVE_ARC4RANDOM_BUF -DHAVE_ICONV -DHAVE_INTTYPES_H -DHAVE_PKCRYPT -DHAVE_STDINT_H -DHAVE_WZAES -DHAVE_ZLIB -DZLIB_COMPAT
 
 ApolloReborn_BUNDLE_RESOURCE_DIRS = resources
+
+# Temporary theme-RE instrumentation (theme builder spike). Opt-in only:
+#   APOLLO_THEME_RE=1 scripts/run-in-sim.sh
+ifeq ($(APOLLO_THEME_RE),1)
+ApolloReborn_FILES += $(SRC_DIR)/ApolloThemeRE.xm
+ApolloReborn_CFLAGS += -DAPOLLO_THEME_RE=1
+endif
 
 # Simulator/dev builds (APOLLO_SIM_BUILD=1; see scripts/run-in-sim.sh) trim the
 # device-only pieces so the tweak links and loads against the iOS simulator SDK:
