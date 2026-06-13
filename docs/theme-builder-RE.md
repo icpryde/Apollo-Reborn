@@ -124,6 +124,38 @@ Theme-independent constants (same across all themes — vote green 00B23B/00940F
 gray text 919191/84878C, separators C7C7CC/646466, link blue 94C6FF/45658D,
 etc.) are intentionally not remapped.
 
+## Text contrast (auto-derived) and opacity
+
+A key finding from the second RE pass: **Apollo's tinted themes only retint
+backgrounds + accent.** The secondary/tertiary *text* grays are
+theme-independent neutral grays, emitted by shared getters regardless of the
+active theme (verified via backtrace: getter `0x1002cbad8` above the central
+UIColor thunk `0x1007530c8` produces `919191` in light / `84878C` in dark for
+every theme; tertiary/metadata grays `666666`/`858585` come from
+`0x100689f68`). Apollo's own themes stay legible only because their
+backgrounds are light/muted. The builder lets the user pick saturated or dark
+backgrounds, against which a fixed gray goes low-contrast (the original
+illegible-secondary-text bug).
+
+Fix (`ApolloThemeBuilder.xm`, both RGB-keyed so they're version-robust — no
+hardcoded getter addresses on the hot path):
+
+- **Auto-contrast text** (`TextGrayReplacement`): intercept the
+  theme-independent text-gray constants (`919191`/`84878C` secondary,
+  `666666`/`858585` tertiary) and replace with a neutral gray whose lightness
+  is derived from the luminance of the user's chosen `primaryBG` for that mode
+  (`sPrimaryLum[]`, Rec.709 weights). Dark background → light text, light
+  background → dark text, pushed to a high-contrast endpoint (mid-grays vanish
+  on medium backgrounds). Secondary uses stronger contrast than tertiary.
+- **Opacity**: the RGB match no longer requires `alpha == 1.0`. Role colors
+  used at reduced opacity (overlays, pressed states) now remap too, with the
+  original alpha preserved (`%orig(r,g,b, a)`).
+
+Primary text and pure black/white are intentionally left alone (they read
+fine and remapping them is risky). Theme-tinted bluish text grays seen in the
+capture (`9399A6`, `94969D`) come through the background getter `0x10068b014`
+and are not separately remapped.
+
 ## Persistence
 
 - Tweak settings (standard defaults, ride into Backup/Restore zips):

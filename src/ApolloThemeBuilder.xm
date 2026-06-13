@@ -80,6 +80,36 @@ static os_unfair_lock sLock = OS_UNFAIR_LOCK_INIT;
 // Fast first-byte filter: bit set if some slot's r-byte equals the value.
 static uint8_t sRByteFilter[256];
 
+// ---------------------------------------------------------------------------
+// Auto-contrast text grays
+// ---------------------------------------------------------------------------
+//
+// Apollo's tinted themes (outrun, sepia…) only retint backgrounds + accent;
+// the secondary/tertiary *text* grays are theme-independent neutral grays
+// (verified via backtrace: getter 0x1002cbad8 emits 919191 in light / 84878C
+// in dark for every theme). Apollo's themes stay legible because their
+// backgrounds are light/muted — but the builder lets the user pick saturated
+// or dark backgrounds, against which a fixed gray goes low-contrast. So we
+// intercept those exact text-gray constants and derive a legible neutral gray
+// from the luminance of the user's chosen primary background for that mode.
+typedef struct {
+    uint8_t r, g, b;   // theme-independent text-gray constant Apollo emits
+    uint8_t mode;      // 0 = light, 1 = dark (which primaryBG to contrast with)
+    uint8_t tier;      // 0 = secondary, 1 = tertiary
+} TextGray;
+
+#define KTEXTGRAYCOUNT 4
+static const TextGray kTextGrays[KTEXTGRAYCOUNT] = {
+    {0x91, 0x91, 0x91, 0, 0}, // light secondary text
+    {0x84, 0x87, 0x8C, 1, 0}, // dark  secondary text
+    {0x66, 0x66, 0x66, 0, 1}, // light tertiary/metadata
+    {0x85, 0x85, 0x85, 1, 1}, // dark  tertiary/metadata
+};
+static uint8_t sTextByteFilter[256];
+// Effective primary-background luminance per mode (user color or donor),
+// recomputed in ApolloThemeBuilderReloadOverrides.
+static CGFloat sPrimaryLum[2] = {0.85, 0.05}; // light, dark donor defaults
+
 static uintptr_t sApolloStart = 0;
 static uintptr_t sApolloEnd = 0;
 
@@ -212,6 +242,27 @@ void ApolloThemeBuilderReloadOverrides(void) {
         }
         if (sSlotCustomized[i]) sRByteFilter[kSlots[i].r] = 1;
     }
+
+    // Effective primary-background luminance per mode (user color, else the
+    // donor constant), used to derive legible auto-contrast text grays.
+    const char *modeNames[2] = {"light", "dark"};
+    const uint8_t donorPrimary[2][3] = {{0xCF, 0xD7, 0xE8}, {0x06, 0x16, 0x36}};
+    for (int m = 0; m < 2; m++) {
+        NSString *hex = colors[[NSString stringWithFormat:@"primaryBG.%s", modeNames[m]]];
+        unsigned int v = 0;
+        CGFloat rr, gg, bb;
+        if (hex.length == 6 && [[NSScanner scannerWithString:hex] scanHexInt:&v]) {
+            rr = ((v >> 16) & 0xFF) / 255.0; gg = ((v >> 8) & 0xFF) / 255.0; bb = (v & 0xFF) / 255.0;
+        } else {
+            rr = donorPrimary[m][0] / 255.0; gg = donorPrimary[m][1] / 255.0; bb = donorPrimary[m][2] / 255.0;
+        }
+        sPrimaryLum[m] = 0.2126 * rr + 0.7152 * gg + 0.0722 * bb;
+    }
+    // Text grays are theme-independent constants, so always filter for them
+    // when the remap is on (they don't depend on per-slot customization).
+    memset(sTextByteFilter, 0, sizeof(sTextByteFilter));
+    for (int i = 0; i < KTEXTGRAYCOUNT; i++) sTextByteFilter[kTextGrays[i].r] = 1;
+
     sRemapActive = enabled && donorActive;
     os_unfair_lock_unlock(&sLock);
     ApolloLog(@"ThemeBuilder: overrides reloaded (enabled=%d donorActive=%d theme=%@)",
@@ -249,11 +300,10 @@ void ApolloThemeBuilderForceRepaint(void) {
 // ---------------------------------------------------------------------------
 
 // Returns slot index for exact donor component match, or -1. Hot path: callers
-// pre-check sRemapActive and alpha.
-static inline int SlotForComponents(CGFloat r, CGFloat g, CGFloat b, uintptr_t caller) {
-    int ri = (int)lround(r * 255.0);
+// pre-check sRemapActive. Alpha is matched on RGB only and preserved by the
+// caller, so role colors used at reduced opacity remap correctly too.
+static inline int SlotForComponents(int ri, int gi, int bi, uintptr_t caller) {
     if (ri < 0 || ri > 255 || !sRByteFilter[ri]) return -1;
-    int gi = (int)lround(g * 255.0), bi = (int)lround(b * 255.0);
     for (int i = 0; i < KSLOTCOUNT; i++) {
         if (!sSlotCustomized[i]) continue;
         if (kSlots[i].r == ri && kSlots[i].g == gi && kSlots[i].b == bi) {
@@ -264,6 +314,28 @@ static inline int SlotForComponents(CGFloat r, CGFloat g, CGFloat b, uintptr_t c
         }
     }
     return -1;
+}
+
+// If (ri,gi,bi) is one of Apollo's theme-independent text grays, fills out[3]
+// with an auto-contrast neutral gray derived from the user's primary
+// background luminance for that constant's mode, and returns true.
+static inline bool TextGrayReplacement(int ri, int gi, int bi, uintptr_t caller, CGFloat out[3]) {
+    if (ri < 0 || ri > 255 || !sTextByteFilter[ri]) return false;
+    if (caller < sApolloStart || caller >= sApolloEnd) return false;
+    for (int i = 0; i < KTEXTGRAYCOUNT; i++) {
+        if (kTextGrays[i].r == ri && kTextGrays[i].g == gi && kTextGrays[i].b == bi) {
+            CGFloat lum = sPrimaryLum[kTextGrays[i].mode];
+            bool lightText = lum < 0.5; // light text on dark bg, dark on light
+            // Push toward a high-contrast endpoint (mid-grays disappear on
+            // medium backgrounds); secondary stronger, tertiary a touch softer.
+            CGFloat level;
+            if (kTextGrays[i].tier == 0) level = lightText ? 0.92 : 0.20;
+            else                         level = lightText ? 0.78 : 0.38;
+            out[0] = out[1] = out[2] = level;
+            return true;
+        }
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -312,17 +384,25 @@ void ApolloThemeBuilderActivateDonorLive(void) {
 %hook UIColor
 
 - (UIColor *)initWithRed:(CGFloat)r green:(CGFloat)g blue:(CGFloat)b alpha:(CGFloat)a {
-    if (sRemapActive && a == 1.0) {
-        int slot = SlotForComponents(r, g, b, (uintptr_t)__builtin_return_address(0));
+    if (sRemapActive) {
+        uintptr_t caller = (uintptr_t)__builtin_return_address(0);
+        int ri = (int)lround(r * 255.0), gi = (int)lround(g * 255.0), bi = (int)lround(b * 255.0);
+        int slot = SlotForComponents(ri, gi, bi, caller);
         if (slot >= 0) return %orig(sRepl[slot][0], sRepl[slot][1], sRepl[slot][2], a);
+        CGFloat tg[3];
+        if (TextGrayReplacement(ri, gi, bi, caller, tg)) return %orig(tg[0], tg[1], tg[2], a);
     }
     return %orig;
 }
 
 + (UIColor *)colorWithRed:(CGFloat)r green:(CGFloat)g blue:(CGFloat)b alpha:(CGFloat)a {
-    if (sRemapActive && a == 1.0) {
-        int slot = SlotForComponents(r, g, b, (uintptr_t)__builtin_return_address(0));
+    if (sRemapActive) {
+        uintptr_t caller = (uintptr_t)__builtin_return_address(0);
+        int ri = (int)lround(r * 255.0), gi = (int)lround(g * 255.0), bi = (int)lround(b * 255.0);
+        int slot = SlotForComponents(ri, gi, bi, caller);
         if (slot >= 0) return %orig(sRepl[slot][0], sRepl[slot][1], sRepl[slot][2], a);
+        CGFloat tg[3];
+        if (TextGrayReplacement(ri, gi, bi, caller, tg)) return %orig(tg[0], tg[1], tg[2], a);
     }
     return %orig;
 }
