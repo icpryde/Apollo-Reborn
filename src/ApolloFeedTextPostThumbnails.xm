@@ -106,14 +106,6 @@ typedef NS_ENUM(unsigned char, ApolloFeedStackAlign) {
 // ASControlNodeEventTouchUpInside from Texture's ASControlNode.h.
 static const NSUInteger ApolloFeedControlEventTouchUpInside = 1 << 4;
 
-// Tweak.h already declares a bare ASImageNode; extend it with the display-node
-// surface the badge needs (the runtime class is a real ASDisplayNode subclass).
-@interface ASImageNode (ApolloFeedThumb)
-@property (nullable, nonatomic, strong) UIImage *image;
-@property (nonatomic, getter=isHidden) BOOL hidden;
-- (id)style;
-@end
-
 @interface ASLayoutSpec : NSObject
 @property (nullable, nonatomic) NSArray *children;
 - (id)style;
@@ -135,20 +127,8 @@ static const NSUInteger ApolloFeedControlEventTouchUpInside = 1 << 4;
 + (instancetype)ratioLayoutSpecWithRatio:(CGFloat)ratio child:(id)child;
 @end
 
-@interface ASOverlayLayoutSpec : ASLayoutSpec
-+ (instancetype)overlayLayoutSpecWithChild:(id)child overlay:(id)overlay;
-@end
-
 @interface ASInsetLayoutSpec : ASLayoutSpec
 + (instancetype)insetLayoutSpecWithInsets:(UIEdgeInsets)insets child:(id)child;
-@end
-
-// ASRelativeLayoutSpecPosition: None=0, Start=1, Center=2, End=3.
-@interface ASRelativeLayoutSpec : ASLayoutSpec
-+ (instancetype)relativePositionLayoutSpecWithHorizontalPosition:(NSUInteger)horizontalPosition
-                                                verticalPosition:(NSUInteger)verticalPosition
-                                                    sizingOption:(NSUInteger)sizingOption
-                                                           child:(id)child;
 @end
 
 // ASLayoutElementStyle subset for fixing the hero height.
@@ -178,8 +158,10 @@ static char kApolloFeedThumbRatioKey;
 // layout for large-mode text/link posts (created once per node, reused).
 static char kApolloFeedHeroNodeKey;
 
-// Associated-object: the "Text Post" badge node overlaid on the hero.
-static char kApolloFeedBadgeNodeKey;
+// Apollo's standard large-cell horizontal content margin (matches the feed
+// search bar and the title/body text), so the rounded hero lines up with the
+// rest of the cell instead of bleeding to the screen edge.
+static const CGFloat kApolloFeedHeroSideInset = 16.0;
 
 // Associated-object on the hero node: the RDKLink it currently displays
 // (updated every layout pass — cells get reused for different links).
@@ -609,31 +591,6 @@ static id ApolloFeedIvar(id obj, const char *name);
 }
 @end
 
-// "Text Post" pill rendered once — overlaid bottom-right on the hero so the
-// feed makes clear this thumbnail belongs to a text post (issue #419).
-static UIImage *ApolloFeedTextPostBadgeImage(void) {
-    static UIImage *sBadge = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        NSString *text = @"Text Post";
-        NSDictionary *attrs = @{
-            NSFontAttributeName: [UIFont systemFontOfSize:10.0 weight:UIFontWeightSemibold],
-            NSForegroundColorAttributeName: [UIColor whiteColor],
-        };
-        CGSize textSize = [text sizeWithAttributes:attrs];
-        CGFloat hPad = 7.0, vPad = 3.0;
-        CGSize size = CGSizeMake(ceil(textSize.width) + hPad * 2.0, ceil(textSize.height) + vPad * 2.0);
-        UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:size];
-        sBadge = [renderer imageWithActions:^(UIGraphicsImageRendererContext *context) {
-            [[UIColor colorWithWhite:0.0 alpha:0.6] setFill];
-            [[UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, size.width, size.height)
-                                        cornerRadius:size.height / 2.0] fill];
-            [text drawAtPoint:CGPointMake(hPad, vPad) withAttributes:attrs];
-        }];
-    });
-    return sBadge;
-}
-
 // Apply the URL to a thumbnail image node (idempotent — skips if already set).
 static void ApolloFeedApplyThumbnailURL(id thumbNode, NSURL *url) {
     if (!thumbNode || !url) return;
@@ -882,12 +839,10 @@ static void ApolloFeedReapplyCleanup(id node, BOOL triggerLayout) {
 - (id)layoutSpecThatFits:(struct ApolloFeedThumbSizeRange)constrainedSize {
     id origSpec = %orig;
     if (!sFeedTextPostThumbnails) {
-        // Toggled off mid-session: a previously injected hero/badge would
-        // otherwise keep its last frame even though it left the layout spec.
+        // Toggled off mid-session: a previously injected hero would otherwise
+        // keep its last frame even though it left the layout spec.
         ASDisplayNode *staleHero = objc_getAssociatedObject(self, &kApolloFeedHeroNodeKey);
         if (staleHero) staleHero.hidden = YES;
-        ASDisplayNode *staleBadge = objc_getAssociatedObject(self, &kApolloFeedBadgeNodeKey);
-        if (staleBadge) staleBadge.hidden = YES;
         // Even without a thumbnail, a naked image URL leading the preview
         // text is noise — show the post's actual text, like a normal text
         // post. (Link card stays native.)
@@ -1002,37 +957,16 @@ static void ApolloFeedReapplyCleanup(id node, BOOL triggerLayout) {
 
         id heroSpec = [ratioCls ratioLayoutSpecWithRatio:ratio child:hero];
 
-        // "Text Post" pill pinned to the hero's bottom-right corner, so it's
-        // obvious in the feed that this thumbnail belongs to a text post.
-        Class overlayCls = objc_getClass("ASOverlayLayoutSpec");
-        Class relativeCls = objc_getClass("ASRelativeLayoutSpec");
+        // RichMediaNode spans the cell edge-to-edge (Apollo's image posts are
+        // intentionally full-bleed), but a rounded-corner thumbnail looks
+        // clipped flush against the screen edge. Inset it to Apollo's standard
+        // content margin so it lines up with the title/body text (review
+        // feedback on #426).
         Class insetCls = objc_getClass("ASInsetLayoutSpec");
-        if (overlayCls && relativeCls && insetCls) {
-            ASImageNode *badge = (ASImageNode *)objc_getAssociatedObject(self, &kApolloFeedBadgeNodeKey);
-            if (!badge) {
-                Class imgNodeCls = objc_getClass("ASImageNode");
-                badge = imgNodeCls ? [[imgNodeCls alloc] init] : nil;
-                if (badge) {
-                    UIImage *pill = ApolloFeedTextPostBadgeImage();
-                    badge.image = pill;
-                    id badgeStyle = [badge style];
-                    if ([badgeStyle respondsToSelector:@selector(setPreferredSize:)]) {
-                        ((ApolloFeedLayoutStyle *)badgeStyle).preferredSize = pill.size;
-                    }
-                    [(ASDisplayNode *)self addSubnode:(ASDisplayNode *)badge];
-                    objc_setAssociatedObject(self, &kApolloFeedBadgeNodeKey, badge,
-                                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-                }
-            }
-            if (badge) {
-                badge.hidden = NO;
-                id positioned = [relativeCls relativePositionLayoutSpecWithHorizontalPosition:3 /* End */
-                                                                             verticalPosition:3 /* End */
-                                                                                 sizingOption:0
-                                                                                        child:badge];
-                id inset = [insetCls insetLayoutSpecWithInsets:UIEdgeInsetsMake(0, 0, 8, 8) child:positioned];
-                heroSpec = [overlayCls overlayLayoutSpecWithChild:heroSpec overlay:inset] ?: heroSpec;
-            }
+        if (insetCls) {
+            id padded = [insetCls insetLayoutSpecWithInsets:UIEdgeInsetsMake(0, kApolloFeedHeroSideInset, 0, kApolloFeedHeroSideInset)
+                                                      child:heroSpec];
+            if (padded) heroSpec = padded;
         }
 
         id stacked = [stackCls stackLayoutSpecWithDirection:ApolloFeedStackDirectionVertical
