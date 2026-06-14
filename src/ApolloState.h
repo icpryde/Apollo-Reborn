@@ -28,6 +28,10 @@ extern BOOL sShowUserAvatars;
 extern BOOL sUseProfileAvatarTabIcon;
 extern BOOL sShowSubredditHeaders;
 extern BOOL sAutoHideTabBarShowOnIdle;
+// When ON, neutralizes Apollo's feed/subreddit search takeover (nav-hide + fade + toolbar
+// dock/grow); the field stays put and results populate the feed in place. Liquid Glass only;
+// mutually exclusive with the default nav-hide mode. See ApolloSearchInPlace.xm.
+extern BOOL sKeepSearchBarInPlace;
 extern BOOL sModernSubredditDividers;
 // Master toggle for subreddit list enhancements (see UDKeySubredditListEnhancements).
 extern BOOL sSubredditListEnhancements;
