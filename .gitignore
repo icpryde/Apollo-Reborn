@@ -24,3 +24,4 @@ iOS26-Runtime-Headers/
 
 # Local iOS Simulator working dir (scripts/run-in-sim.sh)
 .sim/
+widgets/build/
