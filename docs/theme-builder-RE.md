@@ -161,27 +161,24 @@ vote green, link blue) are excluded by the neutrality test. Theme-tinted
 bluish text grays (`9399A6`, `94969D`) come through the background getter
 `0x10068b014` and aren't neutral, so they ride the background remap instead.
 
-## Known limitation: baked chrome glyph icons
+## Profile/menu glyph icons
 
-Some chrome glyphs — most visibly the **profile menu icons** (Posts, Comments,
-Saved, Friends, …) and a few hairline separators — are **not** recolorable by
-the builder. A third RE pass ruled out every color path the engine can hook:
+The profile menu glyphs (Posts, Comments, Saved, Friends, ...) were the main
+light-mode outlier. The signed-in profile list is not a UIKit table cell; it
+is `Apollo.IconTextCellNode`, a Texture `ASCellNode` with `iconImage` and
+`iconNode` (`ASImageNode`) ivars. Under the outrun donor, the light-mode glyph
+image can arrive as original-rendered, so Apollo's normal tint write has no
+visible effect. Stock light themes such as nefertiti and spooky pumpkin use
+the same native row path with template-rendered glyphs and accent tint.
 
-- `UIColor` RGB/white constructors — fire, but never produce these glyphs'
-  color (text/chevrons on the same screen *do* recolor).
-- `-[UIImageView setTintColor:]` — fires for them with `#EBEBEB`, but remapping
-  it has no visible effect.
-- `-[UIImage imageWithTintColor:…]` — fires (white), remapping it has no effect.
-
-Combined with the glyphs being gray in light mode and the accent color in dark
-mode, this strongly indicates they are **pre-rendered asset-catalog images with
-baked light/dark appearance variants**, not runtime-tinted. Baked pixels can't
-be reached by color interception; recoloring them would require intercepting
-image *loading* and rewriting bitmaps (heavy, fragile, and prone to recoloring
-non-chrome imagery), so it's intentionally out of scope. These icons stay at
-Apollo's stock tint — fine on muted/Apollo-style palettes, faint on bold light
-backgrounds. The text, background, accent, bar and separator-role theming is
-unaffected.
+The builder fixes this at the narrow row boundary rather than by rewriting
+arbitrary images: `_TtC6Apollo16IconTextCellNode` normalizes its `iconImage`
+onto `iconNode` with `UIImageRenderingModeAlwaysTemplate`, then sets the node
+and backing view tint to the active builder accent during layout. The UIKit
+settings/action variants (`_TtC6Apollo21IconTextTableViewCell`,
+`_TtC6Apollo23IconActionTableViewCell`) do the equivalent for their
+`iconImageView`. This follows Apollo's native template+tint behavior without
+touching content images or full-color settings icons.
 
 ## Persistence
 

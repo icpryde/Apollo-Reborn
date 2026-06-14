@@ -2,6 +2,19 @@
 #import "ApolloThemeBuilder.h"
 #import "ApolloCommon.h"
 
+// Relative luminance (sRGB-weighted; good enough for a contrast hint) + WCAG
+// contrast ratio, used to warn about color combos that can't be auto-fixed.
+static CGFloat ATBLuminance(NSString *hex) {
+    UIColor *c = ApolloThemeBuilderColorFromHex(hex);
+    CGFloat r = 0, g = 0, b = 0, a = 0;
+    if (!c || ![c getRed:&r green:&g blue:&b alpha:&a]) return 0.5;
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+static CGFloat ATBContrast(CGFloat l1, CGFloat l2) {
+    CGFloat hi = l1 > l2 ? l1 : l2, lo = l1 < l2 ? l1 : l2;
+    return (hi + 0.05) / (lo + 0.05);
+}
+
 // Sections
 typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
     SectionEnable = 0,
@@ -294,9 +307,29 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
                    @"this off, re-selecting Outrun (or this switch) brings it back.";
         case SectionPreset:
             return @"Seed every color from one of Apollo's built-in themes, then adjust to taste.";
+        case SectionLightColors: return [self contrastWarningForMode:@"light"];
+        case SectionDarkColors:  return [self contrastWarningForMode:@"dark"];
         case SectionReset: return nil;
         default: return nil;
     }
+}
+
+// Text is auto-contrasted by the engine, but the accent can't be — icons, links
+// and the selected tab all use it, so warn when it's too close to either
+// background to be visible.
+- (NSString *)contrastWarningForMode:(NSString *)mode {
+    CGFloat accent = ATBLuminance(ApolloThemeBuilderSavedHex(@"accent", mode));
+    CGFloat primary = ATBLuminance(ApolloThemeBuilderSavedHex(@"primaryBG", mode));
+    CGFloat secondary = ATBLuminance(ApolloThemeBuilderSavedHex(@"secondaryBG", mode));
+    CGFloat worst = MIN(ATBContrast(accent, primary), ATBContrast(accent, secondary));
+    if (worst < 1.45) {
+        return @"⚠︎ Your accent is very close to the background — icons, links and the "
+               @"selected tab may be hard to see. Pick a more contrasting accent.";
+    }
+    if (worst < 2.0) {
+        return @"Your accent has low contrast with the background; icons may look faint.";
+    }
+    return nil;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {

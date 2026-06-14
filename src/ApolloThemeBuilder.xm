@@ -23,7 +23,9 @@
 // stays truthful.
 
 #import <UIKit/UIKit.h>
+#import <math.h>
 #import <mach-o/dyld.h>
+#import <objc/message.h>
 #import <objc/runtime.h>
 #import <os/lock.h>
 #import "ApolloCommon.h"
@@ -53,6 +55,11 @@ typedef struct {
     const char *mode;      // "light" / "dark"
     uint8_t r, g, b;       // donor constant bytes Apollo passes to UIColor
 } ThemeSlot;
+
+typedef struct {
+    CGSize min;
+    CGSize max;
+} ThemeBuilderASSizeRange;
 
 #define KSLOTCOUNT 14
 static const ThemeSlot kSlots[KSLOTCOUNT] = {
@@ -102,12 +109,18 @@ static uint8_t sRByteFilter[256];
 // near-white are left alone (structural: primary text, white-on-accent, glyph
 // fills), as are saturated colors (real theme/content colors).
 //
-// Effective primary-background luminance per mode (user color or donor),
-// recomputed in ApolloThemeBuilderReloadOverrides.
-static CGFloat sPrimaryLum[2] = {0.85, 0.05}; // light, dark donor defaults
+// Effective primary/secondary-background luminance per mode (user color or
+// donor), recomputed in ApolloThemeBuilderReloadOverrides. Auto-contrast text
+// must stay readable on BOTH surfaces — cells (primary) and the page behind
+// them (secondary) — which can diverge wildly under a custom theme.
+static CGFloat sPrimaryLum[2]   = {0.85, 0.05}; // light, dark donor defaults
+static CGFloat sSecondaryLum[2] = {0.78, 0.07};
 
 static uintptr_t sApolloStart = 0;
 static uintptr_t sApolloEnd = 0;
+static char kThemeBuilderAppliedSourceImageKey;
+static char kThemeBuilderAppliedTemplateImageKey;
+static char kThemeBuilderAppliedTintKey;
 
 static void FindApolloImage(void) {
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
@@ -219,6 +232,21 @@ void ApolloThemeBuilderReloadOverrides(void) {
     BOOL donorActive = [activeTheme isEqualToString:kDonorThemeName];
     NSDictionary *colors = [ud dictionaryForKey:kApolloCustomThemeColorsKey];
 
+#if APOLLO_THEME_TESTENV
+    // Dev-only deterministic palette override (bypasses cfprefsd). Pass via
+    // SIMCTL_CHILD_ATBTEST="role.mode=RRGGBB;role.mode=RRGGBB;..."
+    const char *env = getenv("ATBTEST");
+    if (env && *env) {
+        NSMutableDictionary *d = [NSMutableDictionary dictionary];
+        for (NSString *pair in [[NSString stringWithUTF8String:env] componentsSeparatedByString:@";"]) {
+            NSArray *kv = [pair componentsSeparatedByString:@"="];
+            if (kv.count == 2 && [kv[1] length] == 6) d[kv[0]] = kv[1];
+        }
+        colors = d; enabled = YES; donorActive = YES;
+        ApolloLog(@"ThemeBuilder[TESTENV]: %lu override colors", (unsigned long)d.count);
+    }
+#endif
+
     os_unfair_lock_lock(&sLock);
     memset(sRByteFilter, 0, sizeof(sRByteFilter));
     for (int i = 0; i < KSLOTCOUNT; i++) {
@@ -239,20 +267,29 @@ void ApolloThemeBuilderReloadOverrides(void) {
         if (sSlotCustomized[i]) sRByteFilter[kSlots[i].r] = 1;
     }
 
-    // Effective primary-background luminance per mode (user color, else the
-    // donor constant), used to derive legible auto-contrast text grays.
+    // Effective primary/secondary-background luminance per mode (user color,
+    // else the donor constant), used to derive legible auto-contrast text grays.
     const char *modeNames[2] = {"light", "dark"};
-    const uint8_t donorPrimary[2][3] = {{0xCF, 0xD7, 0xE8}, {0x06, 0x16, 0x36}};
+    const uint8_t donorPrimary[2][3]   = {{0xCF, 0xD7, 0xE8}, {0x06, 0x16, 0x36}};
+    const uint8_t donorSecondary[2][3] = {{0xBA, 0xC1, 0xD1}, {0x08, 0x1D, 0x47}};
     for (int m = 0; m < 2; m++) {
-        NSString *hex = colors[[NSString stringWithFormat:@"primaryBG.%s", modeNames[m]]];
         unsigned int v = 0;
         CGFloat rr, gg, bb;
-        if (hex.length == 6 && [[NSScanner scannerWithString:hex] scanHexInt:&v]) {
+        NSString *ph = colors[[NSString stringWithFormat:@"primaryBG.%s", modeNames[m]]];
+        if (ph.length == 6 && [[NSScanner scannerWithString:ph] scanHexInt:&v]) {
             rr = ((v >> 16) & 0xFF) / 255.0; gg = ((v >> 8) & 0xFF) / 255.0; bb = (v & 0xFF) / 255.0;
         } else {
             rr = donorPrimary[m][0] / 255.0; gg = donorPrimary[m][1] / 255.0; bb = donorPrimary[m][2] / 255.0;
         }
         sPrimaryLum[m] = 0.2126 * rr + 0.7152 * gg + 0.0722 * bb;
+
+        NSString *sh = colors[[NSString stringWithFormat:@"secondaryBG.%s", modeNames[m]]];
+        if (sh.length == 6 && [[NSScanner scannerWithString:sh] scanHexInt:&v]) {
+            rr = ((v >> 16) & 0xFF) / 255.0; gg = ((v >> 8) & 0xFF) / 255.0; bb = (v & 0xFF) / 255.0;
+        } else {
+            rr = donorSecondary[m][0] / 255.0; gg = donorSecondary[m][1] / 255.0; bb = donorSecondary[m][2] / 255.0;
+        }
+        sSecondaryLum[m] = 0.2126 * rr + 0.7152 * gg + 0.0722 * bb;
     }
 
     sRemapActive = enabled && donorActive;
@@ -312,7 +349,7 @@ static inline int SlotForComponents(int ri, int gi, int bi, uintptr_t caller) {
 // created by Apollo, fills out[3] with an auto-contrast gray derived from the
 // active mode's primary-background luminance and returns true. Preserves the
 // gray's relative prominence so the text/icon hierarchy is kept.
-static inline bool NeutralGrayReplacement(int ri, int gi, int bi, uintptr_t caller, CGFloat out[3]) {
+static inline bool NeutralGrayReplacement(int ri, int gi, int bi, uintptr_t caller, CGFloat alpha, CGFloat out[3]) {
     if (caller < sApolloStart || caller >= sApolloEnd) return false;
     // Neutral = all channels within a tight band (allow a hair of tint).
     int mx = ri > gi ? (ri > bi ? ri : bi) : (gi > bi ? gi : bi);
@@ -320,33 +357,156 @@ static inline bool NeutralGrayReplacement(int ri, int gi, int bi, uintptr_t call
     if (mx - mn > 8) return false;
     // Gray level 0..1 (channels are ~equal; use the mean).
     CGFloat Lg = (ri + gi + bi) / (3.0 * 255.0);
-    // Leave structural near-black / near-white (primary text, white-on-accent,
-    // glyph fills) untouched.
-    if (Lg < 0.10 || Lg > 0.92) return false;
+    // Near-white is left alone (light surfaces, white-on-accent glyphs/text).
+    // Near-black is *primary text* and must auto-contrast too (it vanishes on a
+    // dark background chosen for light mode) — but only when fully opaque, so
+    // translucent black shadows/overlays/scrims are preserved.
+    if (Lg > 0.92) return false;
+    if (Lg < 0.10 && alpha < 0.99) return false;
 
-    // Active appearance picks which background we contrast against. During a
-    // theme repaint / cell layout the current trait reflects the render mode;
-    // fall back to light if unspecified.
     UIUserInterfaceStyle style = UITraitCollection.currentTraitCollection.userInterfaceStyle;
     int mode = (style == UIUserInterfaceStyleDark) ? 1 : 0;
-    CGFloat Lb = sPrimaryLum[mode];
-    bool lightBg = Lb >= 0.5;
 
-    // Prominence: how much contrast the gray "wanted" against Apollo's own
-    // reference background (white in light, black in dark). Darker-on-white /
-    // lighter-on-black = more prominent. Floor it so faint stays visible.
-    CGFloat prominence = lightBg ? (1.0 - Lg) : Lg;
-    if (prominence < 0.20) prominence = 0.20;
-    if (prominence > 0.95) prominence = 0.95;
-    // Place the new gray on the readable side of the background by an amount
-    // proportional to that prominence.
-    CGFloat delta = 0.30 + 0.55 * prominence;
-    CGFloat target = lightBg ? (Lb - delta) : (Lb + delta);
-    if (target < 0.05) target = 0.05;
-    if (target > 0.97) target = 0.97;
+    // Text must read on BOTH the cell (primary) and the page (secondary). A
+    // single gray can't be perfect when those diverge, so pick the direction
+    // (dark vs light text) that maximizes the WCAG contrast ratio against the
+    // *worst* of the two backgrounds, then only stay faint while the contrast
+    // budget against the binding background allows it.
+    CGFloat Lp = sPrimaryLum[mode], Ls = sSecondaryLum[mode];
+    CGFloat loBG = Lp < Ls ? Lp : Ls;   // binds dark text (lowest contrast)
+    CGFloat hiBG = Lp > Ls ? Lp : Ls;   // binds light text
+    CGFloat darkWorst  = (loBG + 0.05) / (0.05 + 0.05);  // wcag(near-black, loBG)
+    CGFloat lightWorst = (1.0 + 0.05) / (hiBG + 0.05);   // wcag(near-white, hiBG)
+    bool goDark = darkWorst >= lightWorst;
+
+    // Faintness preserves Apollo's text hierarchy where contrast allows (its
+    // grays reference white in light mode, black in dark mode).
+    CGFloat faint = (mode == 0) ? Lg : (1.0 - Lg);
+    if (faint < 0.0) faint = 0.0; else if (faint > 1.0) faint = 1.0;
+
+    CGFloat target;
+    if (goDark) {
+        // Softest dark that still clears ~3:1 against the darker background.
+        CGFloat ceil = (loBG + 0.05) / 3.0 - 0.05;
+        if (ceil < 0.06) ceil = 0.06;
+        CGFloat desired = 0.10 + 0.42 * faint;
+        target = desired < ceil ? desired : ceil;
+    } else {
+        // Softest light that still clears ~3:1 against the lighter background.
+        CGFloat floor = 3.0 * (hiBG + 0.05) - 0.05;
+        if (floor > 0.94) floor = 0.94;
+        CGFloat desired = 0.90 - 0.42 * faint;
+        target = desired > floor ? desired : floor;
+    }
 
     out[0] = out[1] = out[2] = target;
     return true;
+}
+
+static UIColor *ThemeBuilderCurrentAccentColor(UITraitCollection *traits) {
+    UIUserInterfaceStyle style = traits.userInterfaceStyle;
+    int slot = (style == UIUserInterfaceStyleDark) ? 7 : 0;
+    CGFloat r, g, b;
+
+    os_unfair_lock_lock(&sLock);
+    if (sSlotCustomized[slot]) {
+        r = sRepl[slot][0];
+        g = sRepl[slot][1];
+        b = sRepl[slot][2];
+    } else {
+        r = kSlots[slot].r / 255.0;
+        g = kSlots[slot].g / 255.0;
+        b = kSlots[slot].b / 255.0;
+    }
+    os_unfair_lock_unlock(&sLock);
+
+    return [UIColor colorWithRed:r green:g blue:b alpha:1.0];
+}
+
+static BOOL ThemeBuilderColorsEqual(UIColor *a, UIColor *b) {
+    if (a == b) return YES;
+    if (!a || !b) return NO;
+    CGFloat ar = 0, ag = 0, ab = 0, aa = 0;
+    CGFloat br = 0, bg = 0, bb = 0, ba = 0;
+    if (![a getRed:&ar green:&ag blue:&ab alpha:&aa]) return NO;
+    if (![b getRed:&br green:&bg blue:&bb alpha:&ba]) return NO;
+    return fabs(ar - br) < 0.002 && fabs(ag - bg) < 0.002 && fabs(ab - bb) < 0.002 && fabs(aa - ba) < 0.002;
+}
+
+static id ThemeBuilderObjectIvar(id object, const char *name) {
+    Ivar ivar = class_getInstanceVariable(object_getClass(object), name);
+    return ivar ? object_getIvar(object, ivar) : nil;
+}
+
+static UIImageView *ThemeBuilderImageViewIvar(id object, const char *name) {
+    id value = ThemeBuilderObjectIvar(object, name);
+    return [value isKindOfClass:[UIImageView class]] ? (UIImageView *)value : nil;
+}
+
+static void ThemeBuilderApplyAccentImageView(id cell) {
+    if (!sRemapActive) return;
+
+    UIImageView *icon = ThemeBuilderImageViewIvar(cell, "iconImageView");
+    if (!icon) return;
+
+    UIImage *image = icon.image;
+    if (image && image.renderingMode != UIImageRenderingModeAlwaysTemplate) {
+        icon.image = [image imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+    }
+    UIImage *highlighted = icon.highlightedImage;
+    if (highlighted && highlighted.renderingMode != UIImageRenderingModeAlwaysTemplate) {
+        icon.highlightedImage = [highlighted imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+    }
+    UIColor *accent = ThemeBuilderCurrentAccentColor(icon.traitCollection);
+    if (!ThemeBuilderColorsEqual(icon.tintColor, accent)) {
+        icon.tintColor = accent;
+    }
+}
+
+static void ThemeBuilderApplyAccentImageNode(id cell) {
+    if (!sRemapActive) return;
+
+    id iconNode = ThemeBuilderObjectIvar(cell, "iconNode");
+    UIImage *iconImage = ThemeBuilderObjectIvar(cell, "iconImage");
+    if (!iconNode || ![iconImage isKindOfClass:[UIImage class]]) return;
+
+    UITraitCollection *traits = UIScreen.mainScreen.traitCollection;
+    if ([iconNode respondsToSelector:@selector(view)]) {
+        UIView *view = ((UIView *(*)(id, SEL))objc_msgSend)(iconNode, @selector(view));
+        if (view.traitCollection) traits = view.traitCollection;
+    }
+    UIColor *accent = ThemeBuilderCurrentAccentColor(traits);
+    UIImage *templated = objc_getAssociatedObject(iconNode, &kThemeBuilderAppliedTemplateImageKey);
+    if (objc_getAssociatedObject(iconNode, &kThemeBuilderAppliedSourceImageKey) != iconImage || !templated) {
+        templated = (iconImage.renderingMode == UIImageRenderingModeAlwaysTemplate)
+            ? iconImage
+            : [iconImage imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+        objc_setAssociatedObject(iconNode, &kThemeBuilderAppliedSourceImageKey, iconImage, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(iconNode, &kThemeBuilderAppliedTemplateImageKey, templated, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+
+    if ([iconNode respondsToSelector:@selector(setImage:)]) {
+        UIImage *current = nil;
+        if ([iconNode respondsToSelector:@selector(image)]) {
+            current = ((UIImage *(*)(id, SEL))objc_msgSend)(iconNode, @selector(image));
+        }
+        if (current != templated) {
+            ((void (*)(id, SEL, UIImage *))objc_msgSend)(iconNode, @selector(setImage:), templated);
+        }
+    }
+    if ([iconNode respondsToSelector:@selector(setTintColor:)]) {
+        UIColor *lastTint = objc_getAssociatedObject(iconNode, &kThemeBuilderAppliedTintKey);
+        if (!ThemeBuilderColorsEqual(lastTint, accent)) {
+            ((void (*)(id, SEL, UIColor *))objc_msgSend)(iconNode, @selector(setTintColor:), accent);
+            objc_setAssociatedObject(iconNode, &kThemeBuilderAppliedTintKey, accent, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+    }
+    if ([iconNode respondsToSelector:@selector(view)]) {
+        UIView *view = ((UIView *(*)(id, SEL))objc_msgSend)(iconNode, @selector(view));
+        if (!ThemeBuilderColorsEqual(view.tintColor, accent)) {
+            view.tintColor = accent;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -401,7 +561,7 @@ void ApolloThemeBuilderActivateDonorLive(void) {
         int slot = SlotForComponents(ri, gi, bi, caller);
         if (slot >= 0) return %orig(sRepl[slot][0], sRepl[slot][1], sRepl[slot][2], a);
         CGFloat tg[3];
-        if (NeutralGrayReplacement(ri, gi, bi, caller, tg)) return %orig(tg[0], tg[1], tg[2], a);
+        if (NeutralGrayReplacement(ri, gi, bi, caller, a, tg)) return %orig(tg[0], tg[1], tg[2], a);
     }
     return %orig;
 }
@@ -413,7 +573,7 @@ void ApolloThemeBuilderActivateDonorLive(void) {
         int slot = SlotForComponents(ri, gi, bi, caller);
         if (slot >= 0) return %orig(sRepl[slot][0], sRepl[slot][1], sRepl[slot][2], a);
         CGFloat tg[3];
-        if (NeutralGrayReplacement(ri, gi, bi, caller, tg)) return %orig(tg[0], tg[1], tg[2], a);
+        if (NeutralGrayReplacement(ri, gi, bi, caller, a, tg)) return %orig(tg[0], tg[1], tg[2], a);
     }
     return %orig;
 }
@@ -425,7 +585,7 @@ void ApolloThemeBuilderActivateDonorLive(void) {
         uintptr_t caller = (uintptr_t)__builtin_return_address(0);
         int wi = (int)lround(w * 255.0);
         CGFloat tg[3];
-        if (NeutralGrayReplacement(wi, wi, wi, caller, tg)) return %orig(tg[0], a);
+        if (NeutralGrayReplacement(wi, wi, wi, caller, a, tg)) return %orig(tg[0], a);
     }
     return %orig;
 }
@@ -435,47 +595,70 @@ void ApolloThemeBuilderActivateDonorLive(void) {
         uintptr_t caller = (uintptr_t)__builtin_return_address(0);
         int wi = (int)lround(w * 255.0);
         CGFloat tg[3];
-        if (NeutralGrayReplacement(wi, wi, wi, caller, tg)) return %orig(tg[0], a);
+        if (NeutralGrayReplacement(wi, wi, wi, caller, a, tg)) return %orig(tg[0], a);
     }
     return %orig;
 }
 
 %end
 
-#if APOLLO_THEME_TINTTEST
-%hook UIImageView
-- (void)setImage:(UIImage *)image {
-    if (sRemapActive && image) {
-        uintptr_t c = (uintptr_t)__builtin_return_address(0);
-        if (c >= sApolloStart && c < sApolloEnd) {
-            %orig([image imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate]);
-            return;
-        }
-    }
+// These UIKit menu rows are the visible outlier for custom light themes:
+// under the outrun donor, their glyph assets arrive as original-rendered
+// images, so Apollo's tint writes are ignored. Stock light themes use the
+// same cells with template glyphs and accent tint. Normalize only these icon
+// cells so the builder follows the native path without rewriting arbitrary
+// app imagery.
+%hook _TtC6Apollo21IconTextTableViewCell
+
+- (void)layoutSubviews {
     %orig;
+    ThemeBuilderApplyAccentImageView(self);
 }
-%end
-%hook UIView
-- (void)setTintColor:(UIColor *)color {
-    if (sRemapActive && color && [self isKindOfClass:[UIImageView class]]) {
-        uintptr_t caller = (uintptr_t)__builtin_return_address(0);
-        if (caller >= sApolloStart && caller < sApolloEnd) {
-            CGFloat r=0,g=0,b=0,a=1,w=0; int ri=-1,gi=-1,bi=-1;
-            if ([color getRed:&r green:&g blue:&b alpha:&a]) { ri=(int)lround(r*255);gi=(int)lround(g*255);bi=(int)lround(b*255); }
-            else if ([color getWhite:&w alpha:&a]) { ri=gi=bi=(int)lround(w*255); }
-            int mx = ri>gi?(ri>bi?ri:bi):(gi>bi?gi:bi), mn = ri<gi?(ri<bi?ri:bi):(gi<bi?gi:bi);
-            if (ri>=0 && mx-mn<=8) { // neutral gray icon tint -> RED
-                ApolloLog(@"TINTTEST UIImageView neutral #%02X%02X%02X caller=0x%lx -> red",
-                          ri,gi,bi,(unsigned long)(0x100000000+(caller-sApolloStart)));
-                %orig([UIColor redColor]);
-                return;
-            }
-        }
-    }
+
+- (void)setHighlighted:(BOOL)highlighted animated:(BOOL)animated {
     %orig;
+    ThemeBuilderApplyAccentImageView(self);
 }
+
+- (void)setSelected:(BOOL)selected animated:(BOOL)animated {
+    %orig;
+    ThemeBuilderApplyAccentImageView(self);
+}
+
 %end
-#endif
+
+%hook _TtC6Apollo23IconActionTableViewCell
+
+- (void)layoutSubviews {
+    %orig;
+    ThemeBuilderApplyAccentImageView(self);
+}
+
+- (void)setHighlighted:(BOOL)highlighted animated:(BOOL)animated {
+    %orig;
+    ThemeBuilderApplyAccentImageView(self);
+}
+
+- (void)setSelected:(BOOL)selected animated:(BOOL)animated {
+    %orig;
+    ThemeBuilderApplyAccentImageView(self);
+}
+
+%end
+
+// The signed-in profile rows are Texture cells, not UIKit table cells. Native
+// themes tint their ASImageNode glyphs through the same accent role; normalize
+// the donor image to template and push the builder accent onto the node.
+%hook _TtC6Apollo16IconTextCellNode
+
+- (id)layoutSpecThatFits:(ThemeBuilderASSizeRange)fits {
+    ThemeBuilderApplyAccentImageNode(self);
+    id spec = %orig;
+    ThemeBuilderApplyAccentImageNode(self);
+    return spec;
+}
+
+%end
 
 %hook NSUserDefaults
 

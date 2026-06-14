@@ -327,7 +327,10 @@ if [[ "$DO_LOGS" == 1 ]]; then
 fi
 
 log "Launching $BUNDLE_ID with ApolloReborn.dylib injected"
-SIMCTL_CHILD_DYLD_INSERT_LIBRARIES="$(cd "$WORK_DIR" && pwd)/ApolloReborn.dylib" \
+DYLIB_INJECT="/tmp/ApolloRebornSim-${BUNDLE_ID//[^A-Za-z0-9_.-]/_}.dylib"
+cp "$DYLIB_DST" "$DYLIB_INJECT"
+codesign -f -s - "$DYLIB_INJECT" >/dev/null 2>&1
+SIMCTL_CHILD_DYLD_INSERT_LIBRARIES="$DYLIB_INJECT" \
     xcrun simctl launch "$DEV" "$BUNDLE_ID"
 
 # ----------------------------------------------------------------------------
