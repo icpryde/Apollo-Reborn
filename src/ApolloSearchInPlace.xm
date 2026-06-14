@@ -40,6 +40,31 @@ static id ApolloObjectIvar(id object, const char *name) {
     return nil;
 }
 
+// MARK: - "Find in Comments" bar (in-thread search) — opaque backing
+//
+// The in-thread comments search (searchBarShouldStickToKeyboard == YES) is excluded from the feed-search
+// handling above, but its docked find bar is transparent, so the comments behind it bleed through the
+// Done button / chevrons. Detect it (its toolbar belongs to a CommentsViewController) and give it a solid
+// backing only while it's docked (active); restore it (transparent) at its resting pill.
+static BOOL isCommentToolbar(UIView *v) {
+    UIResponder *r = [v nextResponder];
+    int guard = 0;
+    while (r && guard++ < 40) {
+        if ([r isKindOfClass:[UIViewController class]]) {
+            const char *cls = object_getClassName(r);
+            if (cls && strstr(cls, "Comments")) return YES;
+        }
+        r = [r nextResponder];
+    }
+    return NO;
+}
+
+// The toolbar is "docked" (the active find-in-page layout) when it's been reparented off the scroll view.
+static BOOL toolbarDocked(UIView *toolbar) {
+    UIView *sup = [toolbar superview];
+    return sup != nil && ![sup isKindOfClass:[UIScrollView class]];
+}
+
 // MARK: - Nav-bar hide
 //
 // Apollo's feed search bar is a custom ApolloSearchToolbar overlaid on the Texture ASTableView, not a
@@ -534,6 +559,18 @@ static void recenterCancelButton(void) {
 // flies in from the docked-top geometry.
 - (void)layoutSubviews {
     %orig;
+    // "Find in Comments" bar (in-thread search, excluded from the feed handling above): when it's docked
+    // (active find-in-page) it's transparent, so the comments behind it bleed through Done / the chevrons.
+    // Give it a solid backing while docked; restore it (transparent) at its resting pill.
+    if (isCommentToolbar((UIView *)self)) {
+        UIView *tbv = (UIView *)self;
+        if (toolbarDocked(tbv)) {
+            UIColor *solid = [UIColor systemBackgroundColor];
+            if (![tbv.backgroundColor isEqual:solid]) { tbv.backgroundColor = solid; tbv.opaque = YES; }
+        } else if (tbv.backgroundColor != nil) {
+            tbv.backgroundColor = nil;
+        }
+    }
     if (!IsLiquidGlass() || (UIView *)self != sFeedSearchToolbar ||
         (!sFeedSearchActive && !sFeedSearchDismissing)) {
         return;
