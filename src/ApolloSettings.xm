@@ -86,7 +86,8 @@ static UIImage *createSettingsIcon(NSString *sfSymbolName, UIColor *bgColor) {
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    if (section == 1) return 5; // Custom API, Saved Categories, Translation, Tag Filters, Theme Builder
+    if (section == 1) return 4; // Custom API, Saved Categories, Translation, Tag Filters
+                                // (Theme Builder now lives under Appearance → Themes)
     if (section > 1) return %orig(tableView, section - 1);
     return %orig;
 }
@@ -121,12 +122,9 @@ static UIImage *createSettingsIcon(NSString *sfSymbolName, UIColor *bgColor) {
         } else if (indexPath.row == 2) {
             cell.textLabel.text = @"Translation";
             cell.imageView.image = createSettingsIcon(@"globe", [UIColor systemIndigoColor]);
-        } else if (indexPath.row == 3) {
+        } else {
             cell.textLabel.text = @"Tag Filters";
             cell.imageView.image = createSettingsIcon(@"eye.slash.fill", [UIColor systemRedColor]);
-        } else {
-            cell.textLabel.text = @"Theme Builder";
-            cell.imageView.image = createSettingsIcon(@"paintpalette.fill", [UIColor systemPurpleColor]);
         }
         return cell;
     }
@@ -166,11 +164,8 @@ static UIImage *createSettingsIcon(NSString *sfSymbolName, UIColor *bgColor) {
         } else if (indexPath.row == 2) {
             TranslationSettingsViewController *vc = [[TranslationSettingsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
             [((UIViewController *)self).navigationController pushViewController:vc animated:YES];
-        } else if (indexPath.row == 3) {
-            TagFiltersViewController *vc = [[TagFiltersViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
-            [((UIViewController *)self).navigationController pushViewController:vc animated:YES];
         } else {
-            ApolloThemeBuilderViewController *vc = [[ApolloThemeBuilderViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+            TagFiltersViewController *vc = [[TagFiltersViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
             [((UIViewController *)self).navigationController pushViewController:vc animated:YES];
         }
         return;

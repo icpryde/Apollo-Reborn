@@ -18,7 +18,8 @@ static CGFloat ATBContrast(CGFloat l1, CGFloat l2) {
 // Sections
 typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
     SectionEnable = 0,
-    SectionPreset,
+    SectionThemes,
+    SectionPreview,
     SectionLightColors,
     SectionDarkColors,
     SectionReset,
@@ -41,14 +42,23 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
 @property (nonatomic, copy) NSString *editingMode;
 @property (nonatomic, strong) NSTimer *repaintDebounce;
 @property (nonatomic, assign) CGFloat lastPreviewWidth;
+@property (nonatomic, assign) NSInteger previewContext;
+@property (nonatomic, assign) BOOL colorEditorMode;
+- (NSInteger)displayedSectionForLogicalSection:(NSInteger)logical;
+- (NSInteger)logicalSectionForDisplayedSection:(NSInteger)section;
 @end
 
 @implementation ApolloThemeBuilderViewController
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"Theme Builder";
-    [self refreshPreview];
+    self.title = self.colorEditorMode ? ApolloThemeBuilderActiveCustomThemeName() : @"Theme Builder";
+}
+
+- (instancetype)initColorEditor {
+    self = [super initWithStyle:UITableViewStyleInsetGrouped];
+    if (self) _colorEditorMode = YES;
+    return self;
 }
 
 - (void)viewDidLayoutSubviews {
@@ -57,8 +67,16 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
     // layout) — tableHeaderView needs an explicit, correct width.
     CGFloat w = self.tableView.bounds.size.width;
     if (w > 0 && fabs(w - self.lastPreviewWidth) > 0.5) {
-        [self refreshPreview];
+        self.lastPreviewWidth = w;
+        NSInteger previewSection = [self displayedSectionForLogicalSection:SectionPreview];
+        if (previewSection != NSNotFound)
+            [self.tableView reloadSections:[NSIndexSet indexSetWithIndex:previewSection] withRowAnimation:UITableViewRowAnimationNone];
     }
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    [self.tableView reloadData];
 }
 
 - (void)traitCollectionDidChange:(UITraitCollection *)previous {
@@ -86,7 +104,14 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
     if (width <= 0) width = self.view.bounds.size.width;
     if (width <= 0) return;
     self.lastPreviewWidth = width;
-    self.tableView.tableHeaderView = [self makePreviewViewWithWidth:width];
+    NSInteger previewSection = [self displayedSectionForLogicalSection:SectionPreview];
+    if (previewSection != NSNotFound)
+        [self.tableView reloadSections:[NSIndexSet indexSetWithIndex:previewSection] withRowAnimation:UITableViewRowAnimationNone];
+}
+
+- (void)previewSegmentChanged:(UISegmentedControl *)control {
+    self.previewContext = control.selectedSegmentIndex;
+    [self refreshPreview];
 }
 
 // A mock Apollo post card rendered with the current role colors, so the user
@@ -104,58 +129,121 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
     BOOL dark = [[self previewMode] isEqualToString:@"dark"];
     UIColor *primaryText = dark ? UIColor.whiteColor : [UIColor colorWithWhite:0.1 alpha:1.0];
 
-    CGFloat margin = 16, cardInset = 16;
-    UIView *container = [[UIView alloc] initWithFrame:CGRectMake(0, 0, width, 210)];
-    container.backgroundColor = page;
+    CGFloat margin = 0, inset = 14;
+    UIView *container = [[UIView alloc] initWithFrame:CGRectMake(0, 0, width, 320)];
+    container.backgroundColor = UIColor.clearColor;
 
-    // Faux nav/tab bar strip (chrome color).
-    UIView *barStrip = [[UIView alloc] initWithFrame:CGRectMake(0, 0, width, 8)];
-    barStrip.backgroundColor = bar;
-    [container addSubview:barStrip];
+    UISegmentedControl *segments = [[UISegmentedControl alloc] initWithItems:@[@"Feed", @"Settings", @"Subreddit"]];
+    segments.frame = CGRectMake(margin, 8, width - 2 * margin, 32);
+    segments.selectedSegmentIndex = self.previewContext;
+    [segments addTarget:self action:@selector(previewSegmentChanged:) forControlEvents:UIControlEventValueChanged];
+    [container addSubview:segments];
 
-    UILabel *caption = [[UILabel alloc] initWithFrame:CGRectMake(margin, 14, width - 2 * margin, 16)];
-    caption.text = [NSString stringWithFormat:@"Live preview · %@ mode", dark ? @"Dark" : @"Light"];
+    CGFloat screenX = margin, screenY = 54, screenW = width - 2 * margin, screenH = 246;
+    UIView *screen = [[UIView alloc] initWithFrame:CGRectMake(screenX, screenY, screenW, screenH)];
+    screen.backgroundColor = page;
+    screen.layer.cornerRadius = 14;
+    screen.layer.borderWidth = 1;
+    screen.layer.borderColor = separator.CGColor;
+    screen.clipsToBounds = YES;
+    [container addSubview:screen];
+
+    UIView *chrome = [[UIView alloc] initWithFrame:CGRectMake(0, 0, screenW, 40)];
+    chrome.backgroundColor = bar;
+    [screen addSubview:chrome];
+
+    UILabel *caption = [[UILabel alloc] initWithFrame:CGRectMake(inset, 12, screenW - 2 * inset, 16)];
+    caption.text = [NSString stringWithFormat:@"%@ preview", dark ? @"Dark" : @"Light"];
     caption.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
     caption.textColor = gray;
-    [container addSubview:caption];
+    [chrome addSubview:caption];
 
-    CGFloat cardX = margin, cardY = 38, cardW = width - 2 * margin, cardH = 152;
+    CGFloat cardX = inset, cardY = 58, cardW = screenW - 2 * inset, cardH = 162;
     UIView *postCard = [[UIView alloc] initWithFrame:CGRectMake(cardX, cardY, cardW, cardH)];
     postCard.backgroundColor = card;
-    postCard.layer.cornerRadius = 12;
-    [container addSubview:postCard];
+    postCard.layer.cornerRadius = 10;
+    postCard.layer.borderWidth = 1;
+    postCard.layer.borderColor = separator.CGColor;
+    postCard.clipsToBounds = YES;
+    [screen addSubview:postCard];
+
+    if (self.previewContext == 1) {
+        NSArray *rows = @[@"Appearance", @"Theme Builder", @"Text Size"];
+        for (NSInteger i = 0; i < rows.count; i++) {
+            CGFloat y = 16 + i * 44;
+            UILabel *row = [[UILabel alloc] initWithFrame:CGRectMake(inset, y, cardW - inset * 2 - 28, 28)];
+            row.text = rows[i];
+            row.font = [UIFont systemFontOfSize:16 weight:(i == 1 ? UIFontWeightSemibold : UIFontWeightRegular)];
+            row.textColor = (i == 1) ? accent : primaryText;
+            [postCard addSubview:row];
+            UILabel *chevron = [[UILabel alloc] initWithFrame:CGRectMake(cardW - inset - 18, y, 18, 28)];
+            chevron.text = @"›";
+            chevron.textAlignment = NSTextAlignmentRight;
+            chevron.font = [UIFont systemFontOfSize:26 weight:UIFontWeightRegular];
+            chevron.textColor = gray;
+            [postCard addSubview:chevron];
+            if (i < rows.count - 1) {
+                UIView *sep = [[UIView alloc] initWithFrame:CGRectMake(inset, y + 36, cardW - inset * 2, 1)];
+                sep.backgroundColor = separator;
+                [postCard addSubview:sep];
+            }
+        }
+        return container;
+    }
+
+    if (self.previewContext == 2) {
+        UIView *banner = [[UIView alloc] initWithFrame:CGRectMake(0, 0, cardW, 52)];
+        banner.backgroundColor = bar;
+        [postCard addSubview:banner];
+        UILabel *name = [[UILabel alloc] initWithFrame:CGRectMake(inset, 14, cardW - inset * 2, 24)];
+        name.text = @"r/apolloapp";
+        name.font = [UIFont systemFontOfSize:19 weight:UIFontWeightBold];
+        name.textColor = accent;
+        [postCard addSubview:name];
+        NSArray *stats = @[@"1.2M readers", @"4.8k online"];
+        for (NSInteger i = 0; i < stats.count; i++) {
+            UILabel *stat = [[UILabel alloc] initWithFrame:CGRectMake(inset, 76 + i * 30, cardW - inset * 2, 22)];
+            stat.text = stats[i];
+            stat.font = [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
+            stat.textColor = i == 0 ? primaryText : gray;
+            [postCard addSubview:stat];
+        }
+        return container;
+    }
 
     // Header row: accent avatar + subreddit/title.
-    UIView *avatar = [[UIView alloc] initWithFrame:CGRectMake(cardInset, 14, 34, 34)];
+    UIView *avatar = [[UIView alloc] initWithFrame:CGRectMake(inset, 16, 34, 34)];
     avatar.backgroundColor = accent;
     avatar.layer.cornerRadius = 17;
     [postCard addSubview:avatar];
 
-    UILabel *sub = [[UILabel alloc] initWithFrame:CGRectMake(cardInset + 44, 14, cardW - cardInset * 2 - 44, 18)];
+    UILabel *sub = [[UILabel alloc] initWithFrame:CGRectMake(inset + 44, 15, cardW - inset * 2 - 44, 18)];
     sub.text = @"r/apolloapp";
     sub.font = [UIFont systemFontOfSize:15 weight:UIFontWeightBold];
     sub.textColor = accent;
     [postCard addSubview:sub];
 
-    UILabel *meta = [[UILabel alloc] initWithFrame:CGRectMake(cardInset + 44, 32, cardW - cardInset * 2 - 44, 16)];
+    UILabel *meta = [[UILabel alloc] initWithFrame:CGRectMake(inset + 44, 34, cardW - inset * 2 - 44, 16)];
     meta.text = @"u/christianselig · 2h";
     meta.font = [UIFont systemFontOfSize:13];
     meta.textColor = gray;
     [postCard addSubview:meta];
 
-    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(cardInset, 58, cardW - cardInset * 2, 38)];
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(inset, 68, cardW - inset * 2, 24)];
     title.text = @"Your custom theme, live as you build it";
-    title.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    title.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
     title.textColor = primaryText;
-    title.numberOfLines = 2;
+    title.numberOfLines = 1;
+    title.adjustsFontSizeToFitWidth = YES;
+    title.minimumScaleFactor = 0.82;
     [postCard addSubview:title];
 
-    UIView *line = [[UIView alloc] initWithFrame:CGRectMake(cardInset, 104, cardW - cardInset * 2, 1)];
+    UIView *line = [[UIView alloc] initWithFrame:CGRectMake(inset, 104, cardW - inset * 2, 1)];
     line.backgroundColor = separator;
     [postCard addSubview:line];
 
     // Footer: accent vote pill + tertiary comment chip.
-    UILabel *vote = [[UILabel alloc] initWithFrame:CGRectMake(cardInset, 116, 92, 26)];
+    UILabel *vote = [[UILabel alloc] initWithFrame:CGRectMake(inset, 120, 92, 26)];
     vote.text = @"▲ 1.2k";
     vote.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
     vote.textColor = UIColor.whiteColor;
@@ -165,7 +253,7 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
     vote.clipsToBounds = YES;
     [postCard addSubview:vote];
 
-    UILabel *comments = [[UILabel alloc] initWithFrame:CGRectMake(cardInset + 100, 116, 96, 26)];
+    UILabel *comments = [[UILabel alloc] initWithFrame:CGRectMake(inset + 104, 120, 92, 26)];
     comments.text = @"💬 42";
     comments.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
     comments.textColor = primaryText;
@@ -275,14 +363,122 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
 
 #pragma mark - Table
 
+- (NSInteger)displayedSectionForLogicalSection:(NSInteger)logical {
+    if (self.colorEditorMode) {
+        switch (logical) {
+            case SectionPreview: return 0;
+            case SectionLightColors: return 1;
+            case SectionDarkColors: return 2;
+            case SectionReset: return 3;
+            default: return NSNotFound;
+        }
+    }
+    switch (logical) {
+        case SectionEnable: return 0;
+        case SectionThemes: return 1;
+        case SectionPreview: return 2;
+        default: return NSNotFound;
+    }
+}
+
+- (NSInteger)logicalSectionForDisplayedSection:(NSInteger)section {
+    if (self.colorEditorMode) {
+        switch (section) {
+            case 0: return SectionPreview;
+            case 1: return SectionLightColors;
+            case 2: return SectionDarkColors;
+            case 3: return SectionReset;
+            default: return NSNotFound;
+        }
+    }
+    switch (section) {
+        case 0: return SectionEnable;
+        case 1: return SectionThemes;
+        case 2: return SectionPreview;
+        default: return NSNotFound;
+    }
+}
+
+- (NSArray<NSString *> *)rolesForPaletteSection:(NSInteger)section {
+    switch (section) {
+        case SectionLightColors:
+        case SectionDarkColors:
+            return ApolloThemeBuilderRoleKeys();
+        default:
+            return @[];
+    }
+}
+
+- (BOOL)isPaletteSection:(NSInteger)section {
+    return section == SectionLightColors || section == SectionDarkColors;
+}
+
+- (NSString *)roleForIndexPath:(NSIndexPath *)indexPath {
+    NSArray<NSString *> *roles = [self rolesForPaletteSection:indexPath.section];
+    return (indexPath.row >= 0 && indexPath.row < roles.count) ? roles[indexPath.row] : nil;
+}
+
+- (UIMenu *)menuForTheme:(NSDictionary *)theme {
+    NSString *themeID = theme[@"id"];
+    BOOL active = [themeID isEqualToString:ApolloThemeBuilderActiveCustomTheme()[@"id"]];
+    BOOL canDelete = ApolloThemeBuilderCustomThemes().count > 1;
+    __weak typeof(self) weakSelf = self;
+    UIAction *edit = [UIAction actionWithTitle:@"Edit Colors" image:[UIImage systemImageNamed:@"paintpalette"]
+                                    identifier:nil handler:^(__kindof UIAction *action) {
+        [weakSelf pushColorEditorForThemeID:themeID];
+    }];
+    UIAction *use = [UIAction actionWithTitle:@"Use Theme" image:[UIImage systemImageNamed:@"checkmark.circle"]
+                                   identifier:nil handler:^(__kindof UIAction *action) {
+        ApolloThemeBuilderSetActiveCustomThemeID(themeID);
+        [weakSelf.tableView reloadData];
+        [weakSelf refreshPreview];
+        ApolloThemeBuilderForceRepaint();
+    }];
+    use.attributes = active ? UIMenuElementAttributesDisabled : 0;
+
+    UIAction *template = [UIAction actionWithTitle:@"Start From Template" image:[UIImage systemImageNamed:@"square.on.square"]
+                                       identifier:nil handler:^(__kindof UIAction *action) {
+        ApolloThemeBuilderSetActiveCustomThemeID(themeID);
+        [weakSelf presentPresetPickerForActiveTheme];
+    }];
+    UIAction *duplicate = [UIAction actionWithTitle:@"Duplicate" image:[UIImage systemImageNamed:@"plus.square.on.square"]
+                                        identifier:nil handler:^(__kindof UIAction *action) {
+        ApolloThemeBuilderSetActiveCustomThemeID(themeID);
+        ApolloThemeBuilderDuplicateActiveCustomTheme();
+        [weakSelf.tableView reloadData];
+        [weakSelf refreshPreview];
+        ApolloThemeBuilderForceRepaint();
+    }];
+    UIAction *rename = [UIAction actionWithTitle:@"Rename" image:[UIImage systemImageNamed:@"pencil"]
+                                      identifier:nil handler:^(__kindof UIAction *action) {
+        ApolloThemeBuilderSetActiveCustomThemeID(themeID);
+        [weakSelf presentRenameThemeDialog];
+    }];
+    UIAction *delete = [UIAction actionWithTitle:@"Delete" image:[UIImage systemImageNamed:@"trash"]
+                                      identifier:nil handler:^(__kindof UIAction *action) {
+        ApolloThemeBuilderSetActiveCustomThemeID(themeID);
+        [weakSelf confirmDeleteTheme];
+    }];
+    delete.attributes = canDelete ? UIMenuElementAttributesDestructive : UIMenuElementAttributesDisabled;
+    return [UIMenu menuWithTitle:@"" children:@[edit, use, template, duplicate, rename, delete]];
+}
+
+- (void)pushColorEditorForThemeID:(NSString *)themeID {
+    ApolloThemeBuilderSetActiveCustomThemeID(themeID);
+    ApolloThemeBuilderViewController *vc = [[ApolloThemeBuilderViewController alloc] initColorEditor];
+    [self.navigationController pushViewController:vc animated:YES];
+}
+
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
-    return ThemeBuilderSectionCount;
+    return self.colorEditorMode ? 4 : 3;
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    section = [self logicalSectionForDisplayedSection:section];
     switch (section) {
         case SectionEnable: return 1;
-        case SectionPreset: return 1;
+        case SectionThemes: return (NSInteger)ApolloThemeBuilderCustomThemes().count + 1;
+        case SectionPreview: return 1;
         case SectionLightColors:
         case SectionDarkColors: return (NSInteger)ApolloThemeBuilderRoleKeys().count;
         case SectionReset: return 1;
@@ -291,8 +487,10 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
+    section = [self logicalSectionForDisplayedSection:section];
     switch (section) {
-        case SectionPreset: return @"Start From";
+        case SectionThemes: return @"My Themes";
+        case SectionPreview: return @"Preview";
         case SectionLightColors: return @"Light Mode Colors";
         case SectionDarkColors: return @"Dark Mode Colors";
         default: return nil;
@@ -300,18 +498,27 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
+    section = [self logicalSectionForDisplayedSection:section];
     switch (section) {
+        case SectionThemes:
+            return @"Tap a theme to edit its colors. Use the menu for templates, duplicate, rename and delete.";
         case SectionEnable:
-            return @"Paints Apollo with your own colors. Your theme lives in the Outrun "
-                   @"slot of Apollo's theme picker — picking a different theme there switches "
-                   @"this off, re-selecting Outrun (or this switch) brings it back.";
-        case SectionPreset:
-            return @"Seed every color from one of Apollo's built-in themes, then adjust to taste.";
-        case SectionLightColors: return [self contrastWarningForMode:@"light"];
-        case SectionDarkColors:  return [self contrastWarningForMode:@"dark"];
+            return @"Applies the active custom theme through the Custom entry in Appearance → Themes.";
+        case SectionPreview:
+            return nil;
+        case SectionLightColors:
+            return [self contrastWarningForMode:@"light"] ?: [self contrastWarningForMode:@"dark"];
         case SectionReset: return nil;
         default: return nil;
     }
+}
+
+- (CGFloat)tableView:(UITableView *)tableView heightForHeaderInSection:(NSInteger)section {
+    return UITableViewAutomaticDimension;
+}
+
+- (CGFloat)tableView:(UITableView *)tableView heightForFooterInSection:(NSInteger)section {
+    return UITableViewAutomaticDimension;
 }
 
 // Text is auto-contrasted by the engine, but the accent can't be — icons, links
@@ -333,7 +540,9 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    if (indexPath.section == SectionEnable) {
+    NSInteger logicalSection = [self logicalSectionForDisplayedSection:indexPath.section];
+    NSIndexPath *logicalIndexPath = [NSIndexPath indexPathForRow:indexPath.row inSection:logicalSection];
+    if (logicalSection == SectionEnable) {
         UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
         cell.textLabel.text = @"Use Custom Theme";
         cell.selectionStyle = UITableViewCellSelectionStyleNone;
@@ -343,21 +552,62 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
         cell.accessoryView = toggle;
         return cell;
     }
-    if (indexPath.section == SectionPreset) {
-        UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
-        cell.textLabel.text = @"Apollo Theme…";
-        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+
+    if (logicalSection == SectionThemes) {
+        NSArray<NSDictionary *> *themes = ApolloThemeBuilderCustomThemes();
+        if (indexPath.row == themes.count) {
+            UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+            UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+            button.frame = cell.contentView.bounds;
+            button.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+            button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
+            button.tintColor = UIColor.systemBlueColor;
+            [button setImage:[UIImage systemImageNamed:@"plus.circle.fill"] forState:UIControlStateNormal];
+            [button setTitle:@" New Theme" forState:UIControlStateNormal];
+            button.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
+            [button addTarget:self action:@selector(presentNewThemeDialog) forControlEvents:UIControlEventTouchUpInside];
+            [cell.contentView addSubview:button];
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+            return cell;
+        }
+        NSDictionary *theme = themes[indexPath.row];
+        NSString *themeID = theme[@"id"];
+        BOOL active = [themeID isEqualToString:ApolloThemeBuilderActiveCustomTheme()[@"id"]];
+        UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
+        cell.textLabel.text = [theme[@"name"] length] ? theme[@"name"] : @"Custom";
+        cell.detailTextLabel.text = active ? @"Active" : @"Tap to use";
+        cell.detailTextLabel.textColor = active ? UIColor.systemBlueColor : UIColor.secondaryLabelColor;
+        cell.accessoryType = active ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
+        UIButton *more = [UIButton buttonWithType:UIButtonTypeSystem];
+        more.frame = CGRectMake(0, 0, 34, 34);
+        [more setImage:[UIImage systemImageNamed:@"ellipsis.circle"] forState:UIControlStateNormal];
+        more.menu = [self menuForTheme:theme];
+        more.showsMenuAsPrimaryAction = YES;
+        cell.accessoryView = more;
         return cell;
     }
-    if (indexPath.section == SectionReset) {
+
+    if (logicalSection == SectionPreview) {
         UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
-        cell.textLabel.text = @"Reset All Colors";
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        CGFloat width = tableView.bounds.size.width - 40.0;
+        if (width < 240.0) width = tableView.bounds.size.width;
+        UIView *preview = [self makePreviewViewWithWidth:width];
+        preview.frame = CGRectMake(0, 0, width, preview.bounds.size.height);
+        [cell.contentView addSubview:preview];
+        cell.contentView.clipsToBounds = YES;
+        return cell;
+    }
+
+    if (logicalSection == SectionReset) {
+        UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        cell.textLabel.text = @"Reset Active Theme Colors";
         cell.textLabel.textColor = [UIColor systemRedColor];
         return cell;
     }
 
-    NSString *mode = (indexPath.section == SectionLightColors) ? @"light" : @"dark";
-    NSString *role = ApolloThemeBuilderRoleKeys()[indexPath.row];
+    NSString *mode = (logicalSection == SectionLightColors) ? @"light" : @"dark";
+    NSString *role = ApolloThemeBuilderRoleKeys()[logicalIndexPath.row];
     NSString *hex = ApolloThemeBuilderSavedHex(role, mode);
 
     UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
@@ -369,25 +619,45 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
     swatch.backgroundColor = ApolloThemeBuilderColorFromHex(hex);
     swatch.layer.cornerRadius = 7;
     swatch.layer.borderWidth = 1;
-    swatch.layer.borderColor = [UIColor separatorColor].CGColor;
+    swatch.layer.borderColor = UIColor.separatorColor.CGColor;
     cell.accessoryView = swatch;
     return cell;
 }
 
+- (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
+    if ([self logicalSectionForDisplayedSection:indexPath.section] == SectionPreview) return 320.0;
+    return UITableViewAutomaticDimension;
+}
+
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
-    if (indexPath.section == SectionPreset) {
-        [self presentPresetPicker];
+    NSInteger logicalSection = [self logicalSectionForDisplayedSection:indexPath.section];
+    NSIndexPath *logicalIndexPath = [NSIndexPath indexPathForRow:indexPath.row inSection:logicalSection];
+    if (logicalSection == SectionThemes) {
+        NSArray<NSDictionary *> *themes = ApolloThemeBuilderCustomThemes();
+        if (indexPath.row == themes.count) {
+            [self presentNewThemeDialog];
+        } else if (indexPath.row < themes.count) {
+            [self pushColorEditorForThemeID:themes[indexPath.row][@"id"]];
+        }
         return;
     }
-    if (indexPath.section == SectionReset) {
+    if (logicalSection == SectionReset) {
         [self confirmReset];
         return;
     }
-    if (indexPath.section != SectionLightColors && indexPath.section != SectionDarkColors) return;
+    if (![self isPaletteSection:logicalSection]) return;
 
-    self.editingMode = (indexPath.section == SectionLightColors) ? @"light" : @"dark";
-    self.editingRole = ApolloThemeBuilderRoleKeys()[indexPath.row];
+    NSString *mode = (logicalSection == SectionLightColors) ? @"light" : @"dark";
+    NSString *role = ApolloThemeBuilderRoleKeys()[logicalIndexPath.row];
+    [self presentColorPickerForRole:role mode:mode];
+}
+
+#pragma mark - Actions
+
+- (void)presentColorPickerForRole:(NSString *)role mode:(NSString *)mode {
+    self.editingRole = role;
+    self.editingMode = mode;
 
     UIColorPickerViewController *picker = [[UIColorPickerViewController alloc] init];
     picker.supportsAlpha = NO;
@@ -400,7 +670,66 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
     [self presentViewController:picker animated:YES completion:nil];
 }
 
-#pragma mark - Actions
+- (void)presentNewThemeDialog {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"New Theme"
+                                                                   message:@"Name it, then choose a starting palette."
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *field) {
+        field.placeholder = @"Theme Name";
+        field.text = @"Custom";
+        field.clearButtonMode = UITextFieldViewModeWhileEditing;
+    }];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Choose Template" style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *action) {
+        NSString *name = alert.textFields.firstObject.text;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self presentPresetPickerForNewThemeName:name];
+        });
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Blank" style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *action) {
+        ApolloThemeBuilderCreateCustomTheme(alert.textFields.firstObject.text, @{});
+        [self.tableView reloadData];
+        [self refreshPreview];
+        ApolloThemeBuilderForceRepaint();
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)presentRenameThemeDialog {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Rename Theme"
+                                                                   message:nil
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *field) {
+        field.placeholder = @"Theme Name";
+        field.text = ApolloThemeBuilderActiveCustomThemeName();
+        field.clearButtonMode = UITextFieldViewModeWhileEditing;
+    }];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Rename" style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *action) {
+        ApolloThemeBuilderRenameActiveCustomTheme(alert.textFields.firstObject.text);
+        [self.tableView reloadData];
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)confirmDeleteTheme {
+    NSString *name = ApolloThemeBuilderActiveCustomThemeName();
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Delete Theme?"
+                                                                   message:[NSString stringWithFormat:@"Delete \"%@\" and switch to another saved custom theme.", name]
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Delete" style:UIAlertActionStyleDestructive
+                                            handler:^(UIAlertAction *action) {
+        ApolloThemeBuilderDeleteActiveCustomTheme();
+        [self.tableView reloadData];
+        [self refreshPreview];
+        ApolloThemeBuilderForceRepaint();
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
 
 - (void)enableToggled:(UISwitch *)toggle {
     ApolloThemeBuilderSetEnabled(toggle.on);
@@ -412,22 +741,51 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
     [self refreshPreview];
 }
 
-- (void)presentPresetPicker {
-    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Start From Theme"
-                                                                   message:@"Replaces all custom colors with this theme's palette."
+- (void)applyPreset:(ThemeBuilderPreset *)preset {
+    for (NSString *key in preset.colors) {
+        NSArray *parts = [key componentsSeparatedByString:@"."];
+        ApolloThemeBuilderSaveHex(parts[0], parts[1], preset.colors[key]);
+    }
+    [self.tableView reloadData];
+    [self refreshPreview];
+    ApolloThemeBuilderForceRepaint();
+}
+
+- (void)presentPresetPickerForActiveTheme {
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Start From Template"
+                                                                   message:@"Replaces the active theme's colors with this palette."
                                                             preferredStyle:UIAlertControllerStyleActionSheet];
     for (ThemeBuilderPreset *preset in [[self class] presets]) {
         [sheet addAction:[UIAlertAction actionWithTitle:preset.name style:UIAlertActionStyleDefault
                                                 handler:^(UIAlertAction *action) {
-            for (NSString *key in preset.colors) {
-                NSArray *parts = [key componentsSeparatedByString:@"."];
-                ApolloThemeBuilderSaveHex(parts[0], parts[1], preset.colors[key]);
-            }
+            [self applyPreset:preset];
+        }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    sheet.popoverPresentationController.sourceView = self.tableView;
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+- (void)presentPresetPickerForNewThemeName:(NSString *)name {
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Start From Template"
+                                                                   message:@"Choose the first palette for this new theme."
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+    for (ThemeBuilderPreset *preset in [[self class] presets]) {
+        [sheet addAction:[UIAlertAction actionWithTitle:preset.name style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *action) {
+            ApolloThemeBuilderCreateCustomTheme(name, preset.colors);
             [self.tableView reloadData];
             [self refreshPreview];
             ApolloThemeBuilderForceRepaint();
         }]];
     }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Blank" style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *action) {
+        ApolloThemeBuilderCreateCustomTheme(name, @{});
+        [self.tableView reloadData];
+        [self refreshPreview];
+        ApolloThemeBuilderForceRepaint();
+    }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     sheet.popoverPresentationController.sourceView = self.tableView;
     [self presentViewController:sheet animated:YES completion:nil];
@@ -439,8 +797,7 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
                                                             preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"Reset" style:UIAlertActionStyleDestructive
                                             handler:^(UIAlertAction *action) {
-        [[NSUserDefaults standardUserDefaults] removeObjectForKey:kApolloCustomThemeColorsKey];
-        ApolloThemeBuilderReloadOverrides();
+        ApolloThemeBuilderResetActiveCustomThemeColors();
         [self.tableView reloadData];
         [self refreshPreview];
         ApolloThemeBuilderForceRepaint();

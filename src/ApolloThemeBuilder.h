@@ -16,6 +16,8 @@ __BEGIN_DECLS
 // along with Backup/Restore Settings for free).
 extern NSString * const kApolloCustomThemeEnabledKey;   // BOOL
 extern NSString * const kApolloCustomThemeColorsKey;    // {roleKey: "RRGGBB"}
+extern NSString * const kApolloCustomThemesKey;         // [{id,name,colors}]
+extern NSString * const kApolloActiveCustomThemeIDKey;  // NSString
 
 // Role keys. Each role has a light and a dark variant ("<role>.light" /
 // "<role>.dark" in the colors dict).
@@ -38,6 +40,16 @@ NSString *ApolloThemeBuilderDonorHex(NSString *roleKey, NSString *mode);
 // Currently saved hex for role+mode (falls back to donor default).
 NSString *ApolloThemeBuilderSavedHex(NSString *roleKey, NSString *mode);
 void ApolloThemeBuilderSaveHex(NSString *roleKey, NSString *mode, NSString *hex);
+
+NSArray<NSDictionary *> *ApolloThemeBuilderCustomThemes(void);
+NSDictionary *ApolloThemeBuilderActiveCustomTheme(void);
+NSString *ApolloThemeBuilderActiveCustomThemeName(void);
+NSString *ApolloThemeBuilderCreateCustomTheme(NSString *name, NSDictionary<NSString *, NSString *> *colors);
+NSString *ApolloThemeBuilderDuplicateActiveCustomTheme(void);
+void ApolloThemeBuilderSetActiveCustomThemeID(NSString *themeID);
+void ApolloThemeBuilderRenameActiveCustomTheme(NSString *name);
+BOOL ApolloThemeBuilderDeleteActiveCustomTheme(void);
+void ApolloThemeBuilderResetActiveCustomThemeColors(void);
 
 BOOL ApolloThemeBuilderIsEnabled(void);
 void ApolloThemeBuilderSetEnabled(BOOL enabled);

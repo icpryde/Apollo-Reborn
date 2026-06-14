@@ -30,9 +30,12 @@
 #import <os/lock.h>
 #import "ApolloCommon.h"
 #import "ApolloThemeBuilder.h"
+#import "ApolloThemeBuilderViewController.h"
 
 NSString * const kApolloCustomThemeEnabledKey = @"ApolloRebornCustomThemeEnabled";
 NSString * const kApolloCustomThemeColorsKey  = @"ApolloRebornCustomThemeColors";
+NSString * const kApolloCustomThemesKey = @"ApolloRebornCustomThemes";
+NSString * const kApolloActiveCustomThemeIDKey = @"ApolloRebornActiveCustomThemeID";
 
 NSString * const kApolloThemeRoleAccent      = @"accent";
 NSString * const kApolloThemeRolePrimaryBG   = @"primaryBG";
@@ -188,16 +191,192 @@ NSString *ApolloThemeBuilderHexFromColor(UIColor *color) {
 }
 
 NSString *ApolloThemeBuilderSavedHex(NSString *roleKey, NSString *mode) {
-    NSDictionary *colors = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kApolloCustomThemeColorsKey];
+    NSDictionary *colors = ApolloThemeBuilderActiveCustomTheme()[@"colors"];
     NSString *saved = colors[[NSString stringWithFormat:@"%@.%@", roleKey, mode]];
     return saved ?: ApolloThemeBuilderDonorHex(roleKey, mode);
 }
 
 void ApolloThemeBuilderSaveHex(NSString *roleKey, NSString *mode, NSString *hex) {
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    NSMutableDictionary *colors = [([ud dictionaryForKey:kApolloCustomThemeColorsKey] ?: @{}) mutableCopy];
+    NSDictionary *active = ApolloThemeBuilderActiveCustomTheme();
+    NSString *activeID = active[@"id"];
+    NSMutableDictionary *colors = [([active[@"colors"] isKindOfClass:[NSDictionary class]] ? active[@"colors"] : @{}) mutableCopy];
     colors[[NSString stringWithFormat:@"%@.%@", roleKey, mode]] = hex;
-    [ud setObject:colors forKey:kApolloCustomThemeColorsKey];
+    NSMutableArray *themes = [[ud arrayForKey:kApolloCustomThemesKey] mutableCopy] ?: [NSMutableArray array];
+    for (NSUInteger i = 0; i < themes.count; i++) {
+        NSDictionary *theme = themes[i];
+        if ([theme[@"id"] isEqualToString:activeID]) {
+            NSMutableDictionary *updated = [theme mutableCopy];
+            updated[@"colors"] = colors;
+            updated[@"updatedAt"] = @([[NSDate date] timeIntervalSince1970]);
+            themes[i] = updated;
+            break;
+        }
+    }
+    [ud setObject:themes forKey:kApolloCustomThemesKey];
+    [ud setObject:colors forKey:kApolloCustomThemeColorsKey]; // legacy/backup compatibility
+    ApolloThemeBuilderReloadOverrides();
+}
+
+static NSString *ThemeBuilderUniqueName(NSArray<NSDictionary *> *themes, NSString *base) {
+    NSMutableSet *names = [NSMutableSet set];
+    for (NSDictionary *theme in themes) {
+        NSString *name = theme[@"name"];
+        if (name.length) [names addObject:name];
+    }
+    if (![names containsObject:base]) return base;
+    for (NSInteger i = 2; i < 1000; i++) {
+        NSString *candidate = [NSString stringWithFormat:@"%@ %ld", base, (long)i];
+        if (![names containsObject:candidate]) return candidate;
+    }
+    return [base stringByAppendingFormat:@" %@", NSUUID.UUID.UUIDString];
+}
+
+static NSDictionary *ThemeBuilderMakeTheme(NSString *name, NSDictionary *colors) {
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    return @{
+        @"id": NSUUID.UUID.UUIDString,
+        @"name": name.length ? name : @"Custom",
+        @"colors": colors ?: @{},
+        @"createdAt": @(now),
+        @"updatedAt": @(now),
+    };
+}
+
+static void ApolloThemeBuilderEnsureThemesMigrated(void) {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    NSArray *existing = [ud arrayForKey:kApolloCustomThemesKey];
+    if (existing.count > 0 && [ud stringForKey:kApolloActiveCustomThemeIDKey].length > 0) return;
+    if (existing.count > 0) {
+        NSDictionary *first = existing.firstObject;
+        if ([first[@"id"] length]) {
+            [ud setObject:first[@"id"] forKey:kApolloActiveCustomThemeIDKey];
+            [ud setObject:first[@"colors"] ?: @{} forKey:kApolloCustomThemeColorsKey];
+            return;
+        }
+    }
+
+    NSDictionary *legacyColors = [ud dictionaryForKey:kApolloCustomThemeColorsKey] ?: @{};
+    NSDictionary *theme = ThemeBuilderMakeTheme(@"Custom", legacyColors);
+    [ud setObject:@[theme] forKey:kApolloCustomThemesKey];
+    [ud setObject:theme[@"id"] forKey:kApolloActiveCustomThemeIDKey];
+    [ud setObject:legacyColors forKey:kApolloCustomThemeColorsKey];
+}
+
+NSArray<NSDictionary *> *ApolloThemeBuilderCustomThemes(void) {
+    ApolloThemeBuilderEnsureThemesMigrated();
+    return [[NSUserDefaults standardUserDefaults] arrayForKey:kApolloCustomThemesKey] ?: @[];
+}
+
+NSDictionary *ApolloThemeBuilderActiveCustomTheme(void) {
+    ApolloThemeBuilderEnsureThemesMigrated();
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    NSArray<NSDictionary *> *themes = [ud arrayForKey:kApolloCustomThemesKey] ?: @[];
+    NSString *activeID = [ud stringForKey:kApolloActiveCustomThemeIDKey];
+    for (NSDictionary *theme in themes) {
+        if ([theme[@"id"] isEqualToString:activeID]) return theme;
+    }
+    NSDictionary *first = themes.firstObject;
+    if (first[@"id"]) [ud setObject:first[@"id"] forKey:kApolloActiveCustomThemeIDKey];
+    return first ?: @{};
+}
+
+NSString *ApolloThemeBuilderActiveCustomThemeName(void) {
+    NSString *name = ApolloThemeBuilderActiveCustomTheme()[@"name"];
+    return name.length ? name : @"Custom";
+}
+
+NSString *ApolloThemeBuilderCreateCustomTheme(NSString *name, NSDictionary<NSString *, NSString *> *colors) {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    NSMutableArray *themes = [ApolloThemeBuilderCustomThemes() mutableCopy];
+    NSString *unique = ThemeBuilderUniqueName(themes, name.length ? name : @"Custom");
+    NSDictionary *theme = ThemeBuilderMakeTheme(unique, colors ?: @{});
+    [themes addObject:theme];
+    [ud setObject:themes forKey:kApolloCustomThemesKey];
+    [ud setObject:theme[@"id"] forKey:kApolloActiveCustomThemeIDKey];
+    [ud setObject:theme[@"colors"] forKey:kApolloCustomThemeColorsKey];
+    ApolloThemeBuilderReloadOverrides();
+    return theme[@"id"];
+}
+
+NSString *ApolloThemeBuilderDuplicateActiveCustomTheme(void) {
+    NSDictionary *active = ApolloThemeBuilderActiveCustomTheme();
+    NSString *name = [NSString stringWithFormat:@"%@ Copy", ApolloThemeBuilderActiveCustomThemeName()];
+    return ApolloThemeBuilderCreateCustomTheme(name, active[@"colors"] ?: @{});
+}
+
+void ApolloThemeBuilderSetActiveCustomThemeID(NSString *themeID) {
+    if (!themeID.length) return;
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    for (NSDictionary *theme in ApolloThemeBuilderCustomThemes()) {
+        if ([theme[@"id"] isEqualToString:themeID]) {
+            [ud setObject:themeID forKey:kApolloActiveCustomThemeIDKey];
+            [ud setObject:theme[@"colors"] ?: @{} forKey:kApolloCustomThemeColorsKey];
+            ApolloThemeBuilderReloadOverrides();
+            return;
+        }
+    }
+}
+
+void ApolloThemeBuilderRenameActiveCustomTheme(NSString *name) {
+    NSString *trimmed = [name stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (!trimmed.length) return;
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    NSDictionary *active = ApolloThemeBuilderActiveCustomTheme();
+    NSString *activeID = active[@"id"];
+    NSMutableArray *themes = [ApolloThemeBuilderCustomThemes() mutableCopy];
+    for (NSUInteger i = 0; i < themes.count; i++) {
+        NSDictionary *theme = themes[i];
+        if ([theme[@"id"] isEqualToString:activeID]) {
+            NSMutableDictionary *updated = [theme mutableCopy];
+            updated[@"name"] = trimmed;
+            updated[@"updatedAt"] = @([[NSDate date] timeIntervalSince1970]);
+            themes[i] = updated;
+            break;
+        }
+    }
+    [ud setObject:themes forKey:kApolloCustomThemesKey];
+}
+
+BOOL ApolloThemeBuilderDeleteActiveCustomTheme(void) {
+    NSMutableArray *themes = [ApolloThemeBuilderCustomThemes() mutableCopy];
+    if (themes.count <= 1) return NO;
+    NSString *activeID = ApolloThemeBuilderActiveCustomTheme()[@"id"];
+    NSUInteger removeIndex = NSNotFound;
+    for (NSUInteger i = 0; i < themes.count; i++) {
+        if ([themes[i][@"id"] isEqualToString:activeID]) {
+            removeIndex = i;
+            break;
+        }
+    }
+    if (removeIndex == NSNotFound) return NO;
+    [themes removeObjectAtIndex:removeIndex];
+    NSDictionary *next = themes[MIN(removeIndex, themes.count - 1)];
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    [ud setObject:themes forKey:kApolloCustomThemesKey];
+    [ud setObject:next[@"id"] forKey:kApolloActiveCustomThemeIDKey];
+    [ud setObject:next[@"colors"] ?: @{} forKey:kApolloCustomThemeColorsKey];
+    ApolloThemeBuilderReloadOverrides();
+    return YES;
+}
+
+void ApolloThemeBuilderResetActiveCustomThemeColors(void) {
+    NSDictionary *active = ApolloThemeBuilderActiveCustomTheme();
+    NSString *activeID = active[@"id"];
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    NSMutableArray *themes = [ApolloThemeBuilderCustomThemes() mutableCopy];
+    for (NSUInteger i = 0; i < themes.count; i++) {
+        NSDictionary *theme = themes[i];
+        if ([theme[@"id"] isEqualToString:activeID]) {
+            NSMutableDictionary *updated = [theme mutableCopy];
+            updated[@"colors"] = @{};
+            updated[@"updatedAt"] = @([[NSDate date] timeIntervalSince1970]);
+            themes[i] = updated;
+            break;
+        }
+    }
+    [ud setObject:themes forKey:kApolloCustomThemesKey];
+    [ud setObject:@{} forKey:kApolloCustomThemeColorsKey];
     ApolloThemeBuilderReloadOverrides();
 }
 
@@ -230,7 +409,7 @@ void ApolloThemeBuilderReloadOverrides(void) {
     BOOL enabled = [ud boolForKey:kApolloCustomThemeEnabledKey];
     NSString *activeTheme = [GroupDefaults() stringForKey:kAppColorThemeKey];
     BOOL donorActive = [activeTheme isEqualToString:kDonorThemeName];
-    NSDictionary *colors = [ud dictionaryForKey:kApolloCustomThemeColorsKey];
+    NSDictionary *colors = ApolloThemeBuilderActiveCustomTheme()[@"colors"];
 
 #if APOLLO_THEME_TESTENV
     // Dev-only deterministic palette override (bypasses cfprefsd). Pass via
@@ -660,6 +839,313 @@ void ApolloThemeBuilderActivateDonorLive(void) {
 
 %end
 
+// A small rounded swatch (background + accent split) previewing the user's
+// light-mode colors, shown next to the "Custom" row in Apollo's theme picker.
+static UIImage *ThemeBuilderPickerSwatch(void) {
+    CGFloat s = 29.0;
+    UIColor *bg = ApolloThemeBuilderColorFromHex(ApolloThemeBuilderSavedHex(@"primaryBG", @"light")) ?: UIColor.systemBackgroundColor;
+    UIColor *accent = ApolloThemeBuilderColorFromHex(ApolloThemeBuilderSavedHex(@"accent", @"light")) ?: UIColor.systemBlueColor;
+    UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(s, s)];
+    return [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+        [[UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, s, s) cornerRadius:7] addClip];
+        [bg setFill]; CGContextFillRect(ctx.CGContext, CGRectMake(0, 0, s, s));
+        UIBezierPath *tri = [UIBezierPath bezierPath];
+        [tri moveToPoint:CGPointMake(s, 0)]; [tri addLineToPoint:CGPointMake(s, s)];
+        [tri addLineToPoint:CGPointMake(0, s)]; [tri closePath];
+        [accent setFill]; [tri fill];
+    }];
+}
+
+// Inject a "Custom" theme at the top of Apollo's own theme picker (section 0,
+// the "APP THEME" list). All 18 stock themes stay intact and selectable —
+// selecting Custom enables the builder (donor + flag); selecting any stock
+// theme turns the builder off.
+%hook _TtC6Apollo27SettingsThemeViewController
+
+- (long long)tableView:(UITableView *)tv numberOfRowsInSection:(long long)section {
+    long long n = %orig;
+    if (section == 0) n += 1; // Custom
+    return n;
+}
+
+- (id)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
+    if (ip.section == 0 && ip.row == 0) {
+        // Borrow a stock theme cell so we inherit Apollo's themed styling, but
+        // clear its checkmark accessory view (the borrowed row may itself be
+        // the selected theme) so our accessory is the only one shown.
+        UITableViewCell *cell = %orig(tv, [NSIndexPath indexPathForRow:0 inSection:0]);
+        cell.accessoryView = nil;
+        cell.textLabel.text = @"Custom";
+        cell.detailTextLabel.text = @"Your own colors, built in Theme Builder.";
+        cell.imageView.image = ThemeBuilderPickerSwatch();
+        cell.accessoryType = ApolloThemeBuilderIsEnabled()
+            ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
+        cell.accessibilityLabel = @"Custom";
+        return cell;
+    }
+    if (ip.section == 0) {
+        UITableViewCell *cell = %orig(tv, [NSIndexPath indexPathForRow:ip.row - 1 inSection:0]);
+        // While Custom is active, Apollo would still mark the donor (Outrun)
+        // row as selected — clear both the standard accessory and Apollo's own
+        // checkmark accessory view so only Custom reads as selected.
+        if (ApolloThemeBuilderIsEnabled()) {
+            cell.accessoryType = UITableViewCellAccessoryNone;
+            cell.accessoryView = nil;
+        }
+        return cell;
+    }
+    return %orig;
+}
+
+- (double)tableView:(UITableView *)tv heightForRowAtIndexPath:(NSIndexPath *)ip {
+    if (ip.section == 0 && ip.row == 0)
+        return %orig(tv, [NSIndexPath indexPathForRow:0 inSection:0]);
+    if (ip.section == 0)
+        return %orig(tv, [NSIndexPath indexPathForRow:ip.row - 1 inSection:0]);
+    return %orig;
+}
+
+- (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
+    if (ip.section == 0 && ip.row == 0) {              // Custom selected
+        [tv deselectRowAtIndexPath:ip animated:YES];
+        ApolloThemeBuilderSetEnabled(YES);
+        ApolloThemeBuilderActivateDonorLive();
+        [tv reloadData];
+        return;
+    }
+    if (ip.section == 0) {                             // stock theme selected
+        if (ApolloThemeBuilderIsEnabled()) {
+            ApolloThemeBuilderSetEnabled(NO);
+            ApolloThemeBuilderForceRepaint();
+        }
+        %orig(tv, [NSIndexPath indexPathForRow:ip.row - 1 inSection:0]);
+        [tv reloadData];
+        return;
+    }
+    %orig;
+}
+
+%end
+
+static NSInteger (*sAppearanceRowsOrig)(id, SEL, UITableView *, NSInteger);
+static UITableViewCell *(*sAppearanceCellOrig)(id, SEL, UITableView *, NSIndexPath *);
+static CGFloat (*sAppearanceHeightOrig)(id, SEL, UITableView *, NSIndexPath *);
+static void (*sAppearanceSelectOrig)(id, SEL, UITableView *, NSIndexPath *);
+static CGFloat (*sAppearanceEstimatedHeightOrig)(id, SEL, UITableView *, NSIndexPath *);
+static void (*sAppearanceWillDisplayOrig)(id, SEL, UITableView *, UITableViewCell *, NSIndexPath *);
+static void (*sAppearanceDidEndDisplayingOrig)(id, SEL, UITableView *, UITableViewCell *, NSIndexPath *);
+static BOOL (*sAppearanceShouldHighlightOrig)(id, SEL, UITableView *, NSIndexPath *);
+static BOOL (*sAppearanceCanEditOrig)(id, SEL, UITableView *, NSIndexPath *);
+static BOOL (*sAppearanceCanMoveOrig)(id, SEL, UITableView *, NSIndexPath *);
+static NSIndexPath *(*sAppearanceWillSelectOrig)(id, SEL, UITableView *, NSIndexPath *);
+static void (*sAppearanceDidHighlightOrig)(id, SEL, UITableView *, NSIndexPath *);
+static void (*sAppearanceDidUnhighlightOrig)(id, SEL, UITableView *, NSIndexPath *);
+static NSInteger (*sAppearanceEditingStyleOrig)(id, SEL, UITableView *, NSIndexPath *);
+static NSInteger (*sAppearanceIndentationOrig)(id, SEL, UITableView *, NSIndexPath *);
+static UISwipeActionsConfiguration *(*sAppearanceLeadingSwipeOrig)(id, SEL, UITableView *, NSIndexPath *);
+static UISwipeActionsConfiguration *(*sAppearanceTrailingSwipeOrig)(id, SEL, UITableView *, NSIndexPath *);
+
+static NSIndexPath *ThemeBuilderAppearanceAdjustedIndexPath(NSIndexPath *ip) {
+    if (ip.section == 0 && ip.row > 1)
+        return [NSIndexPath indexPathForRow:ip.row - 1 inSection:ip.section];
+    return ip;
+}
+
+static BOOL ThemeBuilderAppearanceIsBuilderRow(NSIndexPath *ip) {
+    return ip.section == 0 && ip.row == 1;
+}
+
+static NSInteger ThemeBuilderAppearanceRows(id self, SEL _cmd, UITableView *tv, NSInteger section) {
+    NSInteger n = sAppearanceRowsOrig ? sAppearanceRowsOrig(self, _cmd, tv, section) : 0;
+    if (section == 0) n += 1; // Themes, Theme Builder
+    return n;
+}
+
+static UITableViewCell *ThemeBuilderAppearanceCell(id self, SEL _cmd, UITableView *tv, NSIndexPath *ip) {
+    if (ip.section == 0 && ip.row == 1) {
+        static NSString *reuse = @"ApolloRebornThemeBuilderAppearanceCell";
+        UITableViewCell *cell = [tv dequeueReusableCellWithIdentifier:reuse];
+        if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:reuse];
+        cell.textLabel.text = @"Theme Builder";
+        cell.detailTextLabel.text = nil;
+        cell.imageView.image = nil;
+        cell.accessoryView = nil;
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        cell.accessibilityLabel = @"Theme Builder";
+        return cell;
+    }
+    NSIndexPath *adjusted = ThemeBuilderAppearanceAdjustedIndexPath(ip);
+    return sAppearanceCellOrig ? sAppearanceCellOrig(self, _cmd, tv, adjusted) : [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+}
+
+static CGFloat ThemeBuilderAppearanceHeight(id self, SEL _cmd, UITableView *tv, NSIndexPath *ip) {
+    if (ThemeBuilderAppearanceIsBuilderRow(ip)) {
+        NSIndexPath *themes = [NSIndexPath indexPathForRow:0 inSection:0];
+        return sAppearanceHeightOrig ? sAppearanceHeightOrig(self, _cmd, tv, themes) : UITableViewAutomaticDimension;
+    }
+    NSIndexPath *adjusted = ThemeBuilderAppearanceAdjustedIndexPath(ip);
+    return sAppearanceHeightOrig ? sAppearanceHeightOrig(self, _cmd, tv, adjusted) : UITableViewAutomaticDimension;
+}
+
+static CGFloat ThemeBuilderAppearanceEstimatedHeight(id self, SEL _cmd, UITableView *tv, NSIndexPath *ip) {
+    if (ThemeBuilderAppearanceIsBuilderRow(ip)) {
+        NSIndexPath *themes = [NSIndexPath indexPathForRow:0 inSection:0];
+        return sAppearanceEstimatedHeightOrig ? sAppearanceEstimatedHeightOrig(self, _cmd, tv, themes) : 52.0;
+    }
+    NSIndexPath *adjusted = ThemeBuilderAppearanceAdjustedIndexPath(ip);
+    return sAppearanceEstimatedHeightOrig ? sAppearanceEstimatedHeightOrig(self, _cmd, tv, adjusted) : 52.0;
+}
+
+static void ThemeBuilderAppearanceSelect(id self, SEL _cmd, UITableView *tv, NSIndexPath *ip) {
+    if (ThemeBuilderAppearanceIsBuilderRow(ip)) {
+        [tv deselectRowAtIndexPath:ip animated:YES];
+        ApolloThemeBuilderViewController *vc = [[ApolloThemeBuilderViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+        [((UIViewController *)self).navigationController pushViewController:vc animated:YES];
+        return;
+    }
+    NSIndexPath *adjusted = ThemeBuilderAppearanceAdjustedIndexPath(ip);
+    if (sAppearanceSelectOrig) sAppearanceSelectOrig(self, _cmd, tv, adjusted);
+}
+
+static void ThemeBuilderAppearanceWillDisplay(id self, SEL _cmd, UITableView *tv, UITableViewCell *cell, NSIndexPath *ip) {
+    if (ThemeBuilderAppearanceIsBuilderRow(ip)) return;
+    NSIndexPath *adjusted = ThemeBuilderAppearanceAdjustedIndexPath(ip);
+    if (sAppearanceWillDisplayOrig) sAppearanceWillDisplayOrig(self, _cmd, tv, cell, adjusted);
+}
+
+static void ThemeBuilderAppearanceDidEndDisplaying(id self, SEL _cmd, UITableView *tv, UITableViewCell *cell, NSIndexPath *ip) {
+    if (ThemeBuilderAppearanceIsBuilderRow(ip)) return;
+    NSIndexPath *adjusted = ThemeBuilderAppearanceAdjustedIndexPath(ip);
+    if (sAppearanceDidEndDisplayingOrig) sAppearanceDidEndDisplayingOrig(self, _cmd, tv, cell, adjusted);
+}
+
+static BOOL ThemeBuilderAppearanceShouldHighlight(id self, SEL _cmd, UITableView *tv, NSIndexPath *ip) {
+    if (ThemeBuilderAppearanceIsBuilderRow(ip)) return YES;
+    NSIndexPath *adjusted = ThemeBuilderAppearanceAdjustedIndexPath(ip);
+    return sAppearanceShouldHighlightOrig ? sAppearanceShouldHighlightOrig(self, _cmd, tv, adjusted) : YES;
+}
+
+static NSIndexPath *ThemeBuilderAppearanceWillSelect(id self, SEL _cmd, UITableView *tv, NSIndexPath *ip) {
+    if (ThemeBuilderAppearanceIsBuilderRow(ip)) return ip;
+    NSIndexPath *adjusted = ThemeBuilderAppearanceAdjustedIndexPath(ip);
+    if (!sAppearanceWillSelectOrig) return ip;
+    NSIndexPath *result = sAppearanceWillSelectOrig(self, _cmd, tv, adjusted);
+    return result ? ip : nil;
+}
+
+static void ThemeBuilderAppearanceDidHighlight(id self, SEL _cmd, UITableView *tv, NSIndexPath *ip) {
+    if (ThemeBuilderAppearanceIsBuilderRow(ip)) return;
+    NSIndexPath *adjusted = ThemeBuilderAppearanceAdjustedIndexPath(ip);
+    if (sAppearanceDidHighlightOrig) sAppearanceDidHighlightOrig(self, _cmd, tv, adjusted);
+}
+
+static void ThemeBuilderAppearanceDidUnhighlight(id self, SEL _cmd, UITableView *tv, NSIndexPath *ip) {
+    if (ThemeBuilderAppearanceIsBuilderRow(ip)) return;
+    NSIndexPath *adjusted = ThemeBuilderAppearanceAdjustedIndexPath(ip);
+    if (sAppearanceDidUnhighlightOrig) sAppearanceDidUnhighlightOrig(self, _cmd, tv, adjusted);
+}
+
+static BOOL ThemeBuilderAppearanceCanEdit(id self, SEL _cmd, UITableView *tv, NSIndexPath *ip) {
+    if (ThemeBuilderAppearanceIsBuilderRow(ip)) return NO;
+    NSIndexPath *adjusted = ThemeBuilderAppearanceAdjustedIndexPath(ip);
+    return sAppearanceCanEditOrig ? sAppearanceCanEditOrig(self, _cmd, tv, adjusted) : NO;
+}
+
+static BOOL ThemeBuilderAppearanceCanMove(id self, SEL _cmd, UITableView *tv, NSIndexPath *ip) {
+    if (ThemeBuilderAppearanceIsBuilderRow(ip)) return NO;
+    NSIndexPath *adjusted = ThemeBuilderAppearanceAdjustedIndexPath(ip);
+    return sAppearanceCanMoveOrig ? sAppearanceCanMoveOrig(self, _cmd, tv, adjusted) : NO;
+}
+
+static NSInteger ThemeBuilderAppearanceEditingStyle(id self, SEL _cmd, UITableView *tv, NSIndexPath *ip) {
+    if (ThemeBuilderAppearanceIsBuilderRow(ip)) return UITableViewCellEditingStyleNone;
+    NSIndexPath *adjusted = ThemeBuilderAppearanceAdjustedIndexPath(ip);
+    return sAppearanceEditingStyleOrig ? sAppearanceEditingStyleOrig(self, _cmd, tv, adjusted) : UITableViewCellEditingStyleNone;
+}
+
+static NSInteger ThemeBuilderAppearanceIndentation(id self, SEL _cmd, UITableView *tv, NSIndexPath *ip) {
+    if (ThemeBuilderAppearanceIsBuilderRow(ip)) return 0;
+    NSIndexPath *adjusted = ThemeBuilderAppearanceAdjustedIndexPath(ip);
+    return sAppearanceIndentationOrig ? sAppearanceIndentationOrig(self, _cmd, tv, adjusted) : 0;
+}
+
+static UISwipeActionsConfiguration *ThemeBuilderAppearanceLeadingSwipe(id self, SEL _cmd, UITableView *tv, NSIndexPath *ip) {
+    if (ThemeBuilderAppearanceIsBuilderRow(ip)) return nil;
+    NSIndexPath *adjusted = ThemeBuilderAppearanceAdjustedIndexPath(ip);
+    return sAppearanceLeadingSwipeOrig ? sAppearanceLeadingSwipeOrig(self, _cmd, tv, adjusted) : nil;
+}
+
+static UISwipeActionsConfiguration *ThemeBuilderAppearanceTrailingSwipe(id self, SEL _cmd, UITableView *tv, NSIndexPath *ip) {
+    if (ThemeBuilderAppearanceIsBuilderRow(ip)) return nil;
+    NSIndexPath *adjusted = ThemeBuilderAppearanceAdjustedIndexPath(ip);
+    return sAppearanceTrailingSwipeOrig ? sAppearanceTrailingSwipeOrig(self, _cmd, tv, adjusted) : nil;
+}
+
+static void ThemeBuilderInstallAppearanceHooks(void) {
+    static BOOL installed = NO;
+    if (installed) return;
+    Class cls = objc_getClass("_TtC6Apollo32SettingsAppearanceViewController");
+    if (!cls) {
+        ApolloLog(@"ThemeBuilder: SettingsAppearanceViewController class missing");
+        return;
+    }
+
+    SEL rowsSel = @selector(tableView:numberOfRowsInSection:);
+    SEL cellSel = @selector(tableView:cellForRowAtIndexPath:);
+    SEL heightSel = @selector(tableView:heightForRowAtIndexPath:);
+    SEL selectSel = @selector(tableView:didSelectRowAtIndexPath:);
+    SEL estimatedHeightSel = @selector(tableView:estimatedHeightForRowAtIndexPath:);
+    SEL willDisplaySel = @selector(tableView:willDisplayCell:forRowAtIndexPath:);
+    SEL didEndDisplayingSel = @selector(tableView:didEndDisplayingCell:forRowAtIndexPath:);
+    SEL shouldHighlightSel = @selector(tableView:shouldHighlightRowAtIndexPath:);
+    SEL willSelectSel = @selector(tableView:willSelectRowAtIndexPath:);
+    SEL didHighlightSel = @selector(tableView:didHighlightRowAtIndexPath:);
+    SEL didUnhighlightSel = @selector(tableView:didUnhighlightRowAtIndexPath:);
+    SEL canEditSel = @selector(tableView:canEditRowAtIndexPath:);
+    SEL canMoveSel = @selector(tableView:canMoveRowAtIndexPath:);
+    SEL editingStyleSel = @selector(tableView:editingStyleForRowAtIndexPath:);
+    SEL indentationSel = @selector(tableView:indentationLevelForRowAtIndexPath:);
+    SEL leadingSwipeSel = @selector(tableView:leadingSwipeActionsConfigurationForRowAtIndexPath:);
+    SEL trailingSwipeSel = @selector(tableView:trailingSwipeActionsConfigurationForRowAtIndexPath:);
+    sAppearanceRowsOrig = class_getInstanceMethod(cls, rowsSel) ? (NSInteger (*)(id, SEL, UITableView *, NSInteger))class_getMethodImplementation(cls, rowsSel) : NULL;
+    sAppearanceCellOrig = class_getInstanceMethod(cls, cellSel) ? (UITableViewCell *(*)(id, SEL, UITableView *, NSIndexPath *))class_getMethodImplementation(cls, cellSel) : NULL;
+    sAppearanceHeightOrig = class_getInstanceMethod(cls, heightSel) ? (CGFloat (*)(id, SEL, UITableView *, NSIndexPath *))class_getMethodImplementation(cls, heightSel) : NULL;
+    sAppearanceSelectOrig = class_getInstanceMethod(cls, selectSel) ? (void (*)(id, SEL, UITableView *, NSIndexPath *))class_getMethodImplementation(cls, selectSel) : NULL;
+    sAppearanceEstimatedHeightOrig = class_getInstanceMethod(cls, estimatedHeightSel) ? (CGFloat (*)(id, SEL, UITableView *, NSIndexPath *))class_getMethodImplementation(cls, estimatedHeightSel) : NULL;
+    sAppearanceWillDisplayOrig = class_getInstanceMethod(cls, willDisplaySel) ? (void (*)(id, SEL, UITableView *, UITableViewCell *, NSIndexPath *))class_getMethodImplementation(cls, willDisplaySel) : NULL;
+    sAppearanceDidEndDisplayingOrig = class_getInstanceMethod(cls, didEndDisplayingSel) ? (void (*)(id, SEL, UITableView *, UITableViewCell *, NSIndexPath *))class_getMethodImplementation(cls, didEndDisplayingSel) : NULL;
+    sAppearanceShouldHighlightOrig = class_getInstanceMethod(cls, shouldHighlightSel) ? (BOOL (*)(id, SEL, UITableView *, NSIndexPath *))class_getMethodImplementation(cls, shouldHighlightSel) : NULL;
+    sAppearanceCanEditOrig = class_getInstanceMethod(cls, canEditSel) ? (BOOL (*)(id, SEL, UITableView *, NSIndexPath *))class_getMethodImplementation(cls, canEditSel) : NULL;
+    sAppearanceCanMoveOrig = class_getInstanceMethod(cls, canMoveSel) ? (BOOL (*)(id, SEL, UITableView *, NSIndexPath *))class_getMethodImplementation(cls, canMoveSel) : NULL;
+    sAppearanceWillSelectOrig = class_getInstanceMethod(cls, willSelectSel) ? (NSIndexPath *(*)(id, SEL, UITableView *, NSIndexPath *))class_getMethodImplementation(cls, willSelectSel) : NULL;
+    sAppearanceDidHighlightOrig = class_getInstanceMethod(cls, didHighlightSel) ? (void (*)(id, SEL, UITableView *, NSIndexPath *))class_getMethodImplementation(cls, didHighlightSel) : NULL;
+    sAppearanceDidUnhighlightOrig = class_getInstanceMethod(cls, didUnhighlightSel) ? (void (*)(id, SEL, UITableView *, NSIndexPath *))class_getMethodImplementation(cls, didUnhighlightSel) : NULL;
+    sAppearanceEditingStyleOrig = class_getInstanceMethod(cls, editingStyleSel) ? (NSInteger (*)(id, SEL, UITableView *, NSIndexPath *))class_getMethodImplementation(cls, editingStyleSel) : NULL;
+    sAppearanceIndentationOrig = class_getInstanceMethod(cls, indentationSel) ? (NSInteger (*)(id, SEL, UITableView *, NSIndexPath *))class_getMethodImplementation(cls, indentationSel) : NULL;
+    sAppearanceLeadingSwipeOrig = class_getInstanceMethod(cls, leadingSwipeSel) ? (UISwipeActionsConfiguration *(*)(id, SEL, UITableView *, NSIndexPath *))class_getMethodImplementation(cls, leadingSwipeSel) : NULL;
+    sAppearanceTrailingSwipeOrig = class_getInstanceMethod(cls, trailingSwipeSel) ? (UISwipeActionsConfiguration *(*)(id, SEL, UITableView *, NSIndexPath *))class_getMethodImplementation(cls, trailingSwipeSel) : NULL;
+
+    class_replaceMethod(cls, rowsSel, (IMP)ThemeBuilderAppearanceRows, "q@:@q");
+    class_replaceMethod(cls, cellSel, (IMP)ThemeBuilderAppearanceCell, "@@:@@");
+    class_replaceMethod(cls, heightSel, (IMP)ThemeBuilderAppearanceHeight, "d@:@@");
+    class_replaceMethod(cls, selectSel, (IMP)ThemeBuilderAppearanceSelect, "v@:@@");
+    class_replaceMethod(cls, estimatedHeightSel, (IMP)ThemeBuilderAppearanceEstimatedHeight, "d@:@@");
+    class_replaceMethod(cls, willDisplaySel, (IMP)ThemeBuilderAppearanceWillDisplay, "v@:@@@");
+    class_replaceMethod(cls, didEndDisplayingSel, (IMP)ThemeBuilderAppearanceDidEndDisplaying, "v@:@@@");
+    class_replaceMethod(cls, shouldHighlightSel, (IMP)ThemeBuilderAppearanceShouldHighlight, "B@:@@");
+    class_replaceMethod(cls, willSelectSel, (IMP)ThemeBuilderAppearanceWillSelect, "@@:@@");
+    class_replaceMethod(cls, didHighlightSel, (IMP)ThemeBuilderAppearanceDidHighlight, "v@:@@");
+    class_replaceMethod(cls, didUnhighlightSel, (IMP)ThemeBuilderAppearanceDidUnhighlight, "v@:@@");
+    class_replaceMethod(cls, canEditSel, (IMP)ThemeBuilderAppearanceCanEdit, "B@:@@");
+    class_replaceMethod(cls, canMoveSel, (IMP)ThemeBuilderAppearanceCanMove, "B@:@@");
+    class_replaceMethod(cls, editingStyleSel, (IMP)ThemeBuilderAppearanceEditingStyle, "q@:@@");
+    class_replaceMethod(cls, indentationSel, (IMP)ThemeBuilderAppearanceIndentation, "q@:@@");
+    class_replaceMethod(cls, leadingSwipeSel, (IMP)ThemeBuilderAppearanceLeadingSwipe, "@@:@@");
+    class_replaceMethod(cls, trailingSwipeSel, (IMP)ThemeBuilderAppearanceTrailingSwipe, "@@:@@");
+    installed = YES;
+    ApolloLog(@"ThemeBuilder: Appearance row hook installed");
+}
+
 %hook NSUserDefaults
 
 // Keep the enabled flag truthful: if the user picks a different theme in
@@ -684,6 +1170,7 @@ void ApolloThemeBuilderActivateDonorLive(void) {
     @autoreleasepool {
         FindApolloImage();
         %init(ThemeBuilderHooks);
+        ThemeBuilderInstallAppearanceHooks();
         if (objc_getClass("_TtC6Apollo12ThemeManager")) {
             %init(ThemeBuilderManagerHook);
         }
