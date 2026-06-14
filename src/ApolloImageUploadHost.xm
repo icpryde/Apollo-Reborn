@@ -3083,6 +3083,28 @@ static void ApolloUploadsApplyThumb(UITableViewCell *cell, NSString *key, UIImag
 // height — UILabel vertically centers its text, and Apollo's layout never
 // touches a view it doesn't know about.
 static char kApolloUploadsDetailLabelKey;
+// The native label we hid for a given cell, so a bail-out path can un-hide it.
+static char kApolloUploadsHiddenLabelKey;
+
+// Undo the overlay/hidden-label state we applied to a (possibly recycled) cell.
+// Without this, a cell that previously showed our overlay can be reused on a
+// bail-out path (e.g. right after a delete, when numberOfRowsInSection and the
+// on-disk uploads list momentarily disagree so ApolloUploadsEntryForRow returns
+// nil) and briefly draw a stale overlay over a still-hidden native label.
+static void ApolloUploadsResetDetail(UITableViewCell *cell) {
+    UILabel *hiddenLabel = objc_getAssociatedObject(cell, &kApolloUploadsHiddenLabelKey);
+    if ([hiddenLabel isKindOfClass:[UILabel class]]) hiddenLabel.hidden = NO;
+    objc_setAssociatedObject(cell, &kApolloUploadsHiddenLabelKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    UILabel *overlay = objc_getAssociatedObject(cell, &kApolloUploadsDetailLabelKey);
+    if ([overlay isKindOfClass:[UILabel class]]) {
+        overlay.text = nil;
+        overlay.hidden = YES;
+    }
+    // Drop the key so any still-queued apply block for the old key fails its
+    // currentKey guard instead of re-applying the overlay after this reset.
+    objc_setAssociatedObject(cell, &kApolloUploadsCellURLKey, nil, OBJC_ASSOCIATION_COPY_NONATOMIC);
+}
 
 static void ApolloUploadsApplyDetail(UITableViewCell *cell, NSString *key, NSString *provider, NSDate *date) {
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -3126,10 +3148,13 @@ static void ApolloUploadsApplyDetail(UITableViewCell *cell, NSString *key, NSStr
         overlay.font = label.font;
         overlay.textColor = label.textColor;
         overlay.text = text;
+        overlay.hidden = NO; // undo a prior ApolloUploadsResetDetail on a reused cell
         CGFloat x = label.frame.origin.x;
         overlay.frame = CGRectMake(x, 0, container.bounds.size.width - x - 56.0, container.bounds.size.height); // keep clear of the trash button
         overlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         label.hidden = YES;
+        // Remember which native label we hid so a bail-out path can restore it.
+        objc_setAssociatedObject(cell, &kApolloUploadsHiddenLabelKey, label, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     });
 }
 
@@ -3141,7 +3166,12 @@ static void ApolloUploadsApplyDetail(UITableViewCell *cell, NSString *key, NSStr
         NSInteger totalRows = [tableView numberOfRowsInSection:indexPath.section];
         NSDictionary *entry = ApolloUploadsEntryForRow(indexPath.row, totalRows);
         NSURL *mediaURL = entry ? ApolloUploadsMediaURLFromEntry(entry) : nil;
-        if (!mediaURL) return cell;
+        if (!mediaURL) {
+            // Reset any overlay/hidden-label state from this cell's previous use
+            // so a recycled cell doesn't show a stale overlay over a hidden label.
+            ApolloUploadsResetDetail(cell);
+            return cell;
+        }
 
         NSString *key = mediaURL.absoluteString;
         objc_setAssociatedObject(cell, &kApolloUploadsCellURLKey, key, OBJC_ASSOCIATION_COPY_NONATOMIC);

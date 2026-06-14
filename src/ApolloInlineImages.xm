@@ -1162,6 +1162,39 @@ static CGFloat ApolloAspectRatioFromURL(NSURL *url) {
 - (void)viewWillDisappear:(BOOL)animated {
     [super viewWillDisappear:animated];
     [self apollo_cancelControlsAutoHide];
+
+    // Tear down promptly when the viewer is actually going away. The repeating
+    // progressTimer targets self, so until it's invalidated dealloc can't run;
+    // if the user taps Done / swipes to dismiss while downloads are still in
+    // flight, the viewer (and its imageTasks) would otherwise stay alive until
+    // every task finished. The completion blocks capture weakSelf, so
+    // cancelling the tasks is safe. Gate on isBeingDismissed/isMovingFromParent
+    // so a transient disappearance (e.g. presenting the share sheet) doesn't
+    // cancel still-loading downloads.
+    if (self.isBeingDismissed || self.isMovingFromParentViewController) {
+        [self.progressTimer invalidate];
+        self.progressTimer = nil;
+        for (NSURLSessionDataTask *task in self.imageTasks) {
+            [task cancel];
+        }
+    }
+}
+
+- (void)didReceiveMemoryWarning {
+    [super didReceiveMemoryWarning];
+    // imageDataByIndex keeps the full original bytes of every page for the
+    // viewer's lifetime so Save/Share preserves GIFs/WebPs exactly. For a large
+    // multi-MB album that's a lot of resident memory; under pressure, drop
+    // everything except the page on screen. Save/Share for a dropped page falls
+    // back to re-encoding the displayed image (apollo_dataForPage:), losing only
+    // animation — an acceptable trade when the system is asking for memory.
+    if (self.imageDataByIndex.count == 0) return;
+    // Guard scrollView access — a memory warning can arrive before the view is
+    // loaded, in which case there's no on-screen page to preserve.
+    NSNumber *current = (self.isViewLoaded && self.scrollView) ? @([self apollo_currentPageIndex]) : nil;
+    NSData *keep = current ? self.imageDataByIndex[current] : nil;
+    [self.imageDataByIndex removeAllObjects];
+    if (keep) self.imageDataByIndex[current] = keep;
 }
 
 - (void)viewDidLayoutSubviews {

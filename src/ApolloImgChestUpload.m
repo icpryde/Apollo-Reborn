@@ -135,7 +135,10 @@ static void ApolloImgChestCacheStore(NSString *token, NSDictionary *upload) {
     }
 }
 
-static NSDictionary *_Nullable ApolloImgChestCacheTake(NSString *token) {
+// Read-only lookup — it returns the cached entry without evicting it; the
+// actual eviction happens separately in ApolloImgChestCacheRemove once the
+// combined album post has been created.
+static NSDictionary *_Nullable ApolloImgChestCachePeek(NSString *token) {
     @synchronized (ApolloImgChestCache()) {
         NSDictionary *entry = ApolloImgChestCache()[token];
         return entry;
@@ -352,7 +355,7 @@ ApolloImgChestAlbumResponder ApolloImgChestAlbumCreationResponderForRequest(NSUR
     NSMutableArray<NSDictionary *> *parts = [NSMutableArray arrayWithCapacity:tokens.count];
     NSMutableArray<NSString *> *interimPosts = [NSMutableArray array];
     for (NSString *token in tokens) {
-        NSDictionary *cached = ApolloImgChestCacheTake(token);
+        NSDictionary *cached = ApolloImgChestCachePeek(token);
         NSData *data = [cached[@"data"] isKindOfClass:[NSData class]] ? cached[@"data"] : nil;
         if (data.length == 0) {
             // A member upload isn't ours / bytes already evicted — let the
