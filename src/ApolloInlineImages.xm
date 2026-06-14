@@ -1644,7 +1644,6 @@ static CGFloat ApolloAspectRatioFromURL(NSURL *url) {
 @end
 
 static UIViewController *ApolloTopVCFromView(UIView *v);
-static BOOL ApolloPresentImageChestItems(NSArray<NSDictionary *> *items, UIView *sourceView, NSInteger initialIndex);
 static void ApolloOpenImageChestURLNormally(NSURL *url);
 static BOOL ApolloPresentOrResolveImageChestAlbumURL(NSURL *url, UIView *sourceView, void (^fallback)(void));
 
@@ -1746,7 +1745,9 @@ static UIViewController *ApolloTopVCFromView(UIView *v) {
 
 // Non-static: exported via ApolloCommon.h so other modules can open the
 // viewer. Despite the name it is a generic zoomable image-album viewer;
-// items are dictionaries with an @"url" NSURL.
+// items are dictionaries with an @"url" NSURL. albumURL is the album's page
+// URL when known — it enables the viewer's "Share Album Link" action; pass
+// nil otherwise.
 BOOL ApolloPresentImageChestItemsWithAlbumURL(NSArray<NSDictionary *> *items, UIView *sourceView, NSInteger initialIndex, NSURL *albumURL) {
     if (items.count == 0) return NO;
     UIViewController *top = ApolloTopVCFromView(sourceView);
@@ -1758,7 +1759,10 @@ BOOL ApolloPresentImageChestItemsWithAlbumURL(NSArray<NSDictionary *> *items, UI
     return YES;
 }
 
-static BOOL ApolloPresentImageChestItems(NSArray<NSDictionary *> *items, UIView *sourceView, NSInteger initialIndex) {
+// Non-static: also used by ApolloFeedTextPostThumbnails to open a text post's
+// embedded images fullscreen (declared in ApolloCommon.h). Thin wrapper over
+// ApolloPresentImageChestItemsWithAlbumURL with no album link.
+BOOL ApolloPresentImageChestItems(NSArray<NSDictionary *> *items, UIView *sourceView, NSInteger initialIndex) {
     return ApolloPresentImageChestItemsWithAlbumURL(items, sourceView, initialIndex, nil);
 }
 
