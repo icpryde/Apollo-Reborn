@@ -661,7 +661,7 @@ typedef NS_ENUM(NSInteger, Tag) {
     switch (section) {
         case SectionBackupRestore: return 4;
         case SectionAPIKeys: return 10; // 7 text fields + Can't sign in? + API key setup guide + Copy Widget Setup Code
-        case SectionGeneral: return sShowDeletedComments ? 11 : 10;
+        case SectionGeneral: return sShowDeletedComments ? 12 : 11;
         case SectionMedia: return 12 + (sEnableInlineImages ? 0 : -kApolloMediaInlineDependentRows);
         case SectionSubreddits: return sSubredditListEnhancements ? 8 : 7;
         case SectionNotificationBackend: return 3; // URL + Registration Token + Test Connection
@@ -1055,6 +1055,19 @@ typedef NS_ENUM(NSInteger, Tag) {
                                             label:@"Color Flairs"
                                                on:[defaults boolForKey:UDKeyEnableFlairColors]
                                            action:@selector(flairColorsSwitchToggled:)];
+        case 11: {
+            BOOL lgSupported = IsLiquidGlass();
+            UITableViewCell *cell = [self switchCellWithIdentifier:@"Cell_Gen_KeepSearchInPlace"
+                                                             label:@"Keep Search Bar In Place"
+                                                            detail:@"Requires Liquid Glass."
+                                                                on:lgSupported && [defaults boolForKey:UDKeyKeepSearchBarInPlace]
+                                                            action:@selector(keepSearchBarInPlaceSwitchToggled:)];
+            UISwitch *toggleSwitch = [cell.accessoryView isKindOfClass:[UISwitch class]] ? (UISwitch *)cell.accessoryView : nil;
+            toggleSwitch.enabled = lgSupported;
+            cell.textLabel.enabled = lgSupported;
+            cell.detailTextLabel.enabled = lgSupported;
+            return cell;
+        }
         default: return [[UITableViewCell alloc] init];
     }
 }
@@ -2036,6 +2049,11 @@ typedef NS_ENUM(NSInteger, Tag) {
     sShowSubredditHeaders = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:sShowSubredditHeaders forKey:UDKeyShowSubredditHeaders];
     [[NSNotificationCenter defaultCenter] postNotificationName:@"ApolloSubredditHeaderToggleChangedNotification" object:nil];
+}
+
+- (void)keepSearchBarInPlaceSwitchToggled:(UISwitch *)sender {
+    sKeepSearchBarInPlace = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sKeepSearchBarInPlace forKey:UDKeyKeepSearchBarInPlace];
 }
 
 - (void)userAvatarsSwitchToggled:(UISwitch *)sender {

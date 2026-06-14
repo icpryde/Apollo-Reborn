@@ -1,175 +1,148 @@
 // ApolloSearchInPlace.xm
 //
-// Goal: tapping the feed/subreddit search field should NOT move anything.
-// Stock Apollo runs a "search takeover" on activation: it slides the nav bar up
-// (a -88 transform), reparents + docks the ApolloSearchToolbar (the search field)
-// to the top of the screen (growing it 45->99pt), and shrinks the feed table's
-// top content-inset so the feed/search-results sit just under the docked field.
-// We keep the field exactly where it rests and keep search fully functional:
-// type and the results populate the feed in place, directly below the field.
+// Feed / subreddit search-bar behavior under iOS 26 Liquid Glass. One cohesive subsystem (the parts
+// share %hook methods, so they live together):
+//   - Nav-bar hide: when the search field focuses, fully translate the nav bar off-screen (default).
+//   - Round "X" cancel button: a neutral-gray xmark in a circle that slides / fades in and out.
+//   - Search-results offset: pin the feed inset/offset to a stable rest so results don't jump.
+//   - "Keep Search Bar In Place" mode (sKeepSearchBarInPlace, Settings > Apollo Reborn > General):
+//     keep the nav bar + field where they rest and fill the feed with results below.
 //
-// What we do (and nothing else — search content itself is Apollo's):
-//   1. Block the nav bar's -88 slide *and* its alpha fade so the "Home" row stays
-//      put and fully visible.
-//   2. Pin the toolbar to its resting screen-Y and keep it 45pt tall (zero its
-//      safe-area so the SwiftUI content doesn't inflate), and re-center Cancel.
-//   3. Hold the feed table's top content-inset at the field's bottom PERMANENTLY
-//      (both inactive and active). Apollo natively rests the field ~8pt tucked
-//      under the nav row and shrinks the inset to the docked position on takeover;
-//      holding it constant means the field rests just below the nav bar in both
-//      states, so activation moves nothing and the results show below the field.
-//
-// Most of Apollo's geometry here is re-applied on every layout pass (Texture), so
-// we intercept the setters; the toolbar/nav pins are gated on a "search active"
-// flag, while the feed inset is held via a persistent reference to the feed.
-//
-// See docs/search-bar-shift-RE.md for the reverse engineering.
+// The search-results offset stabilizer runs regardless of Liquid Glass (the jump exists on stock Apollo
+// too, including subreddit views with headers); the nav-bar hide, round-X cancel and in-place mode are
+// Liquid Glass only. ApolloObjectIvar is duplicated from ApolloLiquidGlass.xm (which has its own
+// non-search caller) so this file is self-contained.
 
-#import "ApolloCommon.h"
-#import <UIKit/UIKit.h>
+#import <Foundation/Foundation.h>
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
-#import <substrate.h>
+#import <objc/message.h>
 
-// NB: Apollo's classes are Swift, so the ObjC runtime names are mangled
-// "_TtC6Apollo<len><Name>" and Logos %hook needs them verbatim (it emits
-// objc_getClass("<name>") and the bare names would resolve to nil):
-//   ASTableViewController     -> _TtC6Apollo21ASTableViewController
-//   ApolloSearchToolbar       -> _TtC6Apollo19ApolloSearchToolbar
-//   ApolloSearchBarTextField  -> _TtC6Apollo24ApolloSearchBarTextField
-// (ASTableView is an AsyncDisplayKit ObjC class — plain name.)
+#import "ApolloCommon.h"
+#import "ApolloState.h"
 
-// Resting screen-Y / height of the field-toolbar when NOT taken over. Tracked
-// live from the toolbar's real frame (device / safe-area / scroll independent);
-// defaults are only a fallback.
-static CGFloat sInPlaceToolbarY = 116.0;
-static CGFloat sInPlaceToolbarH = 45.0;
+// Forward ref for the setContentInset:/setContentOffset: hooks below (also declared in
+// ApolloLiquidGlass.xm; a forward @interface in a second .xm is fine).
+@interface ASTableView : UITableView
+@end
 
-static BOOL sFeedSearchActive = NO;
-// Set briefly during teardown to relax the focus-only offset pin so the feed can
-// settle naturally as the keyboard dismisses.
-static BOOL sDismissing = NO;
-// YES once the USER has dragged the feed during a search session (reset on activation
-// and when the feed returns to its top). While NO, Apollo's programmatic scroll-ups
-// (on focus / on each keystroke) are clamped to the resting top so nothing visibly
-// moves — notably a subreddit's banner, which Apollo otherwise scrolls up when you
-// type. Once the user scrolls, we stop clamping so they can browse results freely.
-static BOOL sFeedScrolledByUser = NO;
-// Bumped on every activate/teardown so a stale teardown timer is ignored.
-static int sSearchGen = 0;
-// Armed on activation; consumed once to give the Cancel button a clean horizontal
-// slide-in (replacing Apollo's diagonal one).
-static BOOL sCancelNeedsIntro = NO;
-// Captured on activation; __weak so a torn-down view auto-nils and the setter
-// hooks fall through to %orig.
-static __weak UIView *sActiveSearchToolbar = nil;
-static __weak UINavigationBar *sActiveNavBar = nil;
-static __weak UIViewController *sActiveSearchVC = nil;
-static __weak UITextField *sActiveSearchField = nil;
-// The searchable feed table — PERSISTENT (set whenever the search VC lays out,
-// never cleared on teardown). We hold its top content-inset at the field's bottom
-// in BOTH the inactive and active states, so the field always rests just below
-// the nav bar and *nothing moves* when you tap it (active geometry == inactive
-// geometry). __weak so it auto-nils if the feed is deallocated.
-static __weak UIScrollView *sSearchFeed = nil;
-// The feed VC's search toolbar (persistent; set when a feed VC lays out). The
-// docked-toolbar pins key on THIS instance so they never touch the comment view's
-// own search toolbar (which docks the same way but is Apollo's to manage).
-static __weak UIView *sFeedToolbar = nil;
-
-#pragma mark - Helpers
-
-static id ivarObject(id obj, const char *name) {
-    if (!obj) return nil;
-    Ivar v = class_getInstanceVariable(object_getClass(obj), name);
-    return v ? object_getIvar(obj, v) : nil;
-}
-
-// YES only for the post-feed search controller (Home / subreddit) — the place the
-// "search all posts for X" takeover happens.
-//
-// NB: `CommentsViewController` ALSO has isSearchable==YES and a `commentsSearch`
-// ivar that is nil while idle (only set once a comment search is actually running),
-// so `isSearchable && commentsSearch==nil` wrongly includes the idle comment view —
-// which would make our persistent feed-inset pin treat the comment table as a feed.
-// Exclude it by class. (Other tabs — Profile/Inbox — have isSearchable==NO.)
-static BOOL isSearchableFeedVC(id vc) {
-    if (!vc) return NO;
-    const char *cls = object_getClassName(vc);
-    if (cls && strstr(cls, "Comments")) return NO; // comment view, not the post feed
-    BOOL isSearchable = NO;
-    Ivar sv = class_getInstanceVariable(object_getClass(vc), "isSearchable");
-    if (sv) isSearchable = *(BOOL *)((char *)(__bridge void *)vc + ivar_getOffset(sv));
-    return isSearchable && ivarObject(vc, "commentsSearch") == nil;
-}
-
-// Apollo's feed table (tableNode.view, an ASTableView) — where search results
-// are rendered in place of the feed while searching.
-static UIScrollView *feedScrollView(UIViewController *vc) {
-    id tableNode = ivarObject(vc, "tableNode");
-    if (tableNode && [tableNode respondsToSelector:@selector(view)]) {
-        UIView *v = [(id)tableNode view];
-        if ([v isKindOfClass:[UIScrollView class]]) return (UIScrollView *)v;
+// Runtime ivar reader; walks the superclass chain so inherited ivars resolve.
+static id ApolloObjectIvar(id object, const char *name) {
+    if (!object || !name) return nil;
+    Class cls = object_getClass(object);
+    while (cls) {
+        Ivar ivar = class_getInstanceVariable(cls, name);
+        if (ivar) {
+            return object_getIvar(object, ivar);
+        }
+        cls = class_getSuperclass(cls);
     }
     return nil;
 }
 
-// The content-inset top that puts the feed/results just below the resting field.
-// The feed uses contentInsetAdjustmentBehavior = Never, so adjustedContentInset
-// == contentInset (safe area is NOT added) — set the field's bottom directly.
-static CGFloat inPlaceInsetTop(UIScrollView *feed) {
-    CGFloat extra = feed.adjustedContentInset.top - feed.contentInset.top; // 0 when Never
-    CGFloat top = (sInPlaceToolbarY + sInPlaceToolbarH) - extra;
-    return top < 0 ? 0 : top;
-}
+// MARK: - Nav-bar hide
+//
+// Apollo's feed search bar is a custom ApolloSearchToolbar overlaid on the Texture ASTableView, not a
+// UISearchController. When the field begins editing, the host (_TtC6Apollo21ASTableViewController)
+// translates the whole UINavigationBar up by a hardcoded -88pt and fades it to alpha 0 (sub_1002c2b60,
+// inside a 0.3s animation). The taller iOS 26 nav bar isn't fully cleared by -88, so the title/buttons
+// stay partly visible. We capture the bar on focus and rewrite the hide translate to the bar's true
+// off-screen extent (safe-area top + height). The comments in-thread search
+// (searchBarShouldStickToKeyboard == YES) uses a different, keyboard-anchored layout and is excluded.
 
-// The toolbar is "docked" while the takeover has reparented it onto the VC's view
-// (i.e. its superview is NOT the feed scroll view). In that state we hold it at
-// the in-place screen position; resting in the feed it rides the content normally.
-// Keyed on the superview type so it engages the instant Apollo reparents it —
-// BEFORE textFieldDidBeginEditing sets the active flag (~7ms later) — which is
-// what kills the off-screen blank frame on tap.
-static BOOL toolbarDocked(UIView *toolbar) {
-    UIView *sup = [toolbar superview];
-    return sup != nil && ![sup isKindOfClass:[UIScrollView class]];
-}
+static __weak UINavigationBar *sFeedSearchNavBar = nil;
 
-// Only OUR feed toolbar, and only while docked. Excludes the comment view's search
-// toolbar (different instance, never captured as sFeedToolbar).
-static BOOL feedToolbarDocked(UIView *toolbar) {
-    return toolbar == sFeedToolbar && toolbarDocked(toolbar);
-}
+// Apollo's "Cancel" dismiss button, restyled as a round "X". Captured on focus; __weak so a torn-down
+// view auto-nils.
+static __weak UIButton *sFeedSearchCancel = nil;
+// Armed on focus, consumed once: gives the round-X a clean slide-in.
+static BOOL sCancelNeedsIntro = NO;
 
-// YES if this search toolbar belongs to a CommentsViewController — i.e. it's the
-// "Find in Comments" find-in-page bar (not the post-feed search). Detected via the
-// responder chain (toolbar -> _ASDisplayView -> CommentsViewController). Used to
-// give that bar a solid backing while active so the comments don't bleed through.
-static BOOL isCommentToolbar(UIView *v) {
-    UIResponder *r = [v nextResponder];
-    int guard = 0;
-    while (r && guard++ < 40) {
-        if ([r isKindOfClass:[UIViewController class]]) {
-            const char *cls = object_getClassName(r);
-            if (cls && strstr(cls, "Comments")) return YES;
-        }
-        r = [r nextResponder];
+// MARK: - Search-results offset
+//
+// During a feed search Apollo's contentInset.top and contentOffset on the feed table churn (the
+// present/reframe path re-parks the offset, and under Liquid Glass the nav-bar transform also makes the
+// VC safe-area flicker), pushing the "Search all posts for X" prompt up under the status bar and jumping
+// on each keystroke. Instead of correcting after the fact, we intercept the ASTableView geometry setters
+// and pin them to a stable anchor (the docked toolbar's window-space bottom). The feed uses
+// contentInsetAdjustmentBehavior = .never, so adjustedContentInset.top == contentInset.top. Not gated on
+// Liquid Glass — the jump happens on stock Apollo too.
+static __weak UIScrollView *sFeedSearchTable     = nil;  // captured tableNode.view (ASTableView)
+static __weak UIView        *sFeedSearchToolbar   = nil;  // captured upperToolbar (the rest anchor)
+static BOOL sFeedSearchActive         = NO;  // YES while a feed (!stick) search is editing
+static BOOL sFeedSearchDismissing     = NO;  // YES briefly during dismiss (relax clamp to a downward pull)
+static BOOL sFeedSearchScrolledByUser = NO;  // armed once the user drags → stop clamping so they can browse
+static NSUInteger sFeedSearchDismissGen = 0; // bumps each dismiss / focus / disappear; the release timer ignores stale gens
+static __weak UIView *sFeedSearchField    = nil; // captured searchTextField
+
+// Stable content-top rest for the feed search table: the docked toolbar's window-space bottom (where the
+// first results row sits). Falls back to window safe-area top + 45 until the toolbar is docked.
+static CGFloat ApolloFeedSearchRestTop(void) {
+    UIView *tb = sFeedSearchToolbar;
+    if (tb && tb.window) {
+        CGFloat bottom = CGRectGetMaxY([tb convertRect:tb.bounds toView:nil]); // window space
+        if (bottom > 1.0) return bottom;
     }
-    return NO;
+    UIWindow *w = sFeedSearchNavBar.window ?: sFeedSearchTable.window ?: tb.window;
+    CGFloat safeTop = w ? w.safeAreaInsets.top : 59.0; // 59 ≈ Dynamic-Island top; transient pre-dock only
+    return safeTop + 45.0;
 }
 
-// The round "X" glyph shown in place of the "Cancel" word. Cached (the symbol is
-// theme-independent; the tint is applied on the button). Matches the look of the
-// iOS 26 system search-bar cancel button.
+// MARK: - "Keep Search Bar In Place" rest target
+//
+// In-place mode keeps the nav bar + field where they rest, so results start at the nav bar's window-space
+// bottom + Apollo's 45pt toolbar height. Falls back to the docked-toolbar bottom until the nav bar is
+// captured.
+static CGFloat ApolloFeedSearchInPlaceRestTop(void) {
+    UINavigationBar *nb = sFeedSearchNavBar;
+    if (nb && nb.window) {
+        CGFloat navBottom = CGRectGetMaxY([nb convertRect:nb.bounds toView:nil]); // window space
+        if (navBottom > 1.0) return navBottom + 45.0; // 45 == Apollo's toolbarHeight ivar (portrait)
+    }
+    return ApolloFeedSearchRestTop();
+}
+
+// The active rest for whichever mode is on; the inset floor and the offset clamp both use it. In-place
+// mode is Liquid Glass only, so non-LG (and LG nav-hide) always use the docked-toolbar rest.
+static CGFloat ApolloFeedSearchActiveRestTop(void) {
+    return (sKeepSearchBarInPlace && IsLiquidGlass()) ? ApolloFeedSearchInPlaceRestTop()
+                                                      : ApolloFeedSearchRestTop();
+}
+
+// MARK: - Round "X" cancel button
+//
+// Replaces the "Cancel" text with a neutral-gray xmark in a circle matching the search-field pill. In
+// OFF mode Apollo sizes/positions it (see the sizeThatFits override below); in in-place mode we place it
+// ourselves. The slide-in / slide-out / fade run as layer animations keyed "sipX*".
+
+static const CGFloat kXSize        = 36.0;  // circle diameter (== Apollo's searchBarHeight; matches the field pill)
+static const CGFloat kXRightMargin = 14.0;  // circle right edge -> toolbar right edge (in-place geometry only)
+static const CGFloat kXFieldGap    = 12.0;  // field right edge -> circle left edge (in-place geometry only)
+
+// Tag (associated object) marking the feed dismissSearchBarButton so the sizeThatFits:/
+// intrinsicContentSize overrides below apply to only that one button. In OFF mode Apollo reads the
+// button's sizeThatFits every layout pass to size the field (sub_1002be508), place the field
+// (sub_1002be378) and frame the button — returning a fixed square lets Apollo do all the geometry with
+// no frame writes from us. In-place mode places the button itself instead.
+static const void *kRoundXKey = &kRoundXKey;
+
+// The toolbar's resting (pre-dock) height, captured on focus. OFF mode fires the round-X slide-in only
+// once the toolbar grows past this (i.e. has docked), not on the resting pass.
+static CGFloat sRestToolbarHeight = 45.0;
+
+static void tagRoundXButton(UIButton *btn) {
+    if ([btn isKindOfClass:[UIButton class]] && !objc_getAssociatedObject(btn, kRoundXKey)) {
+        objc_setAssociatedObject(btn, kRoundXKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
+// Cached neutral-gray xmark glyph (AlwaysOriginal so it never picks up Apollo's accent tint).
 static UIImage *roundXImage(void) {
     static UIImage *img = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         UIImageSymbolConfiguration *cfg =
-            [UIImageSymbolConfiguration configurationWithPointSize:12.0
-                                                            weight:UIImageSymbolWeightBold];
-        // Bake a neutral gray straight into the glyph (AlwaysOriginal) so it can never
-        // render in Apollo's accent green — not even for the first frame of the slide-in,
-        // which a template + per-pass tintColor briefly missed.
+            [UIImageSymbolConfiguration configurationWithPointSize:12.0 weight:UIImageSymbolWeightBold];
         img = [[UIImage systemImageNamed:@"xmark" withConfiguration:cfg]
                   imageWithTintColor:[UIColor colorWithWhite:0.62 alpha:1.0]
                        renderingMode:UIImageRenderingModeAlwaysOriginal];
@@ -177,38 +150,29 @@ static UIImage *roundXImage(void) {
     return img;
 }
 
-// Round-X geometry. The circle is pinned to the toolbar's right edge; the field is
-// shrunk so it ends a clean gap to the LEFT of the circle (Apollo sizes the field
-// flush to the cancel button — fine for a "Cancel" word, too cramped for a circle).
-static const CGFloat kXSize        = 33.0;  // circle diameter
-static const CGFloat kXRightMargin = 14.0;  // circle right edge -> toolbar right edge
-static const CGFloat kXFieldGap    = 12.0;  // field right edge -> circle left edge
-
-// Resting CENTER of the X circle in the toolbar's coords. Vertically centered on the
-// FIELD (which sits in the top of the toolbar, not the toolbar's own middle), so it
-// looks aligned with the search pill rather than floating low.
-static CGPoint xRestCenter(UIView *toolbar, UITextField *field) {
+// Resting center of the X circle in toolbar coords: pinned to the right edge, vertically centered on the
+// field so it lines up with the search pill.
+static CGPoint xRestCenter(UIView *toolbar, UIView *field) {
     CGFloat cx = CGRectGetWidth(toolbar.bounds) - kXRightMargin - kXSize / 2.0;
     CGFloat cy = field ? CGRectGetMidY(field.frame) : CGRectGetMidY(toolbar.bounds);
     return CGPointMake(cx, cy);
 }
 
-// The off-right translation that parks the circle fully past the toolbar's right edge
-// (its starting point for the slide-in / ending point for the slide-out).
-static CGFloat xSlideDistance(UIView *toolbar, CGPoint restCenter) {
-    return CGRectGetWidth(toolbar.bounds) - (restCenter.x - kXSize / 2.0) + 6.0;
+// Off-right translation that parks the circle past the toolbar's right edge, from the button's current
+// model frame (caller ensures the transform is identity first).
+static CGFloat xParkDistance(UIView *toolbar, UIView *cancel) {
+    return CGRectGetWidth(toolbar.bounds) - CGRectGetMinX(cancel.frame) + 8.0;
 }
 
-// Restyle Apollo's "Cancel" text button as a round X — the Liquid-Glass look the
-// system search bar (Search tab) uses: clear the title, show the xmark glyph centered
-// in a circular fill that matches the search-field pill. Runs every layout pass while
-// active, and OWNS the button's geometry: it forces bounds + center (so Apollo can't
-// move/resize it) and strips any animation Apollo adds to the button — Apollo otherwise
-// drives a "diagonal" slide-in and a jump-to-the-left on dismiss. The slide is run
-// separately as a TRANSFORM animation (keys "sipX…", preserved here) that composes with
-// the forced center. Also re-asserts the tint each pass (Apollo re-tints it green) and
-// shrinks the field to leave a gap before the circle.
-static void styleCancelAsRoundX(UIButton *btn, UIView *toolbar, UITextField *field) {
+// The field's max right edge while searching, leaving kXFieldGap before the circle.
+static CGFloat fieldMaxRight(UIView *toolbar) {
+    return CGRectGetWidth(toolbar.bounds) - kXRightMargin - kXSize - kXFieldGap;
+}
+
+// Style the round-X each layout pass: clear the title, show the glyph in a circular fill, and (in-place
+// only) force its size/center. Strips Apollo's own button animations so only our slide shows.
+static void styleCancelAsRoundX(UIButton *btn, UIView *toolbar, UIView *field) {
+    // Appearance (idempotent): clear the "Cancel" title, show the gray xmark in a circle.
     if (btn.currentImage == nil || btn.currentTitle.length > 0) {
         [btn setTitle:@"" forState:UIControlStateNormal];
         [btn setImage:roundXImage() forState:UIControlStateNormal];
@@ -218,47 +182,52 @@ static void styleCancelAsRoundX(UIButton *btn, UIView *toolbar, UITextField *fie
         btn.contentEdgeInsets = UIEdgeInsetsZero;
         btn.adjustsImageWhenHighlighted = NO;
     }
-    if (btn.alpha < 1.0) btn.alpha = 1.0; // Apollo fades it out on dismiss; keep it opaque so the slide-out shows
+    // Apollo fades the cancel button to alpha 0 on teardown (sub_1002c3cf8). Keep it opaque while active,
+    // but let an in-place dismiss fade it out (don't force it back up) so it actually goes away.
+    if (btn.alpha < 1.0 && !(sKeepSearchBarInPlace && sFeedSearchDismissing)) btn.alpha = 1.0;
 
-    // Own the geometry: a fixed-size circle at its resting center, set without implicit
-    // animation. center/bounds are independent of `transform`, so the slide animation
-    // (below, on transform.translation.x) plays cleanly on top of this.
-    CGPoint rest = xRestCenter(toolbar, field);
-    if (!CGSizeEqualToSize(btn.bounds.size, CGSizeMake(kXSize, kXSize))) {
-        [UIView performWithoutAnimation:^{ btn.bounds = CGRectMake(0, 0, kXSize, kXSize); }];
+    // In-place: the toolbar is pinned to 45pt while Apollo positions the button for the ~99pt docked
+    // geometry, so it would be clipped — re-center it into the band. OFF mode lets Apollo size/place it.
+    if (sKeepSearchBarInPlace) {
+        CGPoint rest = xRestCenter(toolbar, field);
+        if (!CGSizeEqualToSize(btn.bounds.size, CGSizeMake(kXSize, kXSize))) {
+            [UIView performWithoutAnimation:^{ btn.bounds = CGRectMake(0, 0, kXSize, kXSize); }];
+        }
+        if (!CGPointEqualToPoint(btn.center, rest)) {
+            [UIView performWithoutAnimation:^{ btn.center = rest; }];
+        }
     }
-    if (!CGPointEqualToPoint(btn.center, rest)) {
-        [UIView performWithoutAnimation:^{ btn.center = rest; }];
-    }
-    // Strip Apollo's own animations on the button (its diagonal slide-in / left-jump on
-    // dismiss); keep only ours.
+
+    // Strip Apollo's own (non-sipX) button animations so only our slide shows.
     for (NSString *k in [btn.layer.animationKeys copy]) {
         if (![k hasPrefix:@"sipX"]) [btn.layer removeAnimationForKey:k];
     }
-    // NB: the FIELD width (which leaves the gap before the circle) is NOT set here —
-    // it's clamped in ApolloSearchBarTextField's own setFrame: so Apollo's activation
-    // animation flows straight to the clamped width with no fight/bounce.
 }
 
-// The field's max right edge while docked — leaves kXFieldGap before the X circle,
-// which itself sits kXRightMargin from the toolbar's right edge. Clamping the field's
-// width to this (in its setFrame:) lets Apollo's shrink animation settle here directly
-// instead of overshooting to its full width and snapping back.
-static CGFloat fieldMaxRight(UIView *toolbar) {
-    return CGRectGetWidth(toolbar.bounds) - kXRightMargin - kXSize - kXFieldGap;
-}
-
-// Slide the round X OUT to the right (mirrors the intro). Called on dismiss (X tap /
-// field resign). Sets the model transform off-screen so it stays parked after the
-// animation; styleCancelAsRoundX keeps forcing center/bounds (transform-independent)
-// through the teardown window, so the circle slides cleanly off as one unit.
+// Dismiss the round-X. In-place fades it out (alpha 0 — authoritative, since the toolbar is pinned and
+// clips); OFF slides it off the right edge via a transform.
 static void animateCancelOut(void) {
-    UIView *toolbar = sActiveSearchToolbar;
-    UIView *cancel = (UIView *)ivarObject(sActiveSearchVC, "dismissSearchBarButton");
+    UIView *toolbar = sFeedSearchToolbar;
+    UIButton *cancel = sFeedSearchCancel;
     if (!toolbar || ![cancel isKindOfClass:[UIButton class]]) return;
+
+    if (sKeepSearchBarInPlace) {
+        if ([cancel.layer animationForKey:@"sipXFade"]) return; // already fading out
+        [cancel.layer removeAnimationForKey:@"sipXIn"];
+        cancel.alpha = 0.0; // model hidden so it stays gone after the fade
+        CABasicAnimation *fade = [CABasicAnimation animationWithKeyPath:@"opacity"];
+        fade.fromValue = @1.0;
+        fade.toValue = @0.0;
+        fade.duration = 0.22;
+        fade.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
+        [cancel.layer addAnimation:fade forKey:@"sipXFade"];
+        return;
+    }
+
     if ([cancel.layer animationForKey:@"sipXOut"]) return; // already sliding out
-    CGFloat dist = xSlideDistance(toolbar, xRestCenter(toolbar, sActiveSearchField));
     [cancel.layer removeAnimationForKey:@"sipXIn"];
+    if (!CGAffineTransformIsIdentity(cancel.transform)) cancel.transform = CGAffineTransformIdentity; // frame == model
+    CGFloat dist = xParkDistance(toolbar, cancel);
     cancel.transform = CGAffineTransformMakeTranslation(dist, 0.0); // model parks off-right
     CABasicAnimation *slide = [CABasicAnimation animationWithKeyPath:@"transform.translation.x"];
     slide.fromValue = @0.0;
@@ -268,77 +237,258 @@ static void animateCancelOut(void) {
     [cancel.layer addAnimation:slide forKey:@"sipXOut"];
 }
 
-// Style + place the round X every layout pass, and run the slide-in once per
-// activation (armed by sCancelNeedsIntro). The slide is a clean horizontal transform
-// animation (no opacity fade — fading made the bright glyph appear before its dark
-// circle on black). Starts fully off the right edge and eases into its resting spot.
+// Style + place the round-X each layout pass, and run the slide-in once per activation.
 static void recenterCancelButton(void) {
-    UIView *toolbar = sActiveSearchToolbar;
-    UIView *cancel = (UIView *)ivarObject(sActiveSearchVC, "dismissSearchBarButton");
-    if (!toolbar || !cancel || cancel.superview != toolbar) return;
-    if (![cancel isKindOfClass:[UIButton class]]) return;
+    UIView *toolbar = sFeedSearchToolbar;
+    UIButton *cancel = sFeedSearchCancel;
+    if (!toolbar || ![cancel isKindOfClass:[UIButton class]]) return;
+    if (cancel.superview != toolbar) return;
     if (CGRectGetHeight(toolbar.bounds) < 1.0) return; // not laid out yet
-    // Only own the X while the toolbar is docked (the active takeover). Once it un-docks
-    // (dismiss/teardown), stop forcing its geometry so Apollo can collapse the button —
-    // otherwise our forced 33x33 leaves a stray X on the resting search field.
-    if (!toolbarDocked(toolbar)) return;
-    styleCancelAsRoundX((UIButton *)cancel, toolbar, sActiveSearchField);
+    styleCancelAsRoundX(cancel, toolbar, sFeedSearchField);
     if (sCancelNeedsIntro) {
-        sCancelNeedsIntro = NO;
-        CGFloat dist = xSlideDistance(toolbar, cancel.center);
-        cancel.transform = CGAffineTransformIdentity; // model = resting
-        [cancel.layer removeAnimationForKey:@"sipXOut"];
-        CABasicAnimation *slide = [CABasicAnimation animationWithKeyPath:@"transform.translation.x"];
-        slide.fromValue = @(dist);
-        slide.toValue = @0.0;
-        slide.duration = 0.32;
-        slide.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
-        [cancel.layer addAnimation:slide forKey:@"sipXIn"];
+        // Measure against the model frame: clear any leftover parked transform from a prior dismiss.
+        if (!CGAffineTransformIsIdentity(cancel.transform)) {
+            [UIView performWithoutAnimation:^{ cancel.transform = CGAffineTransformIdentity; }];
+        }
+        // Fire once the button is at its active rest. OFF: wait for the toolbar to dock (grow past its
+        // resting height). In-place: ready immediately (we force the center above).
+        BOOL ready = sKeepSearchBarInPlace
+                   ? YES
+                   : (CGRectGetHeight(toolbar.bounds) > sRestToolbarHeight + 8.0);
+        if (ready && CGRectGetWidth(cancel.bounds) > 1.0) {
+            sCancelNeedsIntro = NO;
+            CGFloat dist = xParkDistance(toolbar, cancel); // transform is identity here -> frame == model
+            [cancel.layer removeAnimationForKey:@"sipXOut"];
+            CABasicAnimation *slide = [CABasicAnimation animationWithKeyPath:@"transform.translation.x"];
+            slide.fromValue = @(dist);
+            slide.toValue = @0.0;
+            slide.duration = 0.32;
+            slide.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
+            [cancel.layer addAnimation:slide forKey:@"sipXIn"];
+        }
     }
 }
 
-// Hold the toolbar / nav pins through Apollo's ~0.3s deactivate animation (the
-// reparent of the docked toolbar back into the feed), then release. The feed
-// inset is NOT released — it stays pinned at the field's bottom permanently (via
-// sSearchFeed), so the field's resting position never changes.
-static void endFeedSearchInPlace(void) {
-    if (!sFeedSearchActive || sDismissing) return;
-    sDismissing = YES;  // relax the focus offset pin so the feed settles naturally
-    int gen = ++sSearchGen;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        if (gen != sSearchGen) return; // re-activated meanwhile
-        sFeedSearchActive = NO;
-        sDismissing = NO;
-        sActiveSearchToolbar = nil;
-        sActiveNavBar = nil;
-        sActiveSearchVC = nil;
-        sActiveSearchField = nil;
-        sCancelNeedsIntro = NO; // clear in case it was armed but never consumed
-        // sSearchFeed is intentionally left set (persistent inset pin).
-        ApolloLog(@"[SearchInPlace] search ended (toolbar/nav pins released)");
-    });
+// MARK: - Cancel button sizing (OFF / nav-hide mode)
+//
+// Apollo reads [dismissSearchBarButton sizeThatFits:] every layout pass to size the field
+// (sub_1002be508: viewWidth - 17 - buttonWidth), place the field (sub_1002be378) and frame the button.
+// Returning a fixed square for our tagged button lets Apollo size the field and position the round-X
+// itself, with no frame writes from us. Scoped to Liquid Glass, OFF mode, and only the tagged button.
+// (The %hook UIButton in ApolloPhotoPostComposerScrollFix.xm only overrides setTitle:, so no collision.)
+%hook UIButton
+
+- (CGSize)sizeThatFits:(CGSize)size {
+    if (IsLiquidGlass() && !sKeepSearchBarInPlace && objc_getAssociatedObject(self, kRoundXKey)) {
+        return CGSizeMake(kXSize, kXSize); // square -> circle via the corner radius; Apollo reclaims the freed width
+    }
+    return %orig;
 }
 
-#pragma mark - Nav bar: block the -88 slide
+- (CGSize)intrinsicContentSize {
+    if (IsLiquidGlass() && !sKeepSearchBarInPlace && objc_getAssociatedObject(self, kRoundXKey)) {
+        return CGSizeMake(kXSize, kXSize);
+    }
+    return %orig;
+}
 
-%hook UINavigationBar
+%end
 
-- (void)setTransform:(CGAffineTransform)transform {
-    if (sFeedSearchActive && self == sActiveNavBar &&
-        (transform.ty != 0.0 || transform.tx != 0.0)) {
-        %orig(CGAffineTransformIdentity);
+@interface _TtC6Apollo21ASTableViewController : UIViewController
+- (void)textFieldDidBeginEditing:(id)textField;
+- (void)dismissSearchBarButtonTappedWithSender:(id)sender;
+@end
+
+%hook _TtC6Apollo21ASTableViewController
+
+- (void)textFieldDidBeginEditing:(id)textField {
+    %orig;
+
+    // searchBarShouldStickToKeyboard == YES is the comments in-thread search (different layout); skip it.
+    if (MSHookIvar<BOOL>(self, "searchBarShouldStickToKeyboard")) return;
+
+    // Offset stabilizer (runs regardless of Liquid Glass): arm the active flags and capture the feed
+    // table + docked toolbar (the rest anchor) + field so the ASTableView inset/offset hooks engage.
+    sFeedSearchActive = YES;
+    sFeedSearchDismissing = NO;
+    sFeedSearchScrolledByUser = NO;
+    ++sFeedSearchDismissGen;  // a re-focus during a dismiss window cancels the pending release timer
+    id tableNode = ApolloObjectIvar(self, "tableNode");
+    UIView *tv = [tableNode respondsToSelector:@selector(view)] ? [tableNode view] : nil;
+    if ([tv isKindOfClass:objc_getClass("ASTableView")]) sFeedSearchTable = (UIScrollView *)tv;
+    id upper = ApolloObjectIvar(self, "upperToolbar");
+    if ([upper isKindOfClass:[UIView class]]) {
+        sFeedSearchToolbar = (UIView *)upper;
+        CGFloat h = CGRectGetHeight([(UIView *)upper bounds]);
+        if (h > 1.0) sRestToolbarHeight = h;
+    }
+    id field = ApolloObjectIvar(self, "searchTextField");
+    if ([field isKindOfClass:[UIView class]]) sFeedSearchField = (UIView *)field;
+
+    // Liquid Glass only: capture the nav bar (for the hide rewrite) and arm the round-X cancel button.
+    if (!IsLiquidGlass()) return;
+    sFeedSearchNavBar = [(UIViewController *)self navigationController].navigationBar;
+    sCancelNeedsIntro = YES; // clean slide-in this session
+    id cancel = ApolloObjectIvar(self, "dismissSearchBarButton");
+    if ([cancel isKindOfClass:[UIButton class]]) {
+        sFeedSearchCancel = (UIButton *)cancel;
+        tagRoundXButton((UIButton *)cancel); // tag for the sizeThatFits override
+    }
+}
+
+// Keep the captured refs current (the table/toolbar may not be ready at focus, and the docked toolbar
+// changes across keystroke reloads). Idempotent; the clamp is armed by sFeedSearchActive.
+- (void)viewDidLayoutSubviews {
+    %orig;
+    if (MSHookIvar<BOOL>(self, "searchBarShouldStickToKeyboard")) return; // feed-only; skip comments search
+    // Keep the offset-stabilizer refs current (runs regardless of Liquid Glass).
+    id tableNode = ApolloObjectIvar(self, "tableNode");
+    UIView *tv = [tableNode respondsToSelector:@selector(view)] ? [tableNode view] : nil;
+    if ([tv isKindOfClass:objc_getClass("ASTableView")]) sFeedSearchTable = (UIScrollView *)tv;
+    id upper = ApolloObjectIvar(self, "upperToolbar");
+    if ([upper isKindOfClass:[UIView class]]) sFeedSearchToolbar = (UIView *)upper;
+    id field = ApolloObjectIvar(self, "searchTextField");
+    if ([field isKindOfClass:[UIView class]]) sFeedSearchField = (UIView *)field;
+
+    // Liquid Glass only: keep the round-X styled and run its slide-in.
+    if (!IsLiquidGlass()) return;
+    id cancel = ApolloObjectIvar(self, "dismissSearchBarButton");
+    if ([cancel isKindOfClass:[UIButton class]]) {
+        sFeedSearchCancel = (UIButton *)cancel;
+        tagRoundXButton((UIButton *)cancel);
+    }
+    if (sFeedSearchActive || sFeedSearchDismissing) recenterCancelButton();
+}
+
+- (void)dismissSearchBarButtonTappedWithSender:(id)sender {
+    // In-place: Apollo's teardown (sub_1002bf57c) animates the toolbar/field/button from the docked-top
+    // geometry; since the nav bar never moved here, that reads as a "fly in from above". Keep our pins
+    // live through the teardown (don't pre-clear), strip the implicit animations (in the toolbar hooks),
+    // and release on a timer guarded by a generation counter against a re-focus.
+    if (IsLiquidGlass() && sKeepSearchBarInPlace) {
+        sFeedSearchDismissing = YES;                  // pins stay armed via (active || dismissing)
+        NSUInteger gen = ++sFeedSearchDismissGen;     // a newer dismiss / re-focus invalidates this timer
+        %orig;
+        animateCancelOut();                           // fade the round-X out
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (gen != sFeedSearchDismissGen) return; // re-focused / re-dismissed meanwhile
+            sFeedSearchActive = NO;
+            sFeedSearchDismissing = NO;
+            sFeedSearchNavBar = nil;
+            sFeedSearchToolbar = nil;
+            sFeedSearchField = nil;
+            sFeedSearchCancel = nil;
+            sCancelNeedsIntro = NO;
+            sFeedSearchScrolledByUser = NO;
+        });
+        return;
+    }
+
+    // OFF (nav-hide): release the capture up front so Apollo's restore passes through, then run a short
+    // dismissing window.
+    sFeedSearchNavBar = nil;
+    sFeedSearchActive = NO;
+    sFeedSearchDismissing = YES;
+    %orig;
+    animateCancelOut(); // slide the round-X out
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ sFeedSearchDismissing = NO; });
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    // If this controller owns the captured bar and is leaving, drop the capture so a stale reference
+    // can't affect an unrelated transform later.
+    if (sFeedSearchNavBar && [(UIViewController *)self navigationController].navigationBar == sFeedSearchNavBar) {
+        sFeedSearchNavBar = nil;
+    }
+    sFeedSearchActive = NO;
+    sFeedSearchDismissing = NO;
+    sFeedSearchToolbar = nil;
+    sFeedSearchField = nil;
+    sFeedSearchCancel = nil;
+    sCancelNeedsIntro = NO;
+    ++sFeedSearchDismissGen; // a pending dismiss release timer can't resurrect state after we leave
+    %orig;
+}
+
+%end
+
+// MARK: - Feed table: pin the top inset/offset
+//
+// Intercept the geometry setters at the source. Strictly gated to the one captured feed table while a
+// feed search is active/dismissing — every other ASTableView falls through to %orig (so the
+// ApolloSubredditHeaders.xm UIScrollView hook still chains). Runs regardless of Liquid Glass.
+%hook ASTableView
+
+- (void)setContentInset:(UIEdgeInsets)inset {
+    if (sFeedSearchActive && (UIScrollView *)self == sFeedSearchTable) {
+        CGFloat want = ApolloFeedSearchActiveRestTop();
+        if (inset.top < want) inset.top = want; // FLOOR only — never lower (allow pull-to-refresh growth)
+        %orig(inset);
         return;
     }
     %orig;
 }
 
-// Apollo's takeover also *fades* the nav bar (the "Home" title + globe/trophy/…
-// buttons) out and back in as it slides. We keep the bar in place, so block the
-// fade too — clamp alpha to 1 while our search is active (covers the teardown
-// window until the pins release).
+- (void)setContentOffset:(CGPoint)offset {
+    if ((UIScrollView *)self == sFeedSearchTable &&
+        (sFeedSearchActive || sFeedSearchDismissing)) {
+        UIScrollView *sv = (UIScrollView *)self;
+        CGFloat rest = -ApolloFeedSearchActiveRestTop();
+        BOOL userScrolling = sv.isDragging || sv.isDecelerating;
+
+        // Once the user drags, stop clamping; re-arm when they settle back at rest.
+        if (sv.isDragging) sFeedSearchScrolledByUser = YES;
+        else if (offset.y <= rest + 1.0) sFeedSearchScrolledByUser = NO;
+
+        if (sFeedSearchDismissing && !userScrolling) {
+            if (offset.y > rest) offset.y = rest; // teardown: only pull DOWN to rest, don't fight restore
+        } else if (sFeedSearchActive && !sFeedSearchDismissing && !userScrolling &&
+                   !sFeedSearchScrolledByUser && offset.y > rest) {
+            offset.y = rest; // kill Apollo's programmatic re-park (focus / keystroke / banner)
+        }
+        %orig(offset);
+        return;
+    }
+    %orig;
+}
+
+%end
+
+// MARK: - Nav-bar hide / in-place block
+//
+// OFF: rewrite Apollo's hardcoded -88 translate to the bar's true off-screen extent so it fully hides.
+// In-place: block the slide and the alpha fade so the nav bar (title + items) stays put and visible.
+%hook UINavigationBar
+
+- (void)setTransform:(CGAffineTransform)transform {
+    // Only the captured feed-search bar, only under Liquid Glass, only for an upward (hide) translate.
+    // Restores (identity / ty >= 0) and every other nav bar pass through.
+    if (!IsLiquidGlass() || self != sFeedSearchNavBar || transform.ty >= -1.0) {
+        %orig;
+        return;
+    }
+
+    // In-place: block the slide entirely so the nav bar stays where it is.
+    if (sKeepSearchBarInPlace) {
+        %orig(CGAffineTransformIdentity);
+        return;
+    }
+
+    // OFF: push by the bar's true off-screen extent (frame origin ≈ safe-area top + height).
+    CGFloat safeTop = self.window ? self.window.safeAreaInsets.top : self.safeAreaInsets.top;
+    CGFloat needed = -(safeTop + self.bounds.size.height);
+
+    CGAffineTransform corrected = transform;
+    if (needed < corrected.ty) corrected.ty = needed; // only ever push further up, never less
+    %orig(corrected);
+}
+
+// In-place: Apollo fades the captured bar to 0 alongside the slide; clamp it back to 1 so the title /
+// items stay visible. Gated to the captured bar; OFF mode wants the fade and passes through.
 - (void)setAlpha:(CGFloat)alpha {
-    if (sFeedSearchActive && self == sActiveNavBar && alpha < 1.0) {
+    if (IsLiquidGlass() && sKeepSearchBarInPlace && self == sFeedSearchNavBar && alpha < 1.0) {
         %orig(1.0);
         return;
     }
@@ -347,220 +497,90 @@ static void endFeedSearchInPlace(void) {
 
 %end
 
-#pragma mark - Search toolbar: keep it in place (don't dock to the top)
+// MARK: - "Keep Search Bar In Place": pin the toolbar
+//
+// In-place only. Apollo's takeover drives the toolbar from its resting band (y≈navBottom, h=45) up to
+// the docked position (h≈99). We pin it to its resting band so it stays under the still-visible nav bar:
+// origin.y = nav-bar window-bottom (in the toolbar's superview space), height 45. Released once the user
+// scrolls so the toolbar rides content normally.
+@interface _TtC6Apollo19ApolloSearchToolbar : UIView
+@end
 
 %hook _TtC6Apollo19ApolloSearchToolbar
 
-// Pin by *screen* Y while docked so it stays exactly in place through the
-// takeover's reparent + animation, and keep it 45pt tall (not the docked 99).
 - (void)setFrame:(CGRect)frame {
-    UIView *sup = [(UIView *)self superview];
-    // Pin the toolbar to its resting screen-Y while:
-    //   (a) it's docked on the VC view during the takeover, OR
-    //   (b) it's being reparented back into OUR feed during teardown.
-    // (b) kills the "search bar drops from the top" on Cancel: Apollo briefly sets
-    // the toolbar's content-y to -161 (screen 0, the very top) and animates it down
-    // to its rest; we override every set so it snaps straight to the resting Y.
-    BOOL teardownInFeed = sDismissing && (UIView *)self == sActiveSearchToolbar &&
-                          sup != nil && sup == sSearchFeed;
-    if (feedToolbarDocked((UIView *)self) || teardownInFeed) {
-        CGFloat supScreenY = [sup convertPoint:CGPointZero toView:nil].y;
-        if (teardownInFeed) [[(UIView *)self layer] removeAnimationForKey:@"position"];
-        %orig(CGRectMake(frame.origin.x, sInPlaceToolbarY - supScreenY,
-                         frame.size.width, sInPlaceToolbarH));
+    if (!IsLiquidGlass() || !sKeepSearchBarInPlace ||
+        (!sFeedSearchActive && !sFeedSearchDismissing) ||
+        sFeedSearchScrolledByUser || (UIView *)self != sFeedSearchToolbar) {
+        %orig;
         return;
     }
-    %orig;
+    UIView *sup = [(UIView *)self superview];
+    UINavigationBar *nb = sFeedSearchNavBar;
+    if (!sup || !nb || !nb.window) { %orig; return; }
+
+    CGFloat windowTopY = CGRectGetMaxY([nb convertRect:nb.bounds toView:nil]); // nav bottom, window space
+    if (windowTopY <= 1.0) { %orig; return; }                                  // bar not laid out yet
+    CGFloat localTopY = [sup convertPoint:CGPointMake(0.0, windowTopY) fromView:nil].y;
+
+    CGRect pinned = frame;
+    pinned.origin.y = localTopY;
+    pinned.size.height = 45.0; // == Apollo's toolbarHeight ivar; never let it grow to ~99
+    %orig(pinned);
 }
 
-// Top safe-area = 0 keeps the SwiftUI content at field local-y 0 / height 45.
+// Each layout pass while searching (both modes): keep the round-X styled/placed and run its slide-in.
+// In-place during dismiss, also strip Apollo's teardown animations off the toolbar + field so nothing
+// flies in from the docked-top geometry.
+- (void)layoutSubviews {
+    %orig;
+    if (!IsLiquidGlass() || (UIView *)self != sFeedSearchToolbar ||
+        (!sFeedSearchActive && !sFeedSearchDismissing)) {
+        return;
+    }
+    recenterCancelButton(); // round-X styling + slide-in
+
+    if (sKeepSearchBarInPlace && sFeedSearchDismissing) {
+        CALayer *tl = [(UIView *)self layer];
+        [tl removeAnimationForKey:@"position"];
+        [tl removeAnimationForKey:@"bounds"];
+        UIView *field = sFeedSearchField;
+        if (field) {
+            CALayer *fl = field.layer;
+            [fl removeAnimationForKey:@"position"];
+            [fl removeAnimationForKey:@"bounds"];
+            [fl removeAnimationForKey:@"bounds.size"];
+            [fl removeAnimationForKey:@"opacity"];
+        }
+    }
+}
+
+// In-place: zero the captured toolbar's top safe-area inset so the field/button row stays in the 45pt band.
 - (UIEdgeInsets)safeAreaInsets {
     UIEdgeInsets insets = %orig;
-    if (feedToolbarDocked((UIView *)self)) insets.top = 0.0;
+    if (IsLiquidGlass() && sKeepSearchBarInPlace &&
+        (sFeedSearchActive || sFeedSearchDismissing) &&
+        (UIView *)self == sFeedSearchToolbar) {
+        insets.top = 0.0;
+    }
     return insets;
 }
 
-- (void)layoutSubviews {
-    %orig;
-    UIView *tbv = (UIView *)self;
-    if (sFeedSearchActive && tbv == sActiveSearchToolbar) {
-        recenterCancelButton();
-    }
-    // "Find in Comments" bar: when active it reparents onto the VC view (docked) and
-    // floats transparently over the comments, so Done / the find field / the up-down
-    // chevrons sit unreadably over the comment text behind them. Give the whole row a
-    // solid backing while active; restore it (transparent) at its resting pill.
-    if (isCommentToolbar(tbv)) {
-        if (toolbarDocked(tbv)) {
-            UIColor *solid = [UIColor systemBackgroundColor];
-            if (![tbv.backgroundColor isEqual:solid]) {
-                tbv.backgroundColor = solid;
-                tbv.opaque = YES;
-            }
-        } else if (tbv.backgroundColor != nil) {
-            tbv.backgroundColor = nil;
-        }
-    }
-}
-
-// Kill the on-tap blank: the takeover reparents the toolbar onto the VC's view,
-// but its frame still carries the feed content-y (~-45 => off-screen above in the
-// VC's coordinate space) for a frame or two until the animation moves it. Pin it
-// on-screen the instant it docks (this fires ~7ms before the active flag is set,
-// so it bridges the gap the flag-gated pin used to miss).
-- (void)didMoveToSuperview {
-    %orig;
-    if (feedToolbarDocked((UIView *)self)) {
-        [(UIView *)self setFrame:[(UIView *)self frame]]; // re-routes through the pin above
-    }
-    // Reliable end-of-search signal: the active toolbar reparents back INTO the feed
-    // scroll view (un-docks) only when the takeover actually ends. Since we no longer
-    // tear down on resignFirstResponder (that fired on mere navigation), this catches
-    // any dismiss path — incl. ones that never tap the X — without the false teardowns.
-    UIView *sup = [(UIView *)self superview];
-    if ((UIView *)self == sActiveSearchToolbar && sFeedSearchActive && !sDismissing &&
-        sup && sup == sSearchFeed) { // back in OUR feed specifically (not any transient scroll view)
-        endFeedSearchInPlace();
-    }
-}
-
 %end
 
-#pragma mark - Feed table: push the results below the in-place field
-
-%hook ASTableView
-
-- (void)setContentInset:(UIEdgeInsets)inset {
-    // PERMANENT pin (both states): hold the top inset at the in-place field's
-    // bottom so the field always rests just below the nav bar and the first row /
-    // results sit directly under it. Inactive Apollo rests it ~8pt higher (field
-    // tucked under the nav row); the takeover shrinks it to the docked position.
-    // We never let it drop below the field bottom — but allow it to GROW (e.g.
-    // pull-to-refresh), so use a floor rather than an exact set.
-    if ((UIScrollView *)self == sSearchFeed) {
-        CGFloat want = inPlaceInsetTop((UIScrollView *)self);
-        if (inset.top < want) inset.top = want;
-    }
-    %orig(inset);
-}
-
-- (void)setContentOffset:(CGPoint)offset {
-    if ((UIScrollView *)self == sSearchFeed) {
-        UIScrollView *sv = (UIScrollView *)self;
-        CGFloat rest = -inPlaceInsetTop(sv); // true top rest for the held inset
-        BOOL userScrolling = sv.isDragging || sv.isDecelerating;
-        // Track who is driving the scroll: a finger drag arms "user scrolled" (so we
-        // stop fighting their browsing); returning to the top re-arms the clamp.
-        if (sv.isDragging) sFeedScrolledByUser = YES;
-        else if (offset.y <= rest + 1.0) sFeedScrolledByUser = NO;
-        if (sDismissing && !userScrolling) {
-            // Teardown: Apollo's deactivate animates the feed offset UP toward its
-            // docked rest, which floats the field to the top of the screen (~y=47)
-            // and then visibly drops it back down to its resting spot — the jarring
-            // "search bar drops from the top" the user reported on Cancel. Hold the
-            // feed at its resting top so the field never moves. Clamp only upward
-            // motion (offset above rest); a user mid-scroll is exempt.
-            if (offset.y > rest) offset.y = rest;
-        } else if (sFeedSearchActive && !sDismissing && !userScrolling &&
-                   !sFeedScrolledByUser && offset.y > rest) {
-            // Hold the feed at its resting top against Apollo's PROGRAMMATIC scroll-ups:
-            // on focus and on each keystroke Apollo scrolls the feed up to surface the
-            // results, which in a subreddit visibly shifts the banner upward as soon as
-            // you type. Clamp those to the rest position so nothing moves — but only
-            // until the user themselves drags (sFeedScrolledByUser), so they can still
-            // scroll down through results without being yanked back to the top. Also
-            // fixes the Home empty-query clip (Apollo's docked-inset offset).
-            offset.y = rest;
-        }
-    }
-    %orig(offset);
-}
-
-%end
-
-#pragma mark - Feed list controller: own the flag + keep geometry in place
-
-%hook _TtC6Apollo21ASTableViewController
-
-- (void)textFieldDidBeginEditing:(UITextField *)textField {
-    %orig;
-    // Only the feed/subreddit search (comments search sets commentsSearch).
-    if (!isSearchableFeedVC(self)) return;
-
-    sSearchGen++; // invalidate any pending teardown
-    sFeedSearchActive = YES;
-    sDismissing = NO;
-    sCancelNeedsIntro = YES; // give the Cancel button a clean horizontal slide-in
-    sActiveSearchVC = (UIViewController *)self;
-    sActiveSearchToolbar = (UIView *)ivarObject(self, "upperToolbar") ?: textField.superview;
-    sActiveSearchField = (UITextField *)ivarObject(self, "searchTextField") ?: textField;
-    sActiveNavBar = [(UIViewController *)self navigationController].navigationBar;
-    UIScrollView *feed = feedScrollView((UIViewController *)self);
-    if (feed) sSearchFeed = feed;
-    sFeedScrolledByUser = NO; // re-arm the programmatic-scroll clamp for this session
-    // The feed already rests at the field's bottom (the inset is held there in
-    // both states), so activation moves nothing. Just re-pin the offset so a stale
-    // scroll position can't leave the first row clipped under the field.
-    if (sSearchFeed) {
-        CGPoint off = sSearchFeed.contentOffset;
-        off.y = -inPlaceInsetTop(sSearchFeed);
-        sSearchFeed.contentOffset = off;
-    }
-    ApolloLog(@"[SearchInPlace] feed search began (toolbar=%p feed=%p)",
-              sActiveSearchToolbar, sSearchFeed);
-}
-
-- (void)dismissSearchBarButtonTappedWithSender:(id)sender {
-    %orig;
-    if ((UIViewController *)self == sActiveSearchVC) {
-        // NB: %orig already un-docked the toolbar, so the didMoveToSuperview handler
-        // has usually started teardown (sDismissing=YES) by now. animateCancelOut only
-        // touches the X's own transform animation, so it's order-independent; the
-        // endFeedSearchInPlace here is a guarded no-op if teardown already began.
-        animateCancelOut();
-        endFeedSearchInPlace();
-    }
-}
-
-- (void)viewDidLayoutSubviews {
-    %orig;
-    // Anchor the in-place rest position to the nav bar's bottom (the spot the
-    // field holds), and remember the feed + toolbar height so the permanent inset
-    // pin (in ASTableView's setContentInset) knows where the field's bottom is.
-    // Runs in both states; robust across device/safe-area (defaults are fallback).
-    if (isSearchableFeedVC(self)) {
-        UINavigationBar *nb = [(UIViewController *)self navigationController].navigationBar;
-        if (nb && [nb window]) {
-            CGFloat navMaxY = CGRectGetMaxY([nb convertRect:[nb bounds] toView:nil]);
-            if (navMaxY > 20.0 && navMaxY < 200.0) sInPlaceToolbarY = navMaxY;
-        }
-        UIView *tb = (UIView *)ivarObject(self, "upperToolbar");
-        if (tb) sFeedToolbar = tb; // the feed's own search toolbar (scopes the docked pins)
-        CGFloat h = tb ? CGRectGetHeight(tb.bounds) : 0.0;
-        if (h > 1.0 && h < 80.0) sInPlaceToolbarH = h;
-        UIScrollView *feed = feedScrollView((UIViewController *)self);
-        if (feed) sSearchFeed = feed;
-    }
-    if (sFeedSearchActive && (UIViewController *)self == sActiveSearchVC) {
-        recenterCancelButton();
-    }
-}
-
-%end
-
-#pragma mark - Search field: end search when it resigns
+// MARK: - Search field gap (in-place mode only)
+//
+// In-place we place the button by hand, so clamp the field's right edge to leave room for the circle.
+// OFF mode gets the field width from Apollo's sizeThatFits-driven math, so we don't touch it here.
+@interface _TtC6Apollo24ApolloSearchBarTextField : UITextField
+@end
 
 %hook _TtC6Apollo24ApolloSearchBarTextField
 
-// Clamp the field's width so its right edge never passes the gap before the X circle.
-// Apollo animates the field's frame on activation; by clamping the target here (the
-// field's single source of truth) rather than snapping a different width from a layout
-// pass, the shrink animation flows straight to the gap with no overshoot/bounce-back.
-// Gated on the feed toolbar being docked (engages at the takeover, before the active
-// flag) and released during teardown so Apollo can grow the field back full-width.
 - (void)setFrame:(CGRect)frame {
     UIView *sup = [(UIView *)self superview];
-    if (sup && sup == sFeedToolbar && toolbarDocked(sup) && !sDismissing) {
+    if (IsLiquidGlass() && sKeepSearchBarInPlace && sFeedSearchActive && !sFeedSearchDismissing &&
+        sup && sup == sFeedSearchToolbar) {
         CGFloat maxRight = fieldMaxRight(sup);
         if (frame.origin.x < maxRight && CGRectGetMaxX(frame) > maxRight) {
             frame.size.width = maxRight - frame.origin.x;
@@ -569,26 +589,8 @@ static void endFeedSearchInPlace(void) {
     %orig(frame);
 }
 
-- (BOOL)resignFirstResponder {
-    BOOL ok = %orig;
-    // NB: do NOT tear down here. The field resigns on ANY keyboard dismissal —
-    // tapping a result, "Search all posts", another tab — none of which dismiss the
-    // search (the field stays docked showing results). Tearing down here desynced our
-    // state from the still-active search (field flush to X / results behind field /
-    // nav gone after navigating away and back). The real dismiss is the X button
-    // (dismissSearchBarButtonTappedWithSender:) or the toolbar un-docking; both are
-    // handled there. (On an X tap, resign also fires, but the X path already ran the
-    // teardown — this was redundant anyway.)
-    return ok;
-}
-
 %end
 
-#pragma mark - ctor
-
 %ctor {
-    @autoreleasepool {
-        %init;
-        ApolloLog(@"[SearchInPlace] module loaded");
-    }
+    %init;
 }

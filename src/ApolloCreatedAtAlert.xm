@@ -130,8 +130,10 @@ static void ApolloPresentCreatedAtAlert(NSDate *createdAt, ApolloASDisplayNode *
 }
 
 // YES if `touch` falls inside `targetNode`'s layer (in containerView coords),
-// padded for comfortable touch targets. Works for layer-backed nodes too.
-static BOOL ApolloTouchHitsNode(ApolloASDisplayNode *targetNode, UIView *containerView, UITouch *touch) {
+// padded by (padX, padY) for a comfortable touch target. Negative pad values
+// grow the rect. Works for layer-backed nodes too.
+static BOOL ApolloTouchHitsNode(ApolloASDisplayNode *targetNode, UIView *containerView, UITouch *touch,
+                                CGFloat padX, CGFloat padY) {
     if (!targetNode || targetNode.isHidden || !containerView || !touch) return NO;
 
     CALayer *targetLayer = nil;
@@ -141,7 +143,7 @@ static BOOL ApolloTouchHitsNode(ApolloASDisplayNode *targetNode, UIView *contain
     CGRect rect = [targetLayer convertRect:targetLayer.bounds toLayer:containerView.layer];
     if (CGRectIsEmpty(rect) || CGRectIsNull(rect) || CGRectIsInfinite(rect)) return NO;
 
-    rect = CGRectInset(rect, -10.0, -8.0);
+    rect = CGRectInset(rect, -padX, -padY);
     CGPoint pt = [touch locationInView:containerView];
     return CGRectContainsPoint(rect, pt);
 }
@@ -186,7 +188,15 @@ static BOOL ApolloAgeTapShouldReceiveTouch(id cell, UIGestureRecognizer *gr, UIT
     UIView *cellView = nil;
     @try { cellView = [(ApolloASDisplayNode *)cell view]; } @catch (__unused id e) {}
     ApolloASDisplayNode *ageNode = ApolloAgeDisplayNodeForCell(cell);
-    return ApolloTouchHitsNode(ageNode, cellView, touch);
+
+    // The label is wide but short, so keep padding small and symmetric;
+    // compact cells get a tighter target since rows are packed.
+    CGFloat padX = 5.0, padY = 5.0;
+    if ([cell isKindOfClass:NSClassFromString(@"_TtC6Apollo19CompactPostCellNode")]) {
+        padX = 2.0;
+        padY = 2.0;
+    }
+    return ApolloTouchHitsNode(ageNode, cellView, touch, padX, padY);
 }
 
 static void ApolloAgeTapFired(id cell, UITapGestureRecognizer *tap) {
