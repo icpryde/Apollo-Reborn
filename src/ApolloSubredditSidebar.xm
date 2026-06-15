@@ -1133,24 +1133,18 @@ static void ApolloSBBuildSidebarSections(UIViewController *vc, NSDictionary *roo
     long long subsCount = idCardSubs > 0 ? idCardSubs : MAX(rdkSubs, 0LL);
     NSString *subsLabel = ApolloSBString(idCard[@"subscribersText"]);
     if (subsLabel.length == 0) subsLabel = @"Subscribers";
-    NSString *createdStr = nil;
-    if (rdkSub) {
-        NSDate *created = ((NSDate *(*)(id, SEL))objc_msgSend)(rdkSub, sel_registerName("createdUTC"));
-        if ([created isKindOfClass:[NSDate class]]) {
-            static NSDateFormatter *fmt; static dispatch_once_t once;
-            dispatch_once(&once, ^{ fmt = [[NSDateFormatter alloc] init]; fmt.dateFormat = @"MMM yyyy"; });
-            createdStr = [fmt stringFromDate:created];
-        }
-    }
     // Stats: Subscribers + weekly Visitors + Contributions. Visitors/Contributions
-    // come from the desktop reddit.com page (scraped async — see ApolloSBFetchWebStats);
-    // until they land we show Subscribers + Created, then swap in the 3-stat row.
+    // come from the desktop reddit.com page (scraped async — see ApolloSBFetchWebStats).
+    // To avoid a layout switch, we render all 3 columns immediately with the
+    // Visitors/Contributions VALUES blank (a height-reserving space) until the scrape
+    // lands, then fill them in — the column count + spacing never change. A failed
+    // scrape simply leaves the two values blank.
     NSString *subsLabelC = subsLabel; long long subsCountC = subsCount;
     ASDisplayNode *(^build3)(NSNumber *, NSNumber *) = ^ASDisplayNode *(NSNumber *v, NSNumber *c) {
         return ApolloSBBuildStatsSection(@[
             ApolloSBMakeStatColumn(subsLabelC, subsCountC > 0 ? ApolloSBFormatCount(subsCountC) : @"—"),
-            ApolloSBMakeStatColumn(@"Visitors", v ? ApolloSBFormatCount(v.longLongValue) : @"—"),
-            ApolloSBMakeStatColumn(@"Contributions", c ? ApolloSBFormatCount(c.longLongValue) : @"—"),
+            ApolloSBMakeStatColumn(@"Visitors", v ? ApolloSBFormatCount(v.longLongValue) : @" "),
+            ApolloSBMakeStatColumn(@"Contributions", c ? ApolloSBFormatCount(c.longLongValue) : @" "),
         ]);
     };
 
@@ -1158,21 +1152,14 @@ static void ApolloSBBuildSidebarSections(UIViewController *vc, NSDictionary *roo
     __block BOOL statsInstalled = NO;
     __weak ASDisplayNode *weakScrollForStats = scrollNode;
     ApolloSBFetchWebStats(subredditName, ^(NSNumber *visitors, NSNumber *contributions) {
-        if (!visitors && !contributions) return;            // failure → keep the Created fallback
+        if (!visitors && !contributions) return;            // failure → leave the blank placeholders
         ASDisplayNode *node3 = build3(visitors, contributions);
-        if (statsInstalled) { ApolloSBReplaceStatsSection(weakScrollForStats, node3); } // async swap
+        if (statsInstalled) { ApolloSBReplaceStatsSection(weakScrollForStats, node3); } // fill in async
         else { warmStatsNode = node3; }                     // warm cache → install below
     });
 
-    ASDisplayNode *statsNode;
-    if (warmStatsNode) {
-        statsNode = warmStatsNode;
-    } else {
-        NSMutableArray *cols = [NSMutableArray array];
-        [cols addObject:ApolloSBMakeStatColumn(subsLabel, subsCount > 0 ? ApolloSBFormatCount(subsCount) : @"—")];
-        if (createdStr.length) [cols addObject:ApolloSBMakeStatColumn(@"Created", createdStr)];
-        statsNode = ApolloSBBuildStatsSection(cols);
-    }
+    // Warm cache → real numbers now; cold → 3 columns with blank V/C placeholders.
+    ASDisplayNode *statsNode = warmStatsNode ?: build3(nil, nil);
     ApolloSBAddSection(vc, scrollNode, statsNode, ApolloSBOrderStats, nil, UIEdgeInsetsMake(18, 16, 6, 16));
     statsInstalled = YES;
 
