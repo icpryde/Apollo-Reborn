@@ -46,23 +46,82 @@ static id ApolloObjectIvar(id object, const char *name) {
 // handling above, but its docked find bar is transparent, so the comments behind it bleed through the
 // Done button / chevrons. Detect it (its toolbar belongs to a CommentsViewController) and give it a solid
 // backing only while it's docked (active); restore it (transparent) at its resting pill.
-static BOOL isCommentToolbar(UIView *v) {
+
+// The CommentsViewController that owns a comment find-in-page bar (walk the responder chain), else nil.
+static UIViewController *commentsVCForView(UIView *v) {
     UIResponder *r = [v nextResponder];
     int guard = 0;
     while (r && guard++ < 40) {
         if ([r isKindOfClass:[UIViewController class]]) {
             const char *cls = object_getClassName(r);
-            if (cls && strstr(cls, "Comments")) return YES;
+            if (cls && strstr(cls, "Comments")) return (UIViewController *)r;
         }
         r = [r nextResponder];
     }
-    return NO;
+    return nil;
+}
+
+static BOOL isCommentToolbar(UIView *v) {
+    return commentsVCForView(v) != nil;
 }
 
 // The toolbar is "docked" (the active find-in-page layout) when it's been reparented off the scroll view.
 static BOOL toolbarDocked(UIView *toolbar) {
     UIView *sup = [toolbar superview];
     return sup != nil && ![sup isKindOfClass:[UIScrollView class]];
+}
+
+// Translucent backing for the docked comment find bar: a rounded blur-glass panel (like the Liquid Glass
+// chrome) rather than an opaque fill. Frosts the comments behind it — so it reads as glass, not a flat slab —
+// while keeping Done / Find / the chevrons legible. Inserted backmost (behind the bar's controls,
+// non-interactive) and removed at the resting pill so the resting state is untouched.
+//
+// Tunables (easy to adjust to taste):
+static UIBlurEffectStyle const kCommentBlurStyle = UIBlurEffectStyleSystemThinMaterial; // ↑transparent: …UltraThin; ↓: …Chrome
+static const CGFloat kCommentBlurInsetX  = 3.0;   // side margins (small, so the rounded corner doesn't crowd Done / the chevrons)
+static const CGFloat kCommentBlurInsetY  = 4.0;   // top/bottom margins
+static const CGFloat kCommentBlurCorner  = 14.0;  // corner radius
+static const CGFloat kCommentDoneNudgeX  = 14.0;  // Done button → right (off the rounded corner, more centered)
+static const CGFloat kCommentDoneNudgeY  = -6.0;  // Done button ↑ up (Apollo sits it a touch low)
+static const void *kCommentBlurKey = &kCommentBlurKey;
+
+// Nudge the docked find bar's "Done" button (Apollo's leftmost button) right + up via a transform (idempotent,
+// doesn't compound across layout passes, and the tap target moves with it).
+static void nudgeCommentDoneButton(UIView *bar) {
+    UIButton *done = nil;
+    for (UIView *sv in bar.subviews) {
+        if ([sv isKindOfClass:[UIButton class]] &&
+            (!done || CGRectGetMinX(sv.frame) < CGRectGetMinX(done.frame))) {
+            done = (UIButton *)sv;
+        }
+    }
+    if (!done) return;
+    CGAffineTransform t = CGAffineTransformMakeTranslation(kCommentDoneNudgeX, kCommentDoneNudgeY);
+    if (!CGAffineTransformEqualToTransform(done.transform, t)) done.transform = t;
+}
+
+static void ensureCommentBlurBacking(UIView *bar) {
+    UIVisualEffectView *blur = objc_getAssociatedObject(bar, kCommentBlurKey);
+    if (!blur) {
+        blur = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:kCommentBlurStyle]];
+        blur.userInteractionEnabled = NO; // never intercept Done / Find / chevron taps
+        blur.clipsToBounds = YES;
+        blur.layer.cornerCurve = kCACornerCurveContinuous;
+        objc_setAssociatedObject(bar, kCommentBlurKey, blur, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    if (blur.superview != bar) [bar insertSubview:blur atIndex:0];
+    else if (bar.subviews.firstObject != blur) [bar sendSubviewToBack:blur]; // stay behind the controls
+    CGRect r = CGRectInset(bar.bounds, kCommentBlurInsetX, kCommentBlurInsetY);
+    blur.frame = r;
+    blur.layer.cornerRadius = MIN(kCommentBlurCorner, CGRectGetHeight(r) / 2.0);
+    if (bar.backgroundColor != nil) bar.backgroundColor = nil; // let the blur show through
+    bar.opaque = NO;
+}
+
+static void removeCommentBlurBacking(UIView *bar) {
+    UIVisualEffectView *blur = objc_getAssociatedObject(bar, kCommentBlurKey);
+    if (blur.superview) [blur removeFromSuperview];
+    if (bar.backgroundColor != nil) bar.backgroundColor = nil;
 }
 
 // MARK: - Nav-bar hide
@@ -561,15 +620,12 @@ static void recenterCancelButton(void) {
     %orig;
     // "Find in Comments" bar (in-thread search, excluded from the feed handling above): when it's docked
     // (active find-in-page) it's transparent, so the comments behind it bleed through Done / the chevrons.
-    // Give it a solid backing while docked; restore it (transparent) at its resting pill.
+    // Back it with a blur material (frosted glass) while docked so it's legible but still translucent — it
+    // tracks light/dark and matches the Liquid Glass chrome; clear it back at the resting pill.
     if (isCommentToolbar((UIView *)self)) {
         UIView *tbv = (UIView *)self;
-        if (toolbarDocked(tbv)) {
-            UIColor *solid = [UIColor systemBackgroundColor];
-            if (![tbv.backgroundColor isEqual:solid]) { tbv.backgroundColor = solid; tbv.opaque = YES; }
-        } else if (tbv.backgroundColor != nil) {
-            tbv.backgroundColor = nil;
-        }
+        if (toolbarDocked(tbv)) { ensureCommentBlurBacking(tbv); nudgeCommentDoneButton(tbv); }
+        else removeCommentBlurBacking(tbv);
     }
     if (!IsLiquidGlass() || (UIView *)self != sFeedSearchToolbar ||
         (!sFeedSearchActive && !sFeedSearchDismissing)) {
