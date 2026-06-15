@@ -916,6 +916,19 @@ static BOOL ApolloRangeTextLooksLikeBareURL(NSAttributedString *attr, NSRange ra
     return [text rangeOfString:path].location != NSNotFound;
 }
 
+// A comment/post inline GIF is written in markdown as `[GIF](url)` (or
+// `![gif](url)`), so once we render the GIF inline the decomposed text node
+// would still show a redundant "GIF" label directly beneath it. Issue #392:
+// when the link/alt text is exactly the default word "gif" we drop it (the GIF
+// is self-evidently a GIF). Custom alt text like `[my dancing cat](url)` is NOT
+// the default word, so it is kept and shown beneath the image as before.
+static BOOL ApolloRangeTextIsDefaultGIFLabel(NSAttributedString *attr, NSRange range) {
+    if (range.location + range.length > attr.string.length) return NO;
+    NSString *text = [[attr.string substringWithRange:range]
+                      stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return [text caseInsensitiveCompare:@"gif"] == NSOrderedSame;
+}
+
 static CGFloat ApolloAspectRatioFromURL(NSURL *url) {
     NSURLComponents *c = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
     NSString *w = nil, *h = nil;
@@ -2833,6 +2846,9 @@ static NSArray *ApolloBuildLeavesForTextNode(ASTextNode *textNode,
     NSMutableArray<NSNumber *> *isVideoURL = [NSMutableArray array];
     NSMutableArray<NSNumber *> *isImageChestURL = [NSMutableArray array];
     NSMutableArray<NSNumber *> *isBareURL = [NSMutableArray array];
+    // Issue #392: the link/alt text is just the default word "gif" — drop the
+    // redundant label beneath the inline GIF (custom alt text stays visible).
+    NSMutableArray<NSNumber *> *isDefaultGifLabel = [NSMutableArray array];
     NSMutableSet<NSString *> *seenAbs = [NSMutableSet set];
     NSUInteger imageChestPostLinkCount = ApolloUniqueImageChestPostLinkCount(attr);
     NSDictionary *hostMediaMetadata = ApolloMediaMetadataForHost(hostMarkdownNode);
@@ -2879,6 +2895,7 @@ static NSArray *ApolloBuildLeavesForTextNode(ASTextNode *textNode,
             if (!abs.length || [seenAbs containsObject:abs]) continue;
             BOOL imageChestURL = ApolloImageChestIsPostURL(url);
             BOOL bareURL = ApolloRangeTextLooksLikeBareURL(attr, fullRange, url);
+            BOOL defaultGifLabel = ApolloRangeTextIsDefaultGIFLabel(attr, fullRange);
             [seenAbs addObject:abs];
             ApolloRegisterInlineSuppressionURL(url);
             ApolloRegisterInlineSuppressionURL(normalized);
@@ -2888,6 +2905,7 @@ static NSArray *ApolloBuildLeavesForTextNode(ASTextNode *textNode,
             [isVideoURL addObject:@(isVideo)];
             [isImageChestURL addObject:@(imageChestURL)];
             [isBareURL addObject:@(bareURL)];
+            [isDefaultGifLabel addObject:@(defaultGifLabel)];
         }
     }];
 
@@ -2961,11 +2979,13 @@ static NSArray *ApolloBuildLeavesForTextNode(ASTextNode *textNode,
         [leaves addObjectsFromArray:prefixImageNodes];
 
         NSMutableAttributedString *remaining = [[attr attributedSubstringFromRange:pRange] mutableCopy];
-        // Reverse-order deletion of bare-URL ranges (paragraph-relative).
+        // Reverse-order deletion of redundant label ranges (paragraph-relative):
+        // bare URLs (the text just repeats the link) and default "GIF" labels
+        // (issue #392 — the GIF is shown inline, so its "GIF" caption is noise).
         for (NSInteger n = (NSInteger)pIdx.count - 1; n >= 0; n--) {
             NSUInteger ri = [pIdx[n] unsignedIntegerValue];
             NSRange r = [ranges[ri] rangeValue];
-            if ([isBareURL[ri] boolValue]) {
+            if ([isBareURL[ri] boolValue] || [isDefaultGifLabel[ri] boolValue]) {
                 [remaining deleteCharactersInRange:NSMakeRange(r.location - pStart, r.length)];
             }
         }
