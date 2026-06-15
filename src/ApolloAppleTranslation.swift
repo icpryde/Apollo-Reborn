@@ -119,6 +119,13 @@ final class ApolloAppleTranslationCoordinator: ObservableObject {
     // Decide and start the consumer for a source's stream. Runs once per source.
     private func startConsumer(src: String, tgt: String) {
         Task { @MainActor in
+            #if compiler(>=6.2)
+            // Built with the iOS 26 SDK (Xcode 26+ / Swift 6.2+): on iOS 26 use the
+            // headless TranslationSession(installedSource:target:) for installed pairs.
+            // It's owned/reusable and NOT view-anchored, so it survives the SwiftUI host
+            // re-renders that collapse a .translationTask-vended session under load.
+            // That initializer is iOS-26-SDK-only, so this whole branch is compiled out on
+            // older SDKs (e.g. CI on Xcode 16) and we fall through to the hosted probe.
             if #available(iOS 26.0, *) {
                 let s = self.makeLanguage(src)
                 let t = self.makeLanguage(tgt)
@@ -145,7 +152,10 @@ final class ApolloAppleTranslationCoordinator: ObservableObject {
                 }
                 return
             }
-            // iOS 18–25: no headless direct initializer -> hosted .translationTask probe.
+            #endif
+            // iOS 18–25, or built against an SDK without the headless initializer (Xcode
+            // < 26): a hosted .translationTask probe drives both translation and the
+            // one-time download sheet.
             appleTranslateLog.log("hosted session \(src, privacy: .public)->\(tgt, privacy: .public)")
             self.configs[src] = TranslationSession.Configuration(
                 source: self.makeLanguage(src),
@@ -156,7 +166,9 @@ final class ApolloAppleTranslationCoordinator: ObservableObject {
         }
     }
 
+    #if compiler(>=6.2)
     // Headless consumer: drains a source's jobs serially through a reused direct session.
+    // Only reachable from the iOS-26-SDK headless path above, so it's gated the same way.
     private func drainDirect(src: String, session: TranslationSession) async {
         guard let stream = streams[src] else { return }
         for await job in stream {
@@ -184,6 +196,7 @@ final class ApolloAppleTranslationCoordinator: ObservableObject {
             }
         }
     }
+    #endif
 
     // Fail every job for an unsupported source (so callers don't hang).
     private func drainFail(src: String, message: String) async {
