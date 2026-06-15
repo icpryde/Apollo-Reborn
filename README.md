@@ -57,6 +57,16 @@ Pre-built IPAs and AltStore Classic/SideStore/Feather sources are now available 
 - **User Profile Pictures**: Show Reddit user avatars next to usernames in feeds, comments, and user profiles (Settings > Custom API > Media > Show User Profile Pictures)
 - **Self-hosted Notifications** (advanced): Optionally route push registrations, watchers, and inbox checks through your own forked [apollo-backend](https://github.com/nickclyde/apollo-backend) instance instead of having those requests silently dropped (Settings > Custom API > Notification Backend)
 
+### Not seeing thumbnails or inline previews?
+
+> [!TIP]
+> If thumbnails or inline media previews aren't showing up, it's usually a Reddit account setting rather than a tweak issue. Open [old.reddit.com/prefs](https://old.reddit.com/prefs) and log in, then under the **Media** section:
+>
+> - Set **Thumbnails** to *"show thumbnails next to links"*
+> - Set **Media previews** to *"auto-expand media previews"*
+>
+> Save your preferences and relaunch Apollo.
+
 ### Self-hosted notifications (advanced)
 
 The legacy Apollo push backends went dark in June 2023 and are otherwise blocked by the tweak. If you run your own instance of [nickclyde/apollo-backend](https://github.com/nickclyde/apollo-backend) (with your own Reddit OAuth `CLIENT_ID` / `CLIENT_SECRET` baked into its env vars), you can set the URL under **Settings > Custom API > Notification Backend** and the tweak will route all `apollopushserver.xyz`, `beta.apollonotifications.com`, and `apolloreq.com` traffic to that host instead. Leave the field empty to keep the current "silently dropped" behavior.
@@ -195,8 +205,8 @@ Resulting `Info.plist` entry:
 
 Available patches:
 
-- **`--liquid-glass`** - enables the iOS 26 Liquid Glass UI and installs a pack of Liquid Glass icons that can be switched between in the tweak's in-app icon picker. Requires the Git LFS asset to be pulled first (`git lfs install && git lfs pull`); see the [Build](#build) note. `patch.sh` will refuse to run with an un-pulled pointer.
-- **`--liquid-glass-icons`** - installs the Liquid Glass icon catalog **only**, without the iOS 26 UI chrome (skips the `vtool` build-version bump that opts the app into the iOS 26 runtime, so legacy UIKit behaviors like the bottom-tab swipe gesture are preserved). Mutually exclusive with `--liquid-glass`. Same Git LFS requirement applies.
+- **`--liquid-glass`** - enables the iOS 26 Liquid Glass UI and installs a pack of Liquid Glass icons that can be switched between in the tweak's in-app icon picker.
+- **`--liquid-glass-icons`** - installs the Liquid Glass icon catalog **only**, without the iOS 26 UI chrome (skips the `vtool` build-version bump that opts the app into the iOS 26 runtime, so legacy UIKit behaviors like the bottom-tab swipe gesture are preserved). Mutually exclusive with `--liquid-glass`.
 - **`--url-schemes <list>`** - adds comma-separated URL schemes to `CFBundleURLTypes` (see [Custom Redirect URI](#custom-redirect-uri), obsolete on v3.1.0+).
 - **`--remove-code-signature`** - strips the existing code signature.
 
@@ -233,12 +243,8 @@ For the in-house four-variant IPA release flow, AltStore Classic/SideStore/Feath
 **Instructions:**
 1. `git clone https://github.com/Apollo-Reborn/Apollo-Reborn`
 2. `cd Apollo-Reborn`
-3. `git lfs install && git lfs pull` (see the note below)
-4. `git submodule update --init --recursive`
-5. `make package` or `make package THEOS_PACKAGE_SCHEME=rootless` for rootless variant
-
-> [!IMPORTANT]
-> The prebuilt Liquid Glass asset catalog (`liquid-glass/prebuilt/Assets.car`) is stored with [Git LFS](https://git-lfs.com). A plain `git clone` without git-lfs installed leaves a tiny text pointer in its place instead of the real ~80 MB file, which makes `patch.sh --liquid-glass` produce a broken IPA that crashes on launch. Run `git lfs install` (one-time per machine) followed by `git lfs pull` to fetch the real asset. Verify with `git lfs ls-files` — a `*` next to the file means it's present.
+3. `git submodule update --init --recursive`
+4. `make package` or `make package THEOS_PACKAGE_SCHEME=rootless` for rootless variant
 
 ## Contributors ✨
 
