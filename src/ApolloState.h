@@ -113,11 +113,21 @@ extern BOOL sEnableBulkTranslation;
 extern BOOL sAutoTranslateOnAppear;
 extern BOOL sTranslatePostTitles;
 extern NSString *sTranslationTargetLanguage;
-extern NSString *sTranslationProvider;
+extern NSString *sTranslationProvider; // @"google", @"libre", or @"apple"
 extern NSString *sLibreTranslateURL;
 extern NSString *sLibreTranslateAPIKey;
 // Lowercased 2-letter language codes the user has opted out of translating.
 extern NSArray<NSString *> *sTranslationSkipLanguages;
+
+#ifdef __OBJC__
+// Whether the on-device Apple translation backend (ApolloAppleTranslation.swift,
+// Translation.framework) can run on this OS. iOS 18.0+. Used to gate the "apple"
+// provider in Settings and during settings hydration.
+static inline BOOL IsAppleTranslationSupported(void) {
+    if (@available(iOS 18.0, *)) return YES;
+    return NO;
+}
+#endif
 
 // Tag filter feature (NSFW / Spoiler).
 extern BOOL sTagFilterEnabled;
