@@ -1210,6 +1210,7 @@ static void initializeRandomSources() {
                                     UDKeyImageUploadProvider: @(ImageUploadProviderImgur),
                                     UDKeyShowUserAvatars: @NO,
                                     UDKeyUseProfileAvatarTabIcon: @NO,
+                                    UDKeySocialLinksInProfile: @YES,
                                     UDKeyShowSubredditHeaders: @NO,
                                     UDKeyAutoHideTabBarShowOnIdle: @NO,
                                     UDKeyEnableBulkTranslation: @NO,
@@ -1283,6 +1284,7 @@ static void initializeRandomSources() {
     sImageUploadProvider = [[NSUserDefaults standardUserDefaults] integerForKey:UDKeyImageUploadProvider];
     sShowUserAvatars = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowUserAvatars];
     sUseProfileAvatarTabIcon = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyUseProfileAvatarTabIcon];
+    sSocialLinksInProfile = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeySocialLinksInProfile];
     sShowSubredditHeaders = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowSubredditHeaders];
     sAutoHideTabBarShowOnIdle = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyAutoHideTabBarShowOnIdle];
     sModernSubredditDividers = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyModernSubredditDividers];

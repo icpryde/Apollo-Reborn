@@ -26,6 +26,12 @@ extern NSInteger sUnmuteCommentsVideos;
 extern BOOL sProxyImgurDDG;
 extern BOOL sShowUserAvatars;
 extern BOOL sUseProfileAvatarTabIcon;
+// When ON, a redditor's profile social links (Buy Me a Coffee, Instagram, X, …) are
+// shown in the profile header between the username and bio: a tappable pill for a
+// single link, or a row of brand badges that opens a slide-up sheet for several.
+// Rendered inside the tweak's custom profile header, so it needs sShowUserAvatars ON.
+// See ApolloProfileSocialLinks.{h,m}.
+extern BOOL sSocialLinksInProfile;
 extern BOOL sShowSubredditHeaders;
 extern BOOL sAutoHideTabBarShowOnIdle;
 extern BOOL sModernSubredditDividers;

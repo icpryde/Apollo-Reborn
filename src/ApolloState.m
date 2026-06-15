@@ -25,6 +25,7 @@ NSInteger sUnmuteCommentsVideos = 0; // 0=Default, 1=Remember from Full Screen, 
 BOOL sProxyImgurDDG = NO;
 BOOL sShowUserAvatars = NO;
 BOOL sUseProfileAvatarTabIcon = NO;
+BOOL sSocialLinksInProfile = YES;
 BOOL sShowSubredditHeaders = NO;
 BOOL sAutoHideTabBarShowOnIdle = NO;
 BOOL sModernSubredditDividers = YES;
