@@ -26,6 +26,11 @@
 #import "ApolloCommon.h"
 #import "ApolloState.h"
 
+// Section builders / keys here are wired up incrementally; tolerate not-yet-used
+// ones under the project's -Werror without per-symbol annotations.
+#pragma clang diagnostic ignored "-Wunused-function"
+#pragma clang diagnostic ignored "-Wunused-variable"
+
 #pragma mark - Texture interfaces (runtime-bound)
 
 typedef NS_ENUM(unsigned char, ApolloSBStackDirection) {
@@ -108,6 +113,10 @@ static inline ApolloSBDimension ApolloSBAutoDim(void) { return (ApolloSBDimensio
 + (instancetype)insetLayoutSpecWithInsets:(UIEdgeInsets)insets child:(id)child;
 @end
 
+@interface ASRatioLayoutSpec : ASLayoutSpec
++ (instancetype)ratioLayoutSpecWithRatio:(CGFloat)ratio child:(id)child;
+@end
+
 #pragma mark - Class accessors
 
 static Class ApolloSBNodeClass(void)    { static Class c; static dispatch_once_t o; dispatch_once(&o, ^{ c = objc_getClass("ASDisplayNode"); }); return c; }
@@ -117,6 +126,7 @@ static Class ApolloSBControlClass(void) { static Class c; static dispatch_once_t
 static Class ApolloSBImageClass(void)   { static Class c; static dispatch_once_t o; dispatch_once(&o, ^{ c = objc_getClass("ASNetworkImageNode"); }); return c; }
 static Class ApolloSBStackClass(void)   { static Class c; static dispatch_once_t o; dispatch_once(&o, ^{ c = objc_getClass("ASStackLayoutSpec"); }); return c; }
 static Class ApolloSBInsetClass(void)   { static Class c; static dispatch_once_t o; dispatch_once(&o, ^{ c = objc_getClass("ASInsetLayoutSpec"); }); return c; }
+static Class ApolloSBRatioClass(void)   { static Class c; static dispatch_once_t o; dispatch_once(&o, ^{ c = objc_getClass("ASRatioLayoutSpec"); }); return c; }
 
 #pragma mark - Swift ivar helpers
 
@@ -180,6 +190,25 @@ static NSString *ApolloSBFormatCount(long long n) {
 static NSString *ApolloSBString(id v) { return [v isKindOfClass:[NSString class]] ? v : nil; }
 static long long ApolloSBLongLong(id v) { return [v isKindOfClass:[NSNumber class]] ? [v longLongValue] : 0; }
 
+// Normalize a section/widget title for fuzzy matching (lowercase, trimmed,
+// punctuation/leading "r/" stripped, collapsed whitespace).
+static NSString *ApolloSBNormTitle(NSString *s) {
+    if (![s isKindOfClass:[NSString class]]) return nil;
+    s = [[s lowercaseString] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSMutableString *out = [NSMutableString string];
+    for (NSUInteger i = 0; i < s.length; i++) {
+        unichar ch = [s characterAtIndex:i];
+        if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) [out appendFormat:@"%C", ch];
+        else if (ch == ' ' && out.length && [out characterAtIndex:out.length - 1] != ' ') [out appendString:@" "];
+    }
+    NSString *r = [out stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+    return r.length ? r : nil;
+}
+static void ApolloSBAddTitle(NSMutableSet<NSString *> *set, NSString *title) {
+    NSString *n = ApolloSBNormTitle(title);
+    if (n) [set addObject:n];
+}
+
 // Strip subreddit-emoji :tokens: from flair / label text for display.
 static NSString *ApolloSBStripEmojiTokens(NSString *raw) {
     if (raw.length == 0) return raw;
@@ -230,7 +259,10 @@ static NSString *ApolloSBStripEmojiTokens(NSString *raw) {
 }
 @end
 
-// Table-of-contents chip tap: scrolls the sidebar to the target section.
+static char kApolloSBCollapseTargetKey;  // ApolloSBCollapseTarget on a collapsible container (declared early for the TOC tap)
+
+// Table-of-contents chip tap: scrolls the sidebar to the target section (and
+// expands it if it's a collapsible section).
 @interface ApolloSBTOCTapTarget : NSObject
 @property (nonatomic, weak) ASDisplayNode *scrollNode;
 @property (nonatomic, weak) ASDisplayNode *targetSection;
@@ -240,6 +272,13 @@ static NSString *ApolloSBStripEmojiTokens(NSString *raw) {
 - (void)tocTapped:(id)sender {
     ASDisplayNode *scroll = self.scrollNode, *target = self.targetSection;
     if (!scroll || !target) return;
+    id collapseTarget = objc_getAssociatedObject(target, &kApolloSBCollapseTargetKey);
+    if ([collapseTarget respondsToSelector:@selector(expand)]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        [collapseTarget performSelector:@selector(expand)];
+#pragma clang diagnostic pop
+    }
     UIView *sv = scroll.view, *tv = target.view;
     if (![sv isKindOfClass:[UIScrollView class]] || !tv || !tv.superview) return;
     UIScrollView *scrollView = (UIScrollView *)sv;
@@ -470,15 +509,12 @@ static ASDisplayNode *ApolloSBBuildCommunityListSection(NSString *title, NSArray
     }
     if (rows.count == 0) return nil;
 
-    ASTextNode *titleNode = ApolloSBMakeTitleNode(title.length ? title : @"Related Communities");
-    NSMutableArray *children = [NSMutableArray arrayWithObject:titleNode];
-    [children addObjectsFromArray:rows];
-
+    // Body only (no title) — the caller wraps this in a collapsible header.
     ASDisplayNode *container = [[ApolloSBNodeClass() alloc] init];
     container.automaticallyManagesSubnodes = YES;
     container.layoutSpecBlock = ^ASLayoutSpec *(ASDisplayNode *n, struct CDStruct_90e057aa cs) {
         return [ApolloSBStackClass() stackLayoutSpecWithDirection:ApolloSBStackVertical spacing:12.0
-                                                   justifyContent:ApolloSBJustifyStart alignItems:ApolloSBAlignStretch children:children];
+                                                   justifyContent:ApolloSBJustifyStart alignItems:ApolloSBAlignStretch children:rows];
     };
     return container;
 }
@@ -546,22 +582,225 @@ static NSArray *ApolloSBLinksFromButtonWidget(NSDictionary *w) {
     return links;
 }
 
-static NSArray *ApolloSBLinksFromMenuWidget(NSDictionary *w) {
-    NSMutableArray *links = [NSMutableArray array];
-    for (NSDictionary *e in (NSArray *)w[@"data"]) {
-        if (![e isKindOfClass:[NSDictionary class]]) continue;
-        if ([e[@"children"] isKindOfClass:[NSArray class]]) {
-            for (NSDictionary *c in e[@"children"]) {
+// --- Image widget (banners / "Join our Discord" tiles) ---------------------
+
+static ASDisplayNode *ApolloSBBuildImageSection(NSDictionary *w, UIViewController *hostVC, NSMutableArray *tapTargets) {
+    NSArray *data = [w[@"data"] isKindOfClass:[NSArray class]] ? w[@"data"] : nil;
+    NSDictionary *img = [data.firstObject isKindOfClass:[NSDictionary class]] ? data.firstObject : nil;
+    NSString *url = ApolloSBString(img[@"url"]);
+    if (url.length == 0) return nil;
+    NSString *linkURL = ApolloSBString(img[@"linkUrl"]);
+    CGFloat iw = [img[@"width"] isKindOfClass:[NSNumber class]] ? [img[@"width"] doubleValue] : 0;
+    CGFloat ih = [img[@"height"] isKindOfClass:[NSNumber class]] ? [img[@"height"] doubleValue] : 0;
+    CGFloat ratio = (iw > 0 && ih > 0) ? (ih / iw) : 0.42; // height:width
+
+    ASNetworkImageNode *imageNode = [[ApolloSBImageClass() alloc] init];
+    imageNode.URL = [NSURL URLWithString:url];
+    imageNode.contentMode = UIViewContentModeScaleAspectFill;
+    imageNode.clipsToBounds = YES;
+    imageNode.cornerRadius = 10.0;
+    imageNode.placeholderColor = [UIColor secondarySystemFillColor];
+
+    NSString *title = ApolloSBString(w[@"shortName"]);
+    ASTextNode *titleNode = title.length ? ApolloSBMakeTitleNode(title) : nil;
+
+    ASControlNode *container = [[ApolloSBControlClass() alloc] init];
+    container.automaticallyManagesSubnodes = YES;
+    if (linkURL.length) {
+        ApolloSBLinkTapTarget *t = [[ApolloSBLinkTapTarget alloc] init];
+        t.urlString = linkURL;
+        t.hostVC = hostVC;
+        [tapTargets addObject:t];
+        [container addTarget:t action:@selector(linkTapped:) forControlEvents:kApolloSBControlEventTouchUpInside];
+    }
+    container.layoutSpecBlock = ^ASLayoutSpec *(ASDisplayNode *n, struct CDStruct_90e057aa cs) {
+        ASLayoutSpec *ratioSpec = [ApolloSBRatioClass() ratioLayoutSpecWithRatio:ratio child:imageNode];
+        if (!titleNode) return ratioSpec;
+        return [ApolloSBStackClass() stackLayoutSpecWithDirection:ApolloSBStackVertical spacing:10.0
+                                                   justifyContent:ApolloSBJustifyStart alignItems:ApolloSBAlignStretch children:@[titleNode, ratioSpec]];
+    };
+    return container;
+}
+
+// --- Collapsible section (tappable header + chevron; body hidden when collapsed) ---
+
+static NSAttributedString *ApolloSBChevronText(BOOL collapsed) {
+    // Down when collapsed ("tap to reveal below"), up when expanded; sized larger
+    // than the title so the disclosure affordance is clearly noticeable.
+    return [[NSAttributedString alloc] initWithString:(collapsed ? @"▾" : @"▴") attributes:@{
+        NSFontAttributeName: [UIFont systemFontOfSize:19.0 weight:UIFontWeightBold],
+        NSForegroundColorAttributeName: UIColor.secondaryLabelColor,
+    }];
+}
+
+static char kApolloSBCollapsedKey;       // NSNumber(BOOL) on the collapsible container
+
+@interface ApolloSBCollapseTarget : NSObject
+@property (nonatomic, weak) ASDisplayNode *container;
+@property (nonatomic, weak) ASTextNode *chevron;
+@property (nonatomic, weak) ASDisplayNode *scrollNode;
+@property (nonatomic, weak) ASDisplayNode *relayoutNode; // intervening section container for NESTED collapsibles; nil at top level
+- (void)toggle:(id)sender;
+- (void)expand;
+@end
+@implementation ApolloSBCollapseTarget
+- (void)applyCollapsed:(BOOL)collapsed {
+    ASDisplayNode *c = self.container;
+    if (!c) return;
+    objc_setAssociatedObject(c, &kApolloSBCollapsedKey, collapsed ? @YES : nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    self.chevron.attributedText = ApolloSBChevronText(collapsed);
+    [c setNeedsLayout];
+    // A NESTED collapsible (e.g. a menu group inside the Community Bookmarks
+    // container) sits under an intervening container whose layoutSpecBlock captures
+    // its children by value and never reads collapsed state — so it can serve a
+    // cached layout and miss the grown child. Dirty it too. nil for top-level.
+    [self.relayoutNode setNeedsLayout];
+    [self.scrollNode setNeedsLayout];
+}
+- (void)toggle:(id)sender { [self applyCollapsed:![objc_getAssociatedObject(self.container, &kApolloSBCollapsedKey) boolValue]]; }
+- (void)expand { if ([objc_getAssociatedObject(self.container, &kApolloSBCollapsedKey) boolValue]) [self applyCollapsed:NO]; }
+@end
+
+// Title for a PILL-STYLE group header (nested menu groups): matches the link cells
+// — 15pt semibold, centered — so a collapsible group reads as one of the bookmark
+// cells, distinguished only by its disclosure chevron.
+static ASTextNode *ApolloSBMakePillTitleNode(NSString *title) {
+    NSMutableParagraphStyle *para = [[NSMutableParagraphStyle alloc] init];
+    para.alignment = NSTextAlignmentCenter;
+    ASTextNode *node = [[ApolloSBTextClass() alloc] init];
+    node.attributedText = [[NSAttributedString alloc] initWithString:(title ?: @"") attributes:@{
+        NSFontAttributeName: [UIFont systemFontOfSize:15.0 weight:UIFontWeightSemibold],
+        NSForegroundColorAttributeName: UIColor.labelColor,
+        NSParagraphStyleAttributeName: para,
+    }];
+    return node;
+}
+
+// Wraps `body` under a tappable title-row header. `startCollapsed` hides the body
+// until the header (or its TOC tab) is tapped. `isSubSection` renders the header as
+// a PILL (matching the section's link cells) with a trailing disclosure chevron, so
+// a nested menu group looks like a bookmark cell you can tap to reveal its children;
+// top-level sections keep the plain 20pt-bold title row. `relayoutNode` is the
+// intervening section container to invalidate on toggle (nil for top-level).
+static ASDisplayNode *ApolloSBMakeCollapsibleEx(NSString *title, ASDisplayNode *body, BOOL startCollapsed,
+                                                BOOL isSubSection, ASDisplayNode *relayoutNode,
+                                                ASDisplayNode *scrollNode, NSMutableArray *tapTargets) {
+    if (!body) return nil;
+    ASTextNode *titleNode = isSubSection ? ApolloSBMakePillTitleNode(title) : ApolloSBMakeTitleNode(title);
+    ASTextNode *chevron = [[ApolloSBTextClass() alloc] init];
+    chevron.attributedText = ApolloSBChevronText(startCollapsed);
+
+    ASControlNode *header = [[ApolloSBControlClass() alloc] init];
+    header.automaticallyManagesSubnodes = YES;
+    if (isSubSection) {
+        // Pill header: same dark rounded background + padding as a link cell, with
+        // the title centered and the disclosure chevron pinned to the trailing edge.
+        // flexGrow on the title fills the row so the chevron sits at the right.
+        header.backgroundColor = [UIColor colorWithWhite:0.5 alpha:0.18];
+        header.cornerRadius = 12.0;
+        header.clipsToBounds = YES;
+        titleNode.style.flexGrow = 1.0;
+        titleNode.style.flexShrink = 1.0;
+        header.layoutSpecBlock = ^ASLayoutSpec *(ASDisplayNode *n, struct CDStruct_90e057aa cs) {
+            ASStackLayoutSpec *row = [ApolloSBStackClass() stackLayoutSpecWithDirection:ApolloSBStackHorizontal spacing:8.0
+                                                       justifyContent:ApolloSBJustifyStart alignItems:ApolloSBAlignCenter children:@[titleNode, chevron]];
+            return [ApolloSBInsetClass() insetLayoutSpecWithInsets:UIEdgeInsetsMake(11, 14, 11, 14) child:row];
+        };
+    } else {
+        header.layoutSpecBlock = ^ASLayoutSpec *(ASDisplayNode *n, struct CDStruct_90e057aa cs) {
+            return [ApolloSBStackClass() stackLayoutSpecWithDirection:ApolloSBStackHorizontal spacing:8.0
+                                                       justifyContent:ApolloSBJustifySpaceBetween alignItems:ApolloSBAlignCenter children:@[titleNode, chevron]];
+        };
+    }
+
+    ASDisplayNode *container = [[ApolloSBNodeClass() alloc] init];
+    container.automaticallyManagesSubnodes = YES;
+    objc_setAssociatedObject(container, &kApolloSBCollapsedKey, startCollapsed ? @YES : nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    ApolloSBCollapseTarget *t = [[ApolloSBCollapseTarget alloc] init];
+    t.container = container; t.chevron = chevron; t.scrollNode = scrollNode; t.relayoutNode = relayoutNode;
+    [tapTargets addObject:t];
+    objc_setAssociatedObject(container, &kApolloSBCollapseTargetKey, t, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [header addTarget:t action:@selector(toggle:) forControlEvents:kApolloSBControlEventTouchUpInside];
+
+    // Nested sub-sections hug their pills a little tighter (8pt header→body gap).
+    CGFloat innerSpacing = isSubSection ? 8.0 : 12.0;
+    container.layoutSpecBlock = ^ASLayoutSpec *(ASDisplayNode *node, struct CDStruct_90e057aa cs) {
+        BOOL collapsed = [objc_getAssociatedObject(node, &kApolloSBCollapsedKey) boolValue];
+        NSArray *children = collapsed ? @[header] : @[header, body];
+        return [ApolloSBStackClass() stackLayoutSpecWithDirection:ApolloSBStackVertical spacing:innerSpacing
+                                                   justifyContent:ApolloSBJustifyStart alignItems:ApolloSBAlignStretch children:children];
+    };
+    return container;
+}
+
+// Back-compat shim: existing top-level callers (community-list, etc.) keep the
+// 20pt-bold header, no sub-section styling, no nested relayout node.
+static ASDisplayNode *ApolloSBMakeCollapsible(NSString *title, ASDisplayNode *body, BOOL startCollapsed,
+                                              ASDisplayNode *scrollNode, NSMutableArray *tapTargets) {
+    return ApolloSBMakeCollapsibleEx(title, body, startCollapsed, NO, nil, scrollNode, tapTargets);
+}
+
+// Builds the "Community Bookmarks" section from a topbar "menu" widget. Top-level
+// entries are walked IN ORDER: a direct {text,url} entry renders as a normal pill
+// in place; a {text, children:[...]} entry renders as a COLLAPSED pill cell (looks
+// like a bookmark cell + disclosure chevron) that reveals its child pills on tap. A purely-flat
+// menu (no groups) yields title + pills in an 8pt vstack — byte-identical to the
+// old flat render. Rendered group names feed `widgetTitles` (may be nil) for bio
+// dedup. Returns nil when nothing renders (caller no-ops on a nil section).
+static ASDisplayNode *ApolloSBBuildMenuSection(NSString *title, NSDictionary *menuWidget, UIViewController *hostVC,
+                                               ASDisplayNode *scrollNode, NSMutableArray *tapTargets,
+                                               NSMutableSet<NSString *> *widgetTitles) {
+    NSArray *data = [menuWidget[@"data"] isKindOfClass:[NSArray class]] ? menuWidget[@"data"] : nil;
+    if (data.count == 0) return nil;
+
+    // The section container is created up front so each group's collapse target can
+    // invalidate it on toggle (nested relayout — its block captures children by value).
+    ASDisplayNode *container = [[ApolloSBNodeClass() alloc] init];
+    container.automaticallyManagesSubnodes = YES;
+
+    NSMutableArray *children = [NSMutableArray array]; // section children, IN ORDER
+    if (title.length) [children addObject:ApolloSBMakeTitleNode(title)];
+
+    for (id entryObj in data) {
+        if (![entryObj isKindOfClass:[NSDictionary class]]) continue;
+        NSDictionary *entry = (NSDictionary *)entryObj;
+
+        if ([entry[@"children"] isKindOfClass:[NSArray class]]) {
+            // GROUP / dropdown — collect valid child links in order.
+            NSMutableArray<NSDictionary *> *childLinks = [NSMutableArray array];
+            for (id c in (NSArray *)entry[@"children"]) {
                 if (![c isKindOfClass:[NSDictionary class]]) continue;
-                NSString *text = ApolloSBString(c[@"text"]), *url = ApolloSBString(c[@"url"]);
-                if (text.length && url.length) [links addObject:@{ @"text": text, @"url": url }];
+                NSString *ct = ApolloSBString(((NSDictionary *)c)[@"text"]), *cu = ApolloSBString(((NSDictionary *)c)[@"url"]);
+                if (ct.length && cu.length) [childLinks addObject:@{ @"text": ct, @"url": cu }];
+            }
+            if (childLinks.count == 0) continue;                          // empty group — skip entirely
+            NSString *realName = ApolloSBString(entry[@"text"]);
+            NSString *groupName = realName.length ? realName : @"More";   // defensive: unnamed group
+            ASDisplayNode *body = ApolloSBBuildLinkGroupSection(nil, childLinks, hostVC, tapTargets); // title==nil => body only
+            ASDisplayNode *group = ApolloSBMakeCollapsibleEx(groupName, body, /*startCollapsed=*/YES,
+                                                             /*isSubSection=*/YES, /*relayoutNode=*/container,
+                                                             scrollNode, tapTargets);
+            if (group) {
+                [children addObject:group];
+                if (widgetTitles && realName.length) ApolloSBAddTitle(widgetTitles, realName); // rendered-only dedup, skip "More"
             }
         } else {
-            NSString *text = ApolloSBString(e[@"text"]), *url = ApolloSBString(e[@"url"]);
-            if (text.length && url.length) [links addObject:@{ @"text": text, @"url": url }];
+            // DIRECT link — a normal pill in original position.
+            NSString *text = ApolloSBString(entry[@"text"]), *url = ApolloSBString(entry[@"url"]);
+            if (text.length == 0 || url.length == 0) continue;
+            [children addObject:ApolloSBMakeLinkPill(text, url, nil, nil, hostVC, tapTargets)];
         }
     }
-    return links;
+
+    // Nothing rendered beyond the title (or not even that) — no empty section header.
+    if (children.count == 0 || (title.length && children.count == 1)) return nil;
+
+    container.layoutSpecBlock = ^ASLayoutSpec *(ASDisplayNode *n, struct CDStruct_90e057aa cs) {
+        return [ApolloSBStackClass() stackLayoutSpecWithDirection:ApolloSBStackVertical spacing:8.0
+                                                   justifyContent:ApolloSBJustifyStart alignItems:ApolloSBAlignStretch children:children];
+    };
+    return container;
 }
 
 #pragma mark - Registry-based multi-section injector
@@ -579,7 +818,10 @@ static char kApolloSBSectionsKey;     // NSMutableArray<ApolloSBSection*> on scr
 static char kApolloSBWrappedKey;      // BOOL: layoutSpecBlock already wrapped
 static char kApolloSBTapTargetsKey;   // NSMutableArray on the VC (retains tap targets)
 static char kApolloSBInstalledKey;    // BOOL on the VC
+static char kApolloSBRevealedKey;     // BOOL on the VC: content already faded in (hide-until-built, anti-flash)
 static char kApolloSBCollapseHeaderKey; // BOOL on the header node
+static char kApolloSBWidgetTitlesKey;   // NSSet<NSString*> (normalized) on the sidebar markdown node, for bio dedup
+static char kApolloSBMarkdownBlocksKey; // NSMutableArray<@[node, attrText]> on a markdown node — blocks that rendered before titles were ready
 
 // Apollo's original spec (collapsed stats header + description/bio markdown) is
 // spliced into the section stack at this order — just under our stats (order 0),
@@ -688,6 +930,19 @@ static void ApolloSBAddSection(UIViewController *vc, ASDisplayNode *scrollNode, 
 
 #pragma mark - Sidebar VC hook
 
+// Anti-flash: viewDidLoad hides the sidebar content (alpha 0) so Apollo's native
+// layout never paints; once our sections are installed (or a safety timeout
+// fires) we fade the composed layout in. Idempotent — only the first call reveals.
+static void ApolloSBRevealSidebar(UIViewController *vc) {
+    if (!vc) return;
+    if ([objc_getAssociatedObject(vc, &kApolloSBRevealedKey) boolValue]) return;
+    objc_setAssociatedObject(vc, &kApolloSBRevealedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    UIView *v = vc.viewIfLoaded;
+    if (!v || v.alpha >= 1.0) return; // never hidden (e.g. early-return path)
+    [UIView animateWithDuration:0.22 delay:0 options:UIViewAnimationOptionCurveEaseOut
+                     animations:^{ v.alpha = 1.0; } completion:nil];
+}
+
 // Builds all sidebar sections. Called only once Apollo's nodes are ready (see
 // ApolloSBTryBuild). vc/root/subredditName/tapTargets come from the VC hook.
 static void ApolloSBBuildSidebarSections(UIViewController *vc, NSDictionary *root, NSString *subredditName, NSMutableArray *tapTargets) {
@@ -703,6 +958,12 @@ static void ApolloSBBuildSidebarSections(UIViewController *vc, NSDictionary *roo
 
     id rdkSub = ApolloSBReadObjectIvar(vc, "subreddit");
     ASDisplayNode *markdownNode = (ASDisplayNode *)ApolloSBReadObjectIvar(vc, "markdownNode");
+
+    // Titles of widgets we render — used to strip duplicate sections from the bio.
+    // "Rules" is always included (Apollo has a Rules button top-right).
+    NSMutableSet<NSString *> *widgetTitles = [NSMutableSet set];
+    ApolloSBAddTitle(widgetTitles, @"Rules");
+    ApolloSBAddTitle(widgetTitles, @"Subreddit Rules");
 
     // ---- Collapsible bio: clip the description markdown to ~2 lines + "Show more". ----
     NSString *mdSource = markdownNode ? ApolloSBReadSwiftStringIvar(markdownNode, "source") : nil;
@@ -760,6 +1021,7 @@ static void ApolloSBBuildSidebarSections(UIViewController *vc, NSDictionary *roo
         if (order.count == 0 || templates.count == 0) continue;
         ASDisplayNode *flair = ApolloSBBuildFlairSection(ApolloSBString(w[@"shortName"]), order, templates, subredditName, tapTargets);
         ApolloSBAddSection(vc, scrollNode, flair, ApolloSBOrderFlair, @"Flair", UIEdgeInsetsMake(20, 16, 0, 16));
+        ApolloSBAddTitle(widgetTitles, ApolloSBString(w[@"shortName"]) ?: @"Search by Flair");
         break;
     }
 
@@ -771,9 +1033,9 @@ static void ApolloSBBuildSidebarSections(UIViewController *vc, NSDictionary *roo
         for (NSString *wid in items) { if ([items[wid][@"kind"] isEqual:@"menu"]) { menuWidget = items[wid]; break; } }
     }
     if (menuWidget) {
-        NSArray *menuLinks = ApolloSBLinksFromMenuWidget(menuWidget);
-        ASDisplayNode *menuSection = ApolloSBBuildLinkGroupSection(@"Community Bookmarks", menuLinks, vc, tapTargets);
+        ASDisplayNode *menuSection = ApolloSBBuildMenuSection(@"Community Bookmarks", menuWidget, vc, scrollNode, tapTargets, widgetTitles);
         ApolloSBAddSection(vc, scrollNode, menuSection, ApolloSBOrderMenu, @"Bookmarks", UIEdgeInsetsMake(20, 16, 0, 16));
+        ApolloSBAddTitle(widgetTitles, @"Community Bookmarks");
     }
 
     // ---- button + community-list widgets (sidebar.order first, then any leftovers). ----
@@ -790,13 +1052,37 @@ static void ApolloSBBuildSidebarSections(UIViewController *vc, NSDictionary *roo
             NSString *shortName = ApolloSBString(w[@"shortName"]);
             ASDisplayNode *section = ApolloSBBuildLinkGroupSection(shortName, links, vc, tapTargets);
             ApolloSBAddSection(vc, scrollNode, section, seqOrder++, shortName ?: @"Links", UIEdgeInsetsMake(20, 16, 0, 16));
+            ApolloSBAddTitle(widgetTitles, shortName);
         } else if ([kind isEqualToString:@"community-list"]) {
             NSArray *data = [w[@"data"] isKindOfClass:[NSArray class]] ? w[@"data"] : nil;
             if (data.count == 0) continue;
+            NSString *shortName = ApolloSBString(w[@"shortName"]) ?: @"Related Communities";
+            ASDisplayNode *body = ApolloSBBuildCommunityListSection(shortName, data, vc, tapTargets);
+            // Long lists start collapsed so the sidebar stays compact; tap to reveal.
+            ASDisplayNode *section = ApolloSBMakeCollapsible(shortName, body, data.count > 5, scrollNode, tapTargets);
+            ApolloSBAddSection(vc, scrollNode, section, seqOrder++, shortName, UIEdgeInsetsMake(20, 16, 0, 16));
+            ApolloSBAddTitle(widgetTitles, shortName);
+        } else if ([kind isEqualToString:@"image"]) {
+            // Banner / "Join our Discord" image tiles — tap opens the linked URL.
             NSString *shortName = ApolloSBString(w[@"shortName"]);
-            ASDisplayNode *section = ApolloSBBuildCommunityListSection(shortName, data, vc, tapTargets);
-            ApolloSBAddSection(vc, scrollNode, section, seqOrder++, shortName ?: @"Communities", UIEdgeInsetsMake(20, 16, 0, 16));
+            ASDisplayNode *section = ApolloSBBuildImageSection(w, vc, tapTargets);
+            ApolloSBAddSection(vc, scrollNode, section, seqOrder++, shortName ?: @"Image", UIEdgeInsetsMake(20, 16, 0, 16));
+            ApolloSBAddTitle(widgetTitles, shortName);
         }
+    }
+
+    // Hand the rendered widget titles to the bio-dedup hook, then re-trim any bio
+    // blocks that rendered before the titles were ready (re-setting the text
+    // re-fires the setAttributedText hook, which now trims).
+    if (markdownNode && widgetTitles.count) {
+        objc_setAssociatedObject(markdownNode, &kApolloSBWidgetTitlesKey, widgetTitles, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        NSMutableArray *blocks = objc_getAssociatedObject(markdownNode, &kApolloSBMarkdownBlocksKey);
+        for (NSArray *b in [blocks copy]) {
+            ASTextNode *node = b[0];
+            NSAttributedString *orig = b[1];
+            if ([node respondsToSelector:@selector(setAttributedText:)]) node.attributedText = orig;
+        }
+        [blocks removeAllObjects];
     }
 
     // ---- Table of contents (built last, from all registered sections). ----
@@ -804,6 +1090,11 @@ static void ApolloSBBuildSidebarSections(UIViewController *vc, NSDictionary *roo
     ASDisplayNode *toc = ApolloSBBuildTOC(allSections, scrollNode, tapTargets);
     ApolloSBAddSection(vc, scrollNode, toc, ApolloSBOrderTOC, nil, UIEdgeInsetsMake(18, 16, 0, 16));
     ApolloLog(@"[Sidebar] r/%@ built (idCard=%d menu=%d toc=%d)", subredditName, idCard != nil, menuWidget != nil, toc != nil);
+
+    // Reveal on the next runloop turn, after Texture has applied the section
+    // relayout — so the fade shows the final composed layout, not a mid-reflow frame.
+    __weak UIViewController *weakVC = vc;
+    dispatch_async(dispatch_get_main_queue(), ^{ ApolloSBRevealSidebar(weakVC); });
 }
 
 // On a warm widget cache the fetch completion fires synchronously + early — before
@@ -846,10 +1137,100 @@ static void ApolloSBTryBuild(UIViewController *vc, NSDictionary *root, NSString 
     NSMutableArray *tapTargets = [NSMutableArray array];
     objc_setAssociatedObject(self, &kApolloSBTapTargetsKey, tapTargets, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
+    // Anti-flash: hide the content until our sections are built, so Apollo's native
+    // sidebar never paints under it. Reveal happens at the end of the build; a safety
+    // timeout guarantees we always fade in even if the build is delayed or fails.
+    ((UIViewController *)self).view.alpha = 0.0;
     __weak UIViewController *weakSelf = (UIViewController *)self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        ApolloSBRevealSidebar(weakSelf);
+    });
+
     ApolloSBFetchWidgets(subredditName, ^(NSDictionary *root) {
         ApolloSBTryBuild(weakSelf, root, subredditName, tapTargets, 0);
     });
+}
+
+%end
+
+#pragma mark - Bio dedup (strip markdown sections already shown as widgets)
+
+// Best-effort: removes markdown heading-sections whose title matches a widget we
+// already render (Rules, Community Bookmarks, Key Links, the community lists, …),
+// keeping unique sections. Heading runs are detected by their larger-than-body
+// font size; a section spans a heading to the next heading. Untouched if nothing
+// matches confidently.
+static NSAttributedString *ApolloSBTrimDuplicateSections(NSAttributedString *attr, NSSet<NSString *> *titles) {
+    if (attr.length == 0 || titles.count == 0) return attr;
+
+    // 1. Body font size = the size covering the most characters.
+    NSMutableDictionary<NSNumber *, NSNumber *> *sizeChars = [NSMutableDictionary dictionary];
+    [attr enumerateAttribute:NSFontAttributeName inRange:NSMakeRange(0, attr.length) options:0
+                  usingBlock:^(UIFont *font, NSRange range, BOOL *stop) {
+        if (![font isKindOfClass:[UIFont class]]) return;
+        NSNumber *k = @(round(font.pointSize));
+        sizeChars[k] = @([sizeChars[k] integerValue] + (NSInteger)range.length);
+    }];
+    CGFloat bodySize = 0; NSInteger bodyChars = -1;
+    for (NSNumber *k in sizeChars) if ([sizeChars[k] integerValue] > bodyChars) { bodyChars = [sizeChars[k] integerValue]; bodySize = k.doubleValue; }
+    if (bodySize <= 0) return attr;
+    CGFloat headingThreshold = bodySize + 1.0;
+
+    // 2. Heading runs (larger font), merging adjacent.
+    NSMutableArray<NSValue *> *headings = [NSMutableArray array];
+    [attr enumerateAttribute:NSFontAttributeName inRange:NSMakeRange(0, attr.length) options:0
+                  usingBlock:^(UIFont *font, NSRange range, BOOL *stop) {
+        if (![font isKindOfClass:[UIFont class]] || font.pointSize < headingThreshold) return;
+        if (headings.count) {
+            NSRange last = [headings.lastObject rangeValue];
+            if (NSMaxRange(last) == range.location) { headings[headings.count - 1] = [NSValue valueWithRange:NSUnionRange(last, range)]; return; }
+        }
+        [headings addObject:[NSValue valueWithRange:range]];
+    }];
+    if (headings.count == 0) return attr;
+
+    // 3. Mark sections whose heading matches a rendered widget title.
+    NSString *full = attr.string;
+    NSMutableArray<NSValue *> *deletes = [NSMutableArray array];
+    for (NSUInteger i = 0; i < headings.count; i++) {
+        NSRange h = [headings[i] rangeValue];
+        if (![titles containsObject:ApolloSBNormTitle([full substringWithRange:h])]) continue;
+        NSUInteger end = (i + 1 < headings.count) ? [headings[i + 1] rangeValue].location : attr.length;
+        [deletes addObject:[NSValue valueWithRange:NSMakeRange(h.location, end - h.location)]];
+    }
+    if (deletes.count == 0) return attr;
+
+    // 4. Delete back-to-front, trim leading whitespace.
+    NSMutableAttributedString *result = [attr mutableCopy];
+    for (NSInteger i = (NSInteger)deletes.count - 1; i >= 0; i--) {
+        NSRange r = [deletes[i] rangeValue];
+        if (NSMaxRange(r) <= result.length) [result deleteCharactersInRange:r];
+    }
+    NSCharacterSet *ws = [NSCharacterSet whitespaceAndNewlineCharacterSet];
+    while (result.length && [ws characterIsMember:[result.string characterAtIndex:0]]) [result deleteCharactersInRange:NSMakeRange(0, 1)];
+    return result;
+}
+
+%hook ASTextNode
+
+- (void)setAttributedText:(NSAttributedString *)attributedText {
+    Class mdc = objc_getClass("_TtC6Apollo12MarkdownNode");
+    if (mdc && [(id)self respondsToSelector:@selector(delegate)]) {
+        id del = ((id (*)(id, SEL))objc_msgSend)((id)self, @selector(delegate));
+        if ([del isKindOfClass:mdc]) {
+            NSSet *titles = objc_getAssociatedObject(del, &kApolloSBWidgetTitlesKey);
+            if (titles.count) { %orig(ApolloSBTrimDuplicateSections(attributedText, titles)); return; }
+            // Titles aren't stored yet — the bio renders before the async /api/widgets
+            // fetch lands. Remember long blocks (descriptions, not short comments) so
+            // the build can re-trim them once it knows which widgets exist.
+            if (attributedText.length > 150) {
+                NSMutableArray *blocks = objc_getAssociatedObject(del, &kApolloSBMarkdownBlocksKey);
+                if (!blocks) { blocks = [NSMutableArray array]; objc_setAssociatedObject(del, &kApolloSBMarkdownBlocksKey, blocks, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
+                [blocks addObject:@[(id)self, attributedText]];
+            }
+        }
+    }
+    %orig;
 }
 
 %end
