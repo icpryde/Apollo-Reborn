@@ -4,12 +4,24 @@
 
 static char kApolloUserFlairEditorPresentedKey;
 static char kApolloUserFlairCapturedOptionsKey;
+static char kApolloUserFlairCollapseModelKey;
 
 static const NSUInteger kApolloUserFlairMaxLength = 64;
+
+// The flair selector's flair options live in section 1 of its table.
+static const NSInteger kApolloUserFlairOptionsSection = 1;
+
+// Placeholder shown on the single collapsed "custom flair" row when a subreddit
+// uses the old (empty-template) flair system.
+static NSString *const kApolloUserFlairCustomRowText = @"Set custom flair…";
 
 static __thread __unsafe_unretained UIViewController *tApolloUserFlairCaptureController = nil;
 static __thread NSInteger tApolloUserFlairCaptureSection = NSNotFound;
 static __thread NSInteger tApolloUserFlairCaptureRow = NSNotFound;
+// While a collapsed "custom flair" cell is being built, this points at the
+// RDKFlairOption backing that row so its (otherwise empty) getters render the
+// placeholder text instead of nothing. Never mutates the model.
+static __thread __unsafe_unretained id tApolloUserFlairCustomRowOption = nil;
 
 @interface ApolloUserFlairOptionAdapter : NSObject
 @property (nonatomic, strong) id option;
@@ -667,35 +679,234 @@ static BOOL ApolloUserFlairMaybePresentEditorForOption(UIViewController *control
     return YES;
 }
 
+#pragma mark - Old Flair System Collapse
+//
+// Subreddits still on Reddit's "old" CSS-class flair system expose their flair
+// templates with NO text and NO emoji — only an editable flag and a UUID. On
+// mobile they are indistinguishable, so Apollo renders a wall of identical blank
+// rows (r/nintendo returns 346) and shows a scary "Apollo is unable to interact"
+// alert. We collapse every empty-but-editable template into a single, labelled
+// "Set custom flair…" row that opens the text editor, and suppress the alert.
+// Labelled templates (text or emoji) and ordinary (new-system) subreddits are
+// left exactly as Apollo presents them.
+
+// Returns the controller's flairOptions as an NSArray. The Swift
+// `[RDKFlairOption]?` ivar bridges to a _ContiguousArrayStorage which responds
+// to NSArray selectors (verified at runtime); nil/empty read back safely.
+static NSArray *ApolloUserFlairControllerOptions(UIViewController *controller) {
+    id raw = ApolloUserFlairRawObjectIvar(controller, @"flairOptions");
+    if ([raw isKindOfClass:[NSArray class]]) return (NSArray *)raw;
+    return nil;
+}
+
+// "Labelled" = something the user can actually tell apart: non-empty text or at
+// least one flair piece (e.g. an emoji-only flair).
+static BOOL ApolloUserFlairOptionIsLabeled(id option) {
+    NSString *text = ApolloUserFlairOptionText(option);
+    if (text.length > 0) return YES;
+    NSArray *flairs = ApolloUserFlairObjectArray(option, @[@"flairs"]);
+    return flairs.count > 0;
+}
+
+@interface ApolloUserFlairCollapseModel : NSObject
+@property (nonatomic) BOOL active;
+// displayRow -> real index into flairOptions
+@property (nonatomic, strong) NSArray<NSNumber *> *realRows;
+// real index of the single representative "custom flair" row (or NSNotFound)
+@property (nonatomic) NSInteger customRealRow;
+// identity of the flairOptions array this model was computed from
+@property (nonatomic) const void *sourcePtr;
+@end
+
+@implementation ApolloUserFlairCollapseModel
+@end
+
+static ApolloUserFlairCollapseModel *ApolloUserFlairBuildCollapseModel(NSArray *options) {
+    ApolloUserFlairCollapseModel *model = [ApolloUserFlairCollapseModel new];
+    model.customRealRow = NSNotFound;
+    model.active = NO;
+
+    NSMutableArray<NSNumber *> *labeledRows = [NSMutableArray array];
+    NSInteger firstEmptyEditable = NSNotFound;
+    NSInteger emptyEditableCount = 0;
+
+    for (NSInteger i = 0; i < (NSInteger)options.count; i++) {
+        id option = options[i];
+        if (ApolloUserFlairOptionIsLabeled(option)) {
+            [labeledRows addObject:@(i)];
+            continue;
+        }
+        BOOL editableKnown = NO;
+        BOOL editable = ApolloUserFlairOptionIsEditable(option, &editableKnown);
+        if (editableKnown && editable) {
+            emptyEditableCount++;
+            if (firstEmptyEditable == NSNotFound) firstEmptyEditable = i;
+        }
+        // Empty AND non-editable templates carry no usable information on mobile
+        // (no text, can't be typed into) — they are dropped from the collapsed list.
+    }
+
+    // Only collapse when the "endless blank rows" problem actually exists: two or
+    // more empty editable templates. One empty editable row is fine as-is.
+    if (emptyEditableCount >= 2 && firstEmptyEditable != NSNotFound) {
+        NSMutableArray<NSNumber *> *rows = [labeledRows mutableCopy];
+        [rows addObject:@(firstEmptyEditable)];
+        model.realRows = rows;
+        model.customRealRow = firstEmptyEditable;
+        model.active = YES;
+    }
+    return model;
+}
+
+static ApolloUserFlairCollapseModel *ApolloUserFlairCollapseModelFor(UIViewController *controller) {
+    if (!controller) return nil;
+    NSArray *options = ApolloUserFlairControllerOptions(controller);
+    if (!options) return nil;
+
+    ApolloUserFlairCollapseModel *cached = objc_getAssociatedObject(controller, &kApolloUserFlairCollapseModelKey);
+    if (cached && cached.sourcePtr == (__bridge const void *)options) return cached;
+
+    ApolloUserFlairCollapseModel *model = ApolloUserFlairBuildCollapseModel(options);
+    model.sourcePtr = (__bridge const void *)options;
+    objc_setAssociatedObject(controller, &kApolloUserFlairCollapseModelKey, model, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (model.active) {
+        ApolloLog(@"[UserFlair] old-flair collapse: %lu options -> %lu rows (custom row real index %ld)",
+            (unsigned long)options.count, (unsigned long)model.realRows.count, (long)model.customRealRow);
+    }
+    return model;
+}
+
+// One reusable RDKFlair carrying the placeholder text, so the collapsed row
+// renders through Apollo's normal flair cell layout instead of as a blank pill.
+static NSArray *ApolloUserFlairCustomRowSyntheticFlairs(void) {
+    static NSArray *cached = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Class flairClass = objc_getClass("RDKFlair");
+        SEL initSEL = @selector(initWithRawText:);
+        if (flairClass && [flairClass instancesRespondToSelector:initSEL]) {
+            id flair = ((id (*)(id, SEL, id))objc_msgSend)([flairClass alloc], initSEL, kApolloUserFlairCustomRowText);
+            if (flair) cached = @[flair];
+        }
+        if (!cached) {
+            // The synthetic flair is what makes the collapsed row render its label;
+            // without it the row falls back to Apollo's empty rendering (still a
+            // single collapsed row, just unlabelled). Surface the failure so a
+            // future RDKFlair API change doesn't degrade silently.
+            ApolloLog(@"[UserFlair] warning: could not build synthetic RDKFlair; custom-flair row will render unlabelled");
+        }
+    });
+    return cached;
+}
+
+// YES when the presenter chain contains Apollo's flair selector. Used to scope
+// alert suppression to that screen. NOTE: Apollo presents this alert *before* it
+// stores self.flairOptions (verified in the binary), so the collapse model is not
+// yet computable here — we deliberately key off the controller's presence, not
+// its model. The alert's title is unique to this one situation, so this is safe.
+static BOOL ApolloUserFlairPresenterHasFlairSelector(UIViewController *presenter) {
+    Class flairClass = objc_getClass("_TtC6Apollo27FlairSelectorViewController");
+    if (!flairClass) return NO;
+
+    NSMutableArray<UIViewController *> *candidates = [NSMutableArray array];
+    if (presenter) [candidates addObject:presenter];
+    if ([presenter isKindOfClass:[UINavigationController class]]) {
+        UINavigationController *nav = (UINavigationController *)presenter;
+        [candidates addObjectsFromArray:nav.viewControllers];
+    }
+    if (presenter.presentedViewController) [candidates addObject:presenter.presentedViewController];
+
+    for (UIViewController *candidate in candidates) {
+        if ([candidate isKindOfClass:flairClass]) return YES;
+    }
+    return NO;
+}
+
 #pragma mark - Hooks
+
+// Swallow Apollo's "Subreddit Uses 'Old' Flair System" alert app-wide. The alert
+// claims Apollo "is unable to properly interact" with the subreddit, which is no
+// longer true once we collapse the empty templates into a usable custom-flair
+// row. We only suppress it when Apollo's flair selector is the screen presenting
+// it (the alert is presented off the selector's nav container, not the controller
+// itself, hence this global hook); its title is unique to this one situation.
+%hook UIViewController
+
+- (void)presentViewController:(UIViewController *)viewControllerToPresent animated:(BOOL)flag completion:(void (^)(void))completion {
+    if ([viewControllerToPresent isKindOfClass:[UIAlertController class]]) {
+        NSString *title = [(UIAlertController *)viewControllerToPresent title] ?: @"";
+        if ([title localizedCaseInsensitiveContainsString:@"Old"] &&
+            [title localizedCaseInsensitiveContainsString:@"Flair System"] &&
+            ApolloUserFlairPresenterHasFlairSelector((UIViewController *)self)) {
+            ApolloLog(@"[UserFlair] suppressed old-flair-system alert (presenter=%@)", NSStringFromClass([self class]));
+            if (completion) completion();
+            return;
+        }
+    }
+    %orig;
+}
+
+%end
 
 %hook _TtC6Apollo27FlairSelectorViewController
 
+- (NSInteger)tableNode:(id)tableNode numberOfRowsInSection:(NSInteger)section {
+    if (section == kApolloUserFlairOptionsSection) {
+        ApolloUserFlairCollapseModel *model = ApolloUserFlairCollapseModelFor((UIViewController *)self);
+        if (model.active) return (NSInteger)model.realRows.count;
+    }
+    return %orig;
+}
+
 - (id)tableNode:(id)tableNode nodeBlockForRowAtIndexPath:(NSIndexPath *)indexPath {
-    id originalBlock = %orig;
-    if (!originalBlock || indexPath.section != 1) return originalBlock;
+    if (indexPath.section != kApolloUserFlairOptionsSection) return %orig;
+
+    // Map the displayed row back to the real flairOptions index when collapsed.
+    ApolloUserFlairCollapseModel *model = ApolloUserFlairCollapseModelFor((UIViewController *)self);
+    NSInteger realRow = indexPath.row;
+    BOOL isCustomRow = NO;
+    NSIndexPath *effectiveIndexPath = indexPath;
+    if (model.active) {
+        if (indexPath.row < 0 || indexPath.row >= (NSInteger)model.realRows.count) return %orig;
+        realRow = [model.realRows[indexPath.row] integerValue];
+        isCustomRow = (realRow == model.customRealRow);
+        effectiveIndexPath = [NSIndexPath indexPathForRow:realRow inSection:kApolloUserFlairOptionsSection];
+    }
+
+    id originalBlock = %orig(tableNode, effectiveIndexPath);
+    if (!originalBlock) return originalBlock;
+
+    // For the collapsed "custom flair" row, look up the backing option so its
+    // getters can render the placeholder while this cell is being built.
+    __unsafe_unretained id customRowOption = nil;
+    if (isCustomRow) {
+        NSArray *options = ApolloUserFlairControllerOptions((UIViewController *)self);
+        if (realRow >= 0 && realRow < (NSInteger)options.count) customRowOption = options[realRow];
+    }
 
     id copiedBlock = [originalBlock copy];
     __weak UIViewController *weakController = (UIViewController *)self;
-    NSInteger section = indexPath.section;
-    NSInteger row = indexPath.row;
+    NSInteger captureRow = realRow;
 
     return [^id {
         UIViewController *strongController = weakController;
         UIViewController *previousController = tApolloUserFlairCaptureController;
         NSInteger previousSection = tApolloUserFlairCaptureSection;
         NSInteger previousRow = tApolloUserFlairCaptureRow;
+        id previousCustomOption = tApolloUserFlairCustomRowOption;
         id node = nil;
 
         tApolloUserFlairCaptureController = strongController;
-        tApolloUserFlairCaptureSection = section;
-        tApolloUserFlairCaptureRow = row;
+        tApolloUserFlairCaptureSection = kApolloUserFlairOptionsSection;
+        tApolloUserFlairCaptureRow = captureRow;
+        tApolloUserFlairCustomRowOption = customRowOption;
         @try {
             node = ((id (^)(void))copiedBlock)();
         } @finally {
             tApolloUserFlairCaptureController = previousController;
             tApolloUserFlairCaptureSection = previousSection;
             tApolloUserFlairCaptureRow = previousRow;
+            tApolloUserFlairCustomRowOption = previousCustomOption;
         }
 
         return node;
@@ -703,8 +914,24 @@ static BOOL ApolloUserFlairMaybePresentEditorForOption(UIViewController *control
 }
 
 - (void)tableNode:(id)tableNode didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
-    id tappedOption = ApolloUserFlairCapturedOptionAtIndexPath((UIViewController *)self, indexPath);
-    %orig;
+    NSIndexPath *effectiveIndexPath = indexPath;
+    ApolloUserFlairCollapseModel *model = (indexPath.section == kApolloUserFlairOptionsSection)
+        ? ApolloUserFlairCollapseModelFor((UIViewController *)self) : nil;
+    if (model.active && indexPath.row >= 0 && indexPath.row < (NSInteger)model.realRows.count) {
+        effectiveIndexPath = [NSIndexPath indexPathForRow:[model.realRows[indexPath.row] integerValue]
+                                               inSection:kApolloUserFlairOptionsSection];
+    }
+
+    id tappedOption = ApolloUserFlairCapturedOptionAtIndexPath((UIViewController *)self, effectiveIndexPath);
+    %orig(tableNode, effectiveIndexPath);
+
+    // When collapsed, the displayed row index differs from the real index Apollo
+    // just selected, so the checkmark may land on the wrong (off-screen) row.
+    // Reload so the visible rows recompute their checkmark from currentFlairID.
+    if (model.active && [tableNode respondsToSelector:@selector(reloadData)]) {
+        ((void (*)(id, SEL))objc_msgSend)(tableNode, @selector(reloadData));
+    }
+
     __weak UIViewController *weakController = (UIViewController *)self;
     dispatch_async(dispatch_get_main_queue(), ^{
         UIViewController *strongController = weakController;
@@ -726,6 +953,9 @@ static BOOL ApolloUserFlairMaybePresentEditorForOption(UIViewController *control
 - (NSString *)textRepresentation {
     NSString *textRepresentation = %orig;
     ApolloUserFlairCaptureOptionIfNeeded(self);
+    if (tApolloUserFlairCustomRowOption && tApolloUserFlairCustomRowOption == self) {
+        return kApolloUserFlairCustomRowText;
+    }
     return textRepresentation;
 }
 
@@ -738,6 +968,10 @@ static BOOL ApolloUserFlairMaybePresentEditorForOption(UIViewController *control
 - (NSArray *)flairs {
     NSArray *flairs = %orig;
     ApolloUserFlairCaptureOptionIfNeeded(self);
+    if (tApolloUserFlairCustomRowOption && tApolloUserFlairCustomRowOption == self) {
+        NSArray *synthetic = ApolloUserFlairCustomRowSyntheticFlairs();
+        if (synthetic) return synthetic;
+    }
     return flairs;
 }
 
