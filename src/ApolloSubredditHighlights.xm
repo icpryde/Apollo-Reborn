@@ -1515,6 +1515,11 @@ static void ApolloHLCollapseOrphanSeparators(UIViewController *vc) {
     if (changed) {
         id tableNode = ApolloHLTypedIvar(vc, @"tableNode", objc_getClass("ASTableNode"));
         if ([tableNode respondsToSelector:@selector(relayoutItems)]) ((void (*)(id, SEL))objc_msgSend)(tableNode, @selector(relayoutItems));
+        // relayoutItems re-measures but the shrink doesn't paint until the next
+        // layout pass (otherwise the breaker stays thick until the user scrolls) —
+        // force the table to apply it now.
+        [tv setNeedsLayout];
+        [tv layoutIfNeeded];
     }
 }
 
