@@ -1530,9 +1530,21 @@ static void ApolloHLRecordHiddenStickyRow(id postNode) {
 static BOOL ApolloHLSeparatorShouldCollapse(id sepNode) {
     if ([objc_getAssociatedObject(sepNode, &kApolloHLSepCollapseKey) boolValue]) return YES; // reactive pass
     if (!sCommunityHighlights || ApolloHLHideSubs().count == 0) return NO;
-    id owning = ApolloHLOwningTableNode(sepNode);
     NSInteger r = ApolloHLNodeRow(sepNode);
-    if (!owning || r < 1) return NO;
+    if (r < 1) return NO;
+    // Texture lays separators out BEFORE the sticky posts, so a separator can't yet
+    // confirm its neighbours are stickies (the set is empty) — the neighbour approach
+    // loses the race and the breaker visibly shrinks afterwards. But the separator
+    // DOES know its row. Stickied posts are always first, so row 0 is the 1st sticky
+    // and ROW 1 is its trailing breaker — exactly the orphaned one to drop in the
+    // common 2-sticky feed. Collapsing row 1 by index is race-free (no dependency on
+    // the posts laying out), so it's correct from the very first frame. For a rare
+    // single-sticky sub row 1 is the real breaker, so it's simply absent below the
+    // carousel (the carousel's own bottom gap stands in); no shrink either way.
+    if (r == 1) return YES;
+    // r >= 3 (a 3rd+ sticky, very rare): only if confirmed between two recorded stickies.
+    id owning = ApolloHLOwningTableNode(sepNode);
+    if (!owning) return NO;
     @synchronized(owning) {
         NSMutableSet *set = ApolloHLHiddenRowsSet(owning, NO);
         return set && [set containsObject:@(r - 1)] && [set containsObject:@(r + 1)];
@@ -1549,7 +1561,8 @@ static void ApolloHLCollapseOrphanSeparators(UIViewController *vc) {
         return [ia compare:ib];
     }];
     if (cells.count == 0) return;
-    if ([tv indexPathForCell:cells.firstObject].row != 0) return; // only when the feed top is visible
+    NSInteger firstRow = [tv indexPathForCell:cells.firstObject].row;
+    if (firstRow != 0) return; // only when the feed top is visible
 
     // Collect the separators in the leading run of de-duped stickies (until the first real post).
     NSMutableArray *runSeps = [NSMutableArray array];
@@ -1633,7 +1646,7 @@ static void ApolloHLCollapseOrphanSeparators(UIViewController *vc) {
 %hook _TtC6Apollo17LargePostCellNode
 - (id)layoutSpecThatFits:(struct ApolloHLSizeRange)constrainedSize {
     if (ApolloHLShouldHideCell(self)) {
-        ApolloHLRecordHiddenStickyRow(self); // so the trailing separator can self-collapse on first layout
+        ApolloHLRecordHiddenStickyRow(self); // feeds the r>=3 fallback path
         id empty = ApolloHLEmptySpec();
         if (empty) return empty;
     }
