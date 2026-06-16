@@ -1172,26 +1172,23 @@ static ApolloUserFlairCollapseModel *ApolloUserFlairBuildCollapseModel(NSArray *
         }
     }
 
-    // Collapse once the "endless blank rows" problem exists (>=2 empty templates).
-    if (emptyEditableCount + emptyNonEditableCount >= 2) {
-        NSMutableArray<NSNumber *> *rows = [labeledRows mutableCopy];
+    // Collapse only when the subreddit is ENTIRELY empty templates (>=2 of them) and
+    // has no real flairs. Then the whole list becomes a single representative row at
+    // real index 0 — an identity mapping, which keeps the table-row remapping trivial
+    // and safe. Subreddits that mix real flairs with a few blanks are left native
+    // (their blank editable rows still get the "Set custom flair…" placeholder via the
+    // per-row path; a handful of dead rows is fine and avoids fragile remapping).
+    if (labeledRows.count == 0 && emptyEditableCount + emptyNonEditableCount >= 2) {
         if (emptyEditableCount >= 1) {
-            // At least one editable template — offer a single "Set custom flair…"
-            // row, drop the rest (incl. blank non-editables).
-            [rows addObject:@(firstEmptyEditable)];
+            model.realRows = @[@(firstEmptyEditable)];
             model.customRealRow = firstEmptyEditable;
             model.infoMode = NO;
-        } else if (labeledRows.count == 0) {
-            // The whole subreddit is blank, non-editable templates — replace the
-            // wall with one explanatory notice.
-            [rows addObject:@(firstEmptyNonEditable)];
+        } else {
+            model.realRows = @[@(firstEmptyNonEditable)];
             model.customRealRow = firstEmptyNonEditable;
             model.infoMode = YES;
         }
-        // else: real flairs plus a wall of blanks — just keep the real ones (the
-        // blanks are dropped) with no notice and no custom row.
-        model.realRows = rows;
-        model.active = (rows.count != options.count);
+        model.active = YES;
     }
     return model;
 }
