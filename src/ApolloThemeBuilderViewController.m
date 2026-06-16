@@ -76,15 +76,29 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
 
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
+    [self applyThemeColors];
     [self.tableView reloadData];
 }
 
 - (void)traitCollectionDidChange:(UITraitCollection *)previous {
     [super traitCollectionDidChange:previous];
     if (self.traitCollection.userInterfaceStyle != previous.userInterfaceStyle) {
+        [self applyThemeColors];
         [self refreshPreview];
     }
 }
+
+- (void)applyThemeColors {
+    if (!ApolloThemeBuilderIsEnabled()) {
+        self.tableView.backgroundColor = nil; // restore system default
+        return;
+    }
+    NSString *mode = [self previewMode];
+    UIColor *primaryBG = ApolloThemeBuilderColorFromHex(ApolloThemeBuilderSavedHex(kApolloThemeRolePrimaryBG, mode));
+    if (primaryBG) self.tableView.backgroundColor = primaryBG;
+}
+
+- (UITableView *)tableViewForWillDisplay { return self.tableView; }
 
 #pragma mark - Live preview
 
@@ -521,20 +535,20 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
     return UITableViewAutomaticDimension;
 }
 
-// Text is auto-contrasted by the engine, but the accent can't be — icons, links
-// and the selected tab all use it, so warn when it's too close to either
-// background to be visible.
+// The accent can't be auto-contrasted — icons, links and the selected tab all
+// use it, so warn when it's too close to either background to be visible.
 - (NSString *)contrastWarningForMode:(NSString *)mode {
     CGFloat accent = ATBLuminance(ApolloThemeBuilderSavedHex(@"accent", mode));
     CGFloat primary = ATBLuminance(ApolloThemeBuilderSavedHex(@"primaryBG", mode));
     CGFloat secondary = ATBLuminance(ApolloThemeBuilderSavedHex(@"secondaryBG", mode));
     CGFloat worst = MIN(ATBContrast(accent, primary), ATBContrast(accent, secondary));
     if (worst < 1.45) {
-        return @"⚠︎ Your accent is very close to the background — icons, links and the "
-               @"selected tab may be hard to see. Pick a more contrasting accent.";
+        return @"⚠︎ Your accent has similar brightness to the background — even if the "
+               @"colors look different, icons, links and the selected tab may be hard to "
+               @"see. Pick an accent that is clearly lighter or darker than your background.";
     }
     if (worst < 2.0) {
-        return @"Your accent has low contrast with the background; icons may look faint.";
+        return @"Your accent's brightness is close to the background; icons may look faint.";
     }
     return nil;
 }
@@ -627,6 +641,26 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
 - (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
     if ([self logicalSectionForDisplayedSection:indexPath.section] == SectionPreview) return 320.0;
     return UITableViewAutomaticDimension;
+}
+
+- (void)tableView:(UITableView *)tableView willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (!ApolloThemeBuilderIsEnabled()) return;
+    NSString *mode = [self previewMode];
+    UIColor *secondaryBG = ApolloThemeBuilderColorFromHex(ApolloThemeBuilderSavedHex(kApolloThemeRoleSecondaryBG, mode));
+    UIColor *textColor = ApolloThemeBuilderColorFromHex(ApolloThemeBuilderSavedHex(kApolloThemeRoleText, mode));
+    UIColor *grayColor = ApolloThemeBuilderColorFromHex(ApolloThemeBuilderSavedHex(kApolloThemeRoleGray, mode));
+    if (secondaryBG) {
+        cell.backgroundColor = secondaryBG;
+        // Clear the default selected-background highlight so it doesn't flash white
+        cell.selectedBackgroundView = [[UIView alloc] init];
+        cell.selectedBackgroundView.backgroundColor = [secondaryBG colorWithAlphaComponent:0.7];
+    }
+    if (textColor) {
+        cell.textLabel.textColor = textColor;
+    }
+    if (grayColor) {
+        cell.detailTextLabel.textColor = grayColor;
+    }
 }
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {

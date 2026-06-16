@@ -44,6 +44,7 @@ NSString * const kApolloThemeRoleTertiaryBG  = @"tertiaryBG";
 NSString * const kApolloThemeRoleSeparator   = @"separator";
 NSString * const kApolloThemeRoleBar         = @"bar";
 NSString * const kApolloThemeRoleGray        = @"gray";
+NSString * const kApolloThemeRoleText        = @"text";
 
 static NSString * const kAppColorThemeKey = @"AppColorTheme";
 static NSString * const kDonorThemeName   = @"outrun";
@@ -118,6 +119,9 @@ static uint8_t sRByteFilter[256];
 // them (secondary) — which can diverge wildly under a custom theme.
 static CGFloat sPrimaryLum[2]   = {0.85, 0.05}; // light, dark donor defaults
 static CGFloat sSecondaryLum[2] = {0.78, 0.07};
+// Explicit user text color per mode — overrides auto-contrast when set.
+static CGFloat sTextColor[2][3] = {{0.0, 0.0, 0.0}, {1.0, 1.0, 1.0}};
+static bool    sTextColorSet[2] = {false, false};
 
 static uintptr_t sApolloStart = 0;
 static uintptr_t sApolloEnd = 0;
@@ -142,7 +146,7 @@ NSArray<NSString *> *ApolloThemeBuilderRoleKeys(void) {
     return @[kApolloThemeRoleAccent, kApolloThemeRolePrimaryBG,
              kApolloThemeRoleSecondaryBG, kApolloThemeRoleTertiaryBG,
              kApolloThemeRoleSeparator, kApolloThemeRoleBar,
-             kApolloThemeRoleGray];
+             kApolloThemeRoleGray, kApolloThemeRoleText];
 }
 
 NSString *ApolloThemeBuilderRoleDisplayName(NSString *roleKey) {
@@ -156,13 +160,18 @@ NSString *ApolloThemeBuilderRoleDisplayName(NSString *roleKey) {
             kApolloThemeRoleTertiaryBG:  @"Tertiary Background",
             kApolloThemeRoleSeparator:   @"Separators",
             kApolloThemeRoleBar:         @"Bars & Chrome",
-            kApolloThemeRoleGray:        @"Neutral Gray",
+            kApolloThemeRoleGray:        @"Secondary Text",
+            kApolloThemeRoleText:        @"Text",
         };
     });
     return names[roleKey] ?: roleKey;
 }
 
 NSString *ApolloThemeBuilderDonorHex(NSString *roleKey, NSString *mode) {
+    // Text role is not a slot color — return natural text defaults.
+    if ([roleKey isEqualToString:kApolloThemeRoleText]) {
+        return [mode isEqualToString:@"dark"] ? @"F2F2F7" : @"0D1117";
+    }
     const char *role = roleKey.UTF8String, *m = mode.UTF8String;
     for (int i = 0; i < KSLOTCOUNT; i++) {
         if (strcmp(kSlots[i].role, role) == 0 && strcmp(kSlots[i].mode, m) == 0) {
@@ -469,12 +478,27 @@ void ApolloThemeBuilderReloadOverrides(void) {
             rr = donorSecondary[m][0] / 255.0; gg = donorSecondary[m][1] / 255.0; bb = donorSecondary[m][2] / 255.0;
         }
         sSecondaryLum[m] = 0.2126 * rr + 0.7152 * gg + 0.0722 * bb;
+
+        NSString *th = colors[[NSString stringWithFormat:@"text.%s", modeNames[m]]];
+        unsigned int tv = 0;
+        if (th.length == 6 && [[NSScanner scannerWithString:th] scanHexInt:&tv]) {
+            sTextColor[m][0] = ((tv >> 16) & 0xFF) / 255.0;
+            sTextColor[m][1] = ((tv >> 8) & 0xFF) / 255.0;
+            sTextColor[m][2] = (tv & 0xFF) / 255.0;
+            sTextColorSet[m] = true;
+        } else {
+            sTextColorSet[m] = false;
+        }
     }
 
     sRemapActive = enabled && donorActive;
     os_unfair_lock_unlock(&sLock);
-    ApolloLog(@"ThemeBuilder: overrides reloaded (enabled=%d donorActive=%d theme=%@)",
-              enabled, donorActive, activeTheme);
+    ApolloLog(@"ThemeBuilder: overrides reloaded (enabled=%d donorActive=%d theme=%@) primaryLum=[%.3f,%.3f] textSet=[%d,%d] textColor=[(%.2f,%.2f,%.2f),(%.2f,%.2f,%.2f)]",
+              enabled, donorActive, activeTheme,
+              sPrimaryLum[0], sPrimaryLum[1],
+              sTextColorSet[0], sTextColorSet[1],
+              sTextColor[0][0], sTextColor[0][1], sTextColor[0][2],
+              sTextColor[1][0], sTextColor[1][1], sTextColor[1][2]);
 }
 
 void ApolloThemeBuilderForceRepaint(void) {
@@ -562,6 +586,36 @@ static inline bool NeutralGrayReplacement(int ri, int gi, int bi, uintptr_t call
     // grays reference white in light mode, black in dark mode).
     CGFloat faint = (mode == 0) ? Lg : (1.0 - Lg);
     if (faint < 0.0) faint = 0.0; else if (faint > 1.0) faint = 1.0;
+
+    // User has explicitly set a text color — use it as the primary-text anchor
+    // and fade toward the background luminance for subtler grays, preserving
+    // the text hierarchy without relying on the auto-WCAG heuristic.
+    // Applied to ALL neutral grays from Apollo (no Lg threshold): slot-remapped
+    // colors (separator, bar, accent) have non-neutral channel spread (mx-mn > 8)
+    // so they never reach this path. UIKit semantic colors (UIColor.label,
+    // separatorColor) are rejected by the caller check above. Only Apollo-created
+    // neutral grays — text, icons, subtle UI chrome — get here.
+    if (sTextColorSet[mode]) {
+        CGFloat bgL = sPrimaryLum[mode];
+        CGFloat tx = sTextColor[mode][0], ty = sTextColor[mode][1], tz = sTextColor[mode][2];
+        // Mid-range grays (faint > 0.25) are secondary text/icons — usernames,
+        // timestamps, counts. If the user customised the Neutral Gray / Secondary
+        // Text slot, use that color for these instead of the primary text color so
+        // the two levels are independently controllable.
+        if (faint > 0.25) {
+            int graySlot = (mode == 0) ? 6 : 13;
+            if (sSlotCustomized[graySlot]) {
+                tx = sRepl[graySlot][0];
+                ty = sRepl[graySlot][1];
+                tz = sRepl[graySlot][2];
+            }
+        }
+        CGFloat fade = faint * 0.40; // at max faintness, blend 40% toward the background
+        out[0] = tx + (bgL - tx) * fade;
+        out[1] = ty + (bgL - ty) * fade;
+        out[2] = tz + (bgL - tz) * fade;
+        return true;
+    }
 
     CGFloat target;
     if (goDark) {
@@ -944,6 +998,28 @@ static NSInteger (*sAppearanceEditingStyleOrig)(id, SEL, UITableView *, NSIndexP
 static NSInteger (*sAppearanceIndentationOrig)(id, SEL, UITableView *, NSIndexPath *);
 static UISwipeActionsConfiguration *(*sAppearanceLeadingSwipeOrig)(id, SEL, UITableView *, NSIndexPath *);
 static UISwipeActionsConfiguration *(*sAppearanceTrailingSwipeOrig)(id, SEL, UITableView *, NSIndexPath *);
+static void (*sAppearanceViewWillAppearOrig)(id, SEL, BOOL);
+static void (*sAppearanceTraitChangeOrig)(id, SEL, UITraitCollection *);
+
+static void ThemeBuilderApplyColorsToAppearanceVC(id self) {
+    if (!sRemapActive) return;
+    UITableViewController *tvc = (UITableViewController *)self;
+    UITableView *tv = tvc.tableView;
+    if (!tv) return;
+    NSString *mode = (tv.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) ? @"dark" : @"light";
+    UIColor *bg = ApolloThemeBuilderColorFromHex(ApolloThemeBuilderSavedHex(kApolloThemeRolePrimaryBG, mode));
+    if (bg) tv.backgroundColor = bg;
+}
+
+static void ThemeBuilderAppearanceViewWillAppear(id self, SEL _cmd, BOOL animated) {
+    if (sAppearanceViewWillAppearOrig) sAppearanceViewWillAppearOrig(self, _cmd, animated);
+    ThemeBuilderApplyColorsToAppearanceVC(self);
+}
+
+static void ThemeBuilderAppearanceTraitChange(id self, SEL _cmd, UITraitCollection *previous) {
+    if (sAppearanceTraitChangeOrig) sAppearanceTraitChangeOrig(self, _cmd, previous);
+    ThemeBuilderApplyColorsToAppearanceVC(self);
+}
 
 static NSIndexPath *ThemeBuilderAppearanceAdjustedIndexPath(NSIndexPath *ip) {
     if (ip.section == 0 && ip.row > 1)
@@ -968,10 +1044,35 @@ static UITableViewCell *ThemeBuilderAppearanceCell(id self, SEL _cmd, UITableVie
         if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:reuse];
         cell.textLabel.text = @"Theme Builder";
         cell.detailTextLabel.text = nil;
-        cell.imageView.image = nil;
         cell.accessoryView = nil;
         cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
         cell.accessibilityLabel = @"Theme Builder";
+        // Render a rounded-rect badge icon matching Apollo's Themes row style
+        NSString *modeKey = (cell.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) ? @"dark" : @"light";
+        UIColor *accent = sRemapActive
+            ? (ApolloThemeBuilderColorFromHex(ApolloThemeBuilderSavedHex(kApolloThemeRoleAccent, modeKey))
+               ?: [UIColor colorWithRed:0.51 green:0.29 blue:0.84 alpha:1.0])
+            : [UIColor colorWithRed:0.51 green:0.29 blue:0.84 alpha:1.0];
+        UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration
+            configurationWithPointSize:15 weight:UIImageSymbolWeightMedium];
+        UIImage *symbol = [[UIImage systemImageNamed:@"paintbrush.fill" withConfiguration:cfg]
+                           imageWithTintColor:UIColor.whiteColor
+                           renderingMode:UIImageRenderingModeAlwaysOriginal];
+        CGFloat side = 29;
+        UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat preferredFormat];
+        fmt.opaque = NO;
+        UIImage *badge = [[[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(side, side) format:fmt]
+            imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+                UIBezierPath *bg = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, side, side)
+                                                              cornerRadius:6.5];
+                [accent setFill];
+                [bg fill];
+                CGSize symSize = symbol.size;
+                CGPoint symOrigin = CGPointMake((side - symSize.width) / 2,
+                                               (side - symSize.height) / 2);
+                [symbol drawAtPoint:symOrigin];
+            }];
+        cell.imageView.image = badge;
         return cell;
     }
     NSIndexPath *adjusted = ThemeBuilderAppearanceAdjustedIndexPath(ip);
@@ -1008,9 +1109,24 @@ static void ThemeBuilderAppearanceSelect(id self, SEL _cmd, UITableView *tv, NSI
 }
 
 static void ThemeBuilderAppearanceWillDisplay(id self, SEL _cmd, UITableView *tv, UITableViewCell *cell, NSIndexPath *ip) {
-    if (ThemeBuilderAppearanceIsBuilderRow(ip)) return;
-    NSIndexPath *adjusted = ThemeBuilderAppearanceAdjustedIndexPath(ip);
-    if (sAppearanceWillDisplayOrig) sAppearanceWillDisplayOrig(self, _cmd, tv, cell, adjusted);
+    if (!ThemeBuilderAppearanceIsBuilderRow(ip)) {
+        NSIndexPath *adjusted = ThemeBuilderAppearanceAdjustedIndexPath(ip);
+        if (sAppearanceWillDisplayOrig) sAppearanceWillDisplayOrig(self, _cmd, tv, cell, adjusted);
+    }
+    if (sRemapActive) {
+        NSString *mode = (tv.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) ? @"dark" : @"light";
+        UIColor *cellBG = ApolloThemeBuilderColorFromHex(ApolloThemeBuilderSavedHex(kApolloThemeRoleSecondaryBG, mode));
+        UIColor *textColor = ApolloThemeBuilderColorFromHex(ApolloThemeBuilderSavedHex(kApolloThemeRoleText, mode));
+        UIColor *grayColor = ApolloThemeBuilderColorFromHex(ApolloThemeBuilderSavedHex(kApolloThemeRoleGray, mode));
+        if (cellBG) {
+            cell.backgroundColor = cellBG;
+            UIView *sel = [[UIView alloc] init];
+            sel.backgroundColor = [cellBG colorWithAlphaComponent:0.7];
+            cell.selectedBackgroundView = sel;
+        }
+        if (textColor) cell.textLabel.textColor = textColor;
+        if (grayColor) cell.detailTextLabel.textColor = grayColor;
+    }
 }
 
 static void ThemeBuilderAppearanceDidEndDisplaying(id self, SEL _cmd, UITableView *tv, UITableViewCell *cell, NSIndexPath *ip) {
@@ -1142,6 +1258,16 @@ static void ThemeBuilderInstallAppearanceHooks(void) {
     class_replaceMethod(cls, indentationSel, (IMP)ThemeBuilderAppearanceIndentation, "q@:@@");
     class_replaceMethod(cls, leadingSwipeSel, (IMP)ThemeBuilderAppearanceLeadingSwipe, "@@:@@");
     class_replaceMethod(cls, trailingSwipeSel, (IMP)ThemeBuilderAppearanceTrailingSwipe, "@@:@@");
+
+    SEL viewWillAppearSel = @selector(viewWillAppear:);
+    SEL traitChangeSel = @selector(traitCollectionDidChange:);
+    sAppearanceViewWillAppearOrig = class_getInstanceMethod(cls, viewWillAppearSel)
+        ? (void (*)(id, SEL, BOOL))class_getMethodImplementation(cls, viewWillAppearSel) : NULL;
+    sAppearanceTraitChangeOrig = class_getInstanceMethod(cls, traitChangeSel)
+        ? (void (*)(id, SEL, UITraitCollection *))class_getMethodImplementation(cls, traitChangeSel) : NULL;
+    class_replaceMethod(cls, viewWillAppearSel, (IMP)ThemeBuilderAppearanceViewWillAppear, "v@:B");
+    class_replaceMethod(cls, traitChangeSel, (IMP)ThemeBuilderAppearanceTraitChange, "v@:@");
+
     installed = YES;
     ApolloLog(@"ThemeBuilder: Appearance row hook installed");
 }
@@ -1160,6 +1286,32 @@ static void ThemeBuilderInstallAppearanceHooks(void) {
         }
         ApolloThemeBuilderReloadOverrides();
     }
+}
+
+%end
+
+// Push the theme separator role color into UIKit table views.
+// UITableView draws its own hairline separators via UIColor.separatorColor
+// (a system semantic color our UIColor hooks never touch). Hooking
+// didMoveToWindow: is the earliest reliable point after the table view is in
+// the hierarchy; we only write when the stored value differs so repeated calls
+// are cheap.
+%hook UITableView
+
+- (void)didMoveToWindow {
+    %orig;
+    if (!sRemapActive || !self.window) return;
+    NSString *mode = (self.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) ? @"dark" : @"light";
+    UIColor *color = ApolloThemeBuilderColorFromHex(ApolloThemeBuilderSavedHex(kApolloThemeRoleSeparator, mode));
+    if (color) self.separatorColor = color;
+}
+
+- (void)traitCollectionDidChange:(UITraitCollection *)previous {
+    %orig;
+    if (!sRemapActive) return;
+    NSString *mode = (self.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) ? @"dark" : @"light";
+    UIColor *color = ApolloThemeBuilderColorFromHex(ApolloThemeBuilderSavedHex(kApolloThemeRoleSeparator, mode));
+    if (color) self.separatorColor = color;
 }
 
 %end

@@ -27,7 +27,8 @@ extern NSString * const kApolloThemeRoleSecondaryBG;   // grouped/secondary back
 extern NSString * const kApolloThemeRoleTertiaryBG;    // dimmed/tertiary background
 extern NSString * const kApolloThemeRoleSeparator;     // separators / elevated chrome
 extern NSString * const kApolloThemeRoleBar;           // nav/tab bar background
-extern NSString * const kApolloThemeRoleGray;          // neutral gray (placeholders etc.)
+extern NSString * const kApolloThemeRoleGray;          // secondary text: usernames, timestamps, counts
+extern NSString * const kApolloThemeRoleText;          // primary text / icon tint direction
 
 // All role keys in display order.
 NSArray<NSString *> *ApolloThemeBuilderRoleKeys(void);
