@@ -16,6 +16,10 @@ static const NSInteger kApolloUserFlairOptionsSection = 1;
 // Placeholder shown on a blank, editable flair row so it's obvious it's tappable.
 static NSString *const kApolloUserFlairCustomRowText = @"Set custom flair…";
 
+// Shown when a subreddit's flair is enabled but every template is empty AND not
+// editable — there is genuinely nothing to pick (the case is broken on the web too).
+static NSString *const kApolloUserFlairNoFlairsRowText = @"No usable flairs in this community";
+
 static __thread __unsafe_unretained UIViewController *tApolloUserFlairCaptureController = nil;
 static __thread NSInteger tApolloUserFlairCaptureSection = NSNotFound;
 static __thread NSInteger tApolloUserFlairCaptureRow = NSNotFound;
@@ -1082,13 +1086,34 @@ static NSArray *ApolloUserFlairControllerOptions(UIViewController *controller) {
     return nil;
 }
 
-// "Labelled" = something the user can actually tell apart: non-empty text or at
-// least one flair piece (e.g. an emoji-only flair).
+// Some subreddits build "blank" flairs out of invisible characters (e.g. r/dbz uses
+// U+2800 BRAILLE PATTERN BLANK). Treat text made up only of whitespace / invisibles
+// as empty so those dead templates don't count as real flairs.
+static BOOL ApolloUserFlairStringIsBlank(NSString *s) {
+    if (s.length == 0) return YES;
+    static NSCharacterSet *blanks = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSMutableCharacterSet *m = [[NSCharacterSet whitespaceAndNewlineCharacterSet] mutableCopy];
+        // braille blank, ZWSP/ZWNJ/ZWJ, word joiner, BOM, hangul fillers, NBSP, MVS
+        [m addCharactersInString:@"⠀​‌‍⁠﻿ㅤᅟ ᠎"];
+        blanks = [m copy];
+    });
+    return [s stringByTrimmingCharactersInSet:blanks].length == 0;
+}
+
+// "Labelled" = something the user can actually tell apart: real (visible) text, an
+// emoji label, or an image. A flair piece that exists but is visually empty (no
+// real text, no emoji, no image — e.g. r/dbz's blank-character templates) does NOT
+// count, otherwise we'd keep a wall of blank pills instead of collapsing them.
 static BOOL ApolloUserFlairOptionIsLabeled(id option) {
-    NSString *text = ApolloUserFlairOptionText(option);
-    if (text.length > 0) return YES;
+    NSString *text = ApolloUserFlairOptionText(option); // covers text + emoji labels
+    if (!ApolloUserFlairStringIsBlank(text)) return YES;
     NSArray *flairs = ApolloUserFlairObjectArray(option, @[@"flairs"]);
-    return flairs.count > 0;
+    for (id f in flairs) {
+        if (ApolloUserFlairObjectString(f, @[@"imageURL"]).length > 0) return YES;
+    }
+    return NO;
 }
 
 // A blank-but-editable template: nothing to show, but you can type into it. These
@@ -1105,8 +1130,11 @@ static BOOL ApolloUserFlairOptionIsBlankEditable(id option) {
 @property (nonatomic) BOOL active;
 // displayRow -> real index into flairOptions
 @property (nonatomic, strong) NSArray<NSNumber *> *realRows;
-// real index of the single representative "custom flair" row (or NSNotFound)
+// real index of the single representative collapsed row (or NSNotFound)
 @property (nonatomic) NSInteger customRealRow;
+// YES = the representative row is an "no usable flairs" notice (empties are all
+// non-editable); NO = it's a tappable "Set custom flair…" / current-flair row.
+@property (nonatomic) BOOL infoMode;
 // identity of the flairOptions array this model was computed from
 @property (nonatomic) const void *sourcePtr;
 @end
@@ -1121,7 +1149,9 @@ static ApolloUserFlairCollapseModel *ApolloUserFlairBuildCollapseModel(NSArray *
 
     NSMutableArray<NSNumber *> *labeledRows = [NSMutableArray array];
     NSInteger firstEmptyEditable = NSNotFound;
+    NSInteger firstEmptyNonEditable = NSNotFound;
     NSInteger emptyEditableCount = 0;
+    NSInteger emptyNonEditableCount = 0;
 
     for (NSInteger i = 0; i < (NSInteger)options.count; i++) {
         id option = options[i];
@@ -1134,19 +1164,34 @@ static ApolloUserFlairCollapseModel *ApolloUserFlairBuildCollapseModel(NSArray *
         if (editableKnown && editable) {
             emptyEditableCount++;
             if (firstEmptyEditable == NSNotFound) firstEmptyEditable = i;
+        } else {
+            // Empty AND non-editable: no text, can't be typed into — useless on mobile
+            // (and on the web). Some subs have a whole wall of these.
+            emptyNonEditableCount++;
+            if (firstEmptyNonEditable == NSNotFound) firstEmptyNonEditable = i;
         }
-        // Empty AND non-editable templates carry no usable information on mobile
-        // (no text, can't be typed into) — they are dropped from the collapsed list.
     }
 
-    // Only collapse when the "endless blank rows" problem actually exists: two or
-    // more empty editable templates. One empty editable row is fine as-is.
-    if (emptyEditableCount >= 2 && firstEmptyEditable != NSNotFound) {
+    // Collapse once the "endless blank rows" problem exists (>=2 empty templates).
+    if (emptyEditableCount + emptyNonEditableCount >= 2) {
         NSMutableArray<NSNumber *> *rows = [labeledRows mutableCopy];
-        [rows addObject:@(firstEmptyEditable)];
+        if (emptyEditableCount >= 1) {
+            // At least one editable template — offer a single "Set custom flair…"
+            // row, drop the rest (incl. blank non-editables).
+            [rows addObject:@(firstEmptyEditable)];
+            model.customRealRow = firstEmptyEditable;
+            model.infoMode = NO;
+        } else if (labeledRows.count == 0) {
+            // The whole subreddit is blank, non-editable templates — replace the
+            // wall with one explanatory notice.
+            [rows addObject:@(firstEmptyNonEditable)];
+            model.customRealRow = firstEmptyNonEditable;
+            model.infoMode = YES;
+        }
+        // else: real flairs plus a wall of blanks — just keep the real ones (the
+        // blanks are dropped) with no notice and no custom row.
         model.realRows = rows;
-        model.customRealRow = firstEmptyEditable;
-        model.active = YES;
+        model.active = (rows.count != options.count);
     }
     return model;
 }
@@ -1163,8 +1208,9 @@ static ApolloUserFlairCollapseModel *ApolloUserFlairCollapseModelFor(UIViewContr
     model.sourcePtr = (__bridge const void *)options;
     objc_setAssociatedObject(controller, &kApolloUserFlairCollapseModelKey, model, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     if (model.active) {
-        ApolloLog(@"[UserFlair] old-flair collapse: %lu options -> %lu rows (custom row real index %ld)",
-            (unsigned long)options.count, (unsigned long)model.realRows.count, (long)model.customRealRow);
+        ApolloLog(@"[UserFlair] old-flair collapse: %lu options -> %lu rows (rep index %ld, %@)",
+            (unsigned long)options.count, (unsigned long)model.realRows.count, (long)model.customRealRow,
+            model.infoMode ? @"no-usable-flairs notice" : @"custom flair row");
     }
     return model;
 }
@@ -1396,7 +1442,18 @@ static BOOL ApolloUserFlairPresenterHasFlairSelector(UIViewController *presenter
     NSString *customRowText = nil;
     {
         NSArray *options = ApolloUserFlairControllerOptions((UIViewController *)self);
-        if (realRow >= 0 && realRow < (NSInteger)options.count) {
+        BOOL isInfoRow = (model.active && model.infoMode && realRow == model.customRealRow);
+        if (isInfoRow) {
+            // The whole subreddit's flair is empty + non-editable: show one notice
+            // instead of a wall of dead rows. Tapping it explains (see didSelect).
+            id opt = (realRow < (NSInteger)options.count) ? options[realRow] : nil;
+            if (opt) {
+                id piece = ApolloUserFlairMakeTextFlair(kApolloUserFlairNoFlairsRowText);
+                customRowOption = opt;
+                customRowFlairs = piece ? @[piece] : nil;
+                customRowText = kApolloUserFlairNoFlairsRowText;
+            }
+        } else if (realRow >= 0 && realRow < (NSInteger)options.count) {
             id opt = options[realRow];
             NSString *currentText = ApolloUserFlairCurrentFlairTextForOption((UIViewController *)self, opt);
             // When templates are collapsed into one representative row, the current
@@ -1472,6 +1529,19 @@ static BOOL ApolloUserFlairPresenterHasFlairSelector(UIViewController *presenter
     if (model.active && indexPath.row >= 0 && indexPath.row < (NSInteger)model.realRows.count) {
         effectiveIndexPath = [NSIndexPath indexPathForRow:[model.realRows[indexPath.row] integerValue]
                                                inSection:kApolloUserFlairOptionsSection];
+    }
+
+    // The "no usable flairs" notice isn't a real choice — explain instead of selecting.
+    if (model.active && model.infoMode && effectiveIndexPath.row == model.customRealRow) {
+        if ([tableNode respondsToSelector:@selector(deselectRowAtIndexPath:animated:)]) {
+            ((void (*)(id, SEL, NSIndexPath *, BOOL))objc_msgSend)(tableNode, @selector(deselectRowAtIndexPath:animated:), indexPath, NO);
+        }
+        UIAlertController *info = [UIAlertController alertControllerWithTitle:@"No Usable Flairs"
+            message:@"This community has flair enabled, but every flair option is empty and can't be edited, so there's nothing to apply. That's the subreddit's own setup — not an Apollo limitation."
+            preferredStyle:UIAlertControllerStyleAlert];
+        [info addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [ApolloUserFlairPresenterForController((UIViewController *)self) presentViewController:info animated:YES completion:nil];
+        return;
     }
 
     id tappedOption = ApolloUserFlairCapturedOptionAtIndexPath((UIViewController *)self, effectiveIndexPath);
