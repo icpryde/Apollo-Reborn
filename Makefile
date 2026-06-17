@@ -65,6 +65,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloQuickActions.xm \
     $(SRC_DIR)/ApolloHideModSubreddits.xm \
     $(SRC_DIR)/ApolloTagFilters.xm \
+    $(SRC_DIR)/ApolloSearchHeaderOverlapFix.xm \
     $(SRC_DIR)/ApolloImageChestResolver.m \
     $(SRC_DIR)/ApolloLinkPreviewModel.m \
     $(SRC_DIR)/ApolloLinkPreviewCache.m \
