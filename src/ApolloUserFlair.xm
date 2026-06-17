@@ -440,6 +440,35 @@ static UIViewController *ApolloUserFlairPresenterForController(UIViewController 
     return presenter ?: controller;
 }
 
+// First http(s) URL embedded in a string (NSDataDetector handles "Go to <url> ..."
+// instruction text). nil when there's no link.
+static NSURL *ApolloUserFlairFirstURL(NSString *text) {
+    if (text.length == 0) return nil;
+    NSDataDetector *det = [NSDataDetector dataDetectorWithTypes:NSTextCheckingTypeLink error:NULL];
+    NSTextCheckingResult *m = [det firstMatchInString:text options:0 range:NSMakeRange(0, text.length)];
+    NSURL *url = m.URL;
+    if (url && ([url.scheme isEqualToString:@"http"] || [url.scheme isEqualToString:@"https"])) return url;
+    return nil;
+}
+
+// Open a URL in an in-app browser (SFSafariViewController), keeping the user inside
+// Apollo — used for subreddits whose only "flair" option is a link to an external
+// flair tool (e.g. r/anime's flair.r-anime.moe). Falls back to the system opener.
+static void ApolloUserFlairOpenURLInApp(UIViewController *controller, NSURL *url) {
+    if (!url || !controller) return;
+    Class sfvc = objc_getClass("SFSafariViewController");
+    if (sfvc) {
+        id vc = ((id (*)(id, SEL, NSURL *))objc_msgSend)([sfvc alloc], @selector(initWithURL:), url);
+        if ([vc isKindOfClass:[UIViewController class]]) {
+            [controller presentViewController:vc animated:YES completion:nil];
+            return;
+        }
+    }
+    if ([[UIApplication sharedApplication] respondsToSelector:@selector(openURL:options:completionHandler:)]) {
+        [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:nil];
+    }
+}
+
 @implementation ApolloUserFlairSelectorAdapter
 
 + (instancetype)adapterWithController:(UIViewController *)controller {
@@ -1363,8 +1392,18 @@ static NSString *ApolloUserFlairCurrentFlairTextForOption(UIViewController *cont
     if (templateID.length > 0) {
         return [templateID isEqualToString:optionID] ? text : nil;
     }
-    // Free-form flair (no template): show it on the blank editable "custom" row.
-    return ApolloUserFlairOptionIsBlankEditable(option) ? text : nil;
+    // Free-form flair (no template id): show it on the blank editable "custom" row,
+    // OR on the sole editable template (e.g. r/soccer's single emoji template, whose
+    // applied flair is free-form). Without this the row/editor fall back to the
+    // template's generic default, so a changed flair looks like it never applied and
+    // editing it would silently discard the user's real flair.
+    if (ApolloUserFlairOptionIsBlankEditable(option)) return text;
+    NSArray *options = ApolloUserFlairControllerOptions(controller);
+    if (options.count == 1) {
+        BOOL editableKnown = NO;
+        if (ApolloUserFlairOptionIsEditable(option, &editableKnown) && editableKnown) return text;
+    }
+    return nil;
 }
 
 #pragma mark - Old-Reddit CSS Sprite Flairs
@@ -1853,6 +1892,25 @@ static BOOL ApolloUserFlairPresenterHasFlairSelector(UIViewController *presenter
         [info addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
         [ApolloUserFlairPresenterForController((UIViewController *)self) presentViewController:info animated:YES completion:nil];
         return;
+    }
+
+    // Some subreddits expose a single NON-editable template whose "text" is just an
+    // instruction to use an external flair tool (e.g. r/anime: "Go to
+    // https://flair.r-anime.moe to get your flair!"). There's nothing to apply, so
+    // open the link in an in-app browser instead of selecting/committing it.
+    {
+        id opt = ApolloUserFlairCapturedOptionAtIndexPath((UIViewController *)self, effectiveIndexPath);
+        BOOL editableKnown = NO;
+        BOOL editable = ApolloUserFlairOptionIsEditable(opt, &editableKnown);
+        NSURL *link = ApolloUserFlairFirstURL(ApolloUserFlairOptionText(opt));
+        if (link && editableKnown && !editable) {
+            if ([tableNode respondsToSelector:@selector(deselectRowAtIndexPath:animated:)]) {
+                ((void (*)(id, SEL, NSIndexPath *, BOOL))objc_msgSend)(tableNode, @selector(deselectRowAtIndexPath:animated:), indexPath, NO);
+            }
+            ApolloUserFlairOpenURLInApp((UIViewController *)self, link);
+            ApolloLog(@"[UserFlair] flair-tool link row -> opened %@ in-app", link.absoluteString);
+            return;
+        }
     }
 
     id tappedOption = ApolloUserFlairCapturedOptionAtIndexPath((UIViewController *)self, effectiveIndexPath);
