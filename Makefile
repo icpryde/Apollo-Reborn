@@ -60,6 +60,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloTranslation.xm \
     $(SRC_DIR)/ApolloVideoUnmute.xm \
     $(SRC_DIR)/ApolloVideoSwipeFix.xm \
+    $(SRC_DIR)/ApolloVideoPlaybackSpeed.xm \
     $(SRC_DIR)/ApolloMediaPreviewErrorFix.xm \
     $(SRC_DIR)/ApolloSubredditIndexPolish.xm \
     $(SRC_DIR)/ApolloQuickActions.xm \
