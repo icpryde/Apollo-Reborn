@@ -501,22 +501,6 @@ static void ApolloSubredditIndexClearHeaderChrome(UIView *header, UILabel *label
     header.opaque = NO;
 }
 
-static void ApolloSubredditIndexApplyModernTableSurfaceBackground(UITableView *tableView) {
-    // Intentionally does NOT give the table a coloured background (#450).
-    //
-    // This used to colour the scroll view's backgroundColor (and backgroundView) to the row
-    // surface so transparent modern section headers wouldn't reveal a mismatched gap. But on
-    // iOS 26, ANY coloured background on a UIScrollView (backgroundColor OR a coloured
-    // backgroundView, opaque flag irrelevant) makes the navigation bar switch from its
-    // transparent scroll-edge appearance to its glass / content-reflecting appearance. The bar
-    // then mirrors the selected first row (Home, which sits right at the bar's edge) across the
-    // whole header — the reported tint. Classic mode never coloured the table, which is exactly
-    // why classic never bled. The section-header gaps are instead filled by each header's own
-    // opaque backgroundColor (see ApolloSubredditIndexStyleHeaderView), so the scroll view stays
-    // transparent and the nav bar never reflects the selection.
-    (void)tableView;
-}
-
 static UITableView *ApolloSubredditIndexTableForView(UIView *view) {
     while (view) {
         if ([view isKindOfClass:[UITableView class]]) return (UITableView *)view;
@@ -1135,7 +1119,11 @@ static void ApolloSubredditIndexInstallOrUpdate(UITableView *tableView) {
 
     objc_setAssociatedObject(tableView, &kApolloSubredditIndexTableKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     ApolloSubredditIndexApplySeparatorInsets(tableView);
-    ApolloSubredditIndexApplyModernTableSurfaceBackground(tableView);
+    // NB: deliberately do NOT colour the table's scroll-view background here. On iOS 26 any opaque
+    // UIScrollView background flips the nav bar to its glass / content-reflecting appearance, which
+    // mirrors the selected Home row across the whole header (#450). The gaps that transparent modern
+    // section headers would leave are instead filled by each header's own opaque backgroundColor in
+    // ApolloSubredditIndexStyleHeaderView, so the scroll view stays transparent.
     ApolloSubredditIndexHideNativeIndex(tableView);
 
     UIView *container = tableView.superview ?: tableView;
@@ -1571,9 +1559,8 @@ static void ApolloSubredditIndexStyleHeaderView(UIView *header, UITableView *tab
 
     // Fill the gap a transparent modern header would otherwise leave by giving the header its
     // own opaque surface colour (matching the rows). This replaces the old approach of colouring
-    // the whole scroll view, which tripped the iOS 26 nav-bar glass reflection (#450) — see
-    // ApolloSubredditIndexApplyModernTableSurfaceBackground. The header is a subview below the
-    // first row, so it never reaches the nav bar's reflected band.
+    // the whole scroll view, which tripped the iOS 26 nav-bar glass reflection (#450). The header
+    // is a subview below the first row, so it never reaches the nav bar's reflected band.
     UIColor *surfaceColor = ApolloSubredditIndexThemeListBackgroundColor(tableView, header);
     header.backgroundColor = ApolloSubredditIndexColorIsVisible(surfaceColor) ? surfaceColor : tableView.backgroundColor;
 }
