@@ -32,7 +32,6 @@
 // "<number>×"), which is specific to the speed picker and localization-safe.
 
 #import "ApolloCommon.h"
-#import "ApolloVideoPlaybackSpeedIcons.h"
 
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
@@ -246,28 +245,32 @@ static BOOL ShouldAugmentSpeedMenu(NSArray<UIMenuElement *> *children) {
 static const CGFloat kSpeedIconSourcePx = 144.0;
 static const CGFloat kSpeedIconPointSize = 34.0;
 
-static UIImage *DecodeEmbeddedIcon(NSString *base64) {
-    NSData *data = [[NSData alloc] initWithBase64EncodedString:base64
-                                                       options:NSDataBase64DecodingIgnoreUnknownCharacters];
+// Load a bundled icon (resources/<name>.png) as a template image at the menu
+// point size. ApolloBundledResourcePath resolves the file across the supported
+// install layouts (jailbreak, sideload, deb fuse) and the simulator.
+static UIImage *LoadBundledSpeedIcon(NSString *name) {
+    NSString *path = ApolloBundledResourcePath(name, @"png");
+    if (path.length == 0) return nil;
+    NSData *data = [NSData dataWithContentsOfFile:path];
     if (!data) return nil;
     UIImage *raw = [UIImage imageWithData:data scale:(kSpeedIconSourcePx / kSpeedIconPointSize)];
     return [raw imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
 }
 
-// Custom icons (embedded as base64 PNGs), decoded once and cached: a leaping
-// deer for 0.75× and a side-view running fox for 1.25× — matching Apollo's
-// snail/turtle/rabbit/cheetah line-art set.
+// Custom icons (PNGs in resources/), loaded once and cached: a leaping deer for
+// 0.75× and a side-view running fox for 1.25× — matching Apollo's snail/turtle/
+// rabbit/cheetah line-art set.
 static UIImage *DeerIcon(void) {
     static UIImage *icon = nil;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ icon = DecodeEmbeddedIcon(kApolloDeerIconBase64); });
+    dispatch_once(&once, ^{ icon = LoadBundledSpeedIcon(@"playback-speed-deer"); });
     return icon;
 }
 
 static UIImage *FoxIcon(void) {
     static UIImage *icon = nil;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ icon = DecodeEmbeddedIcon(kApolloFoxIconBase64); });
+    dispatch_once(&once, ^{ icon = LoadBundledSpeedIcon(@"playback-speed-fox"); });
     return icon;
 }
 
