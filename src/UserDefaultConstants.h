@@ -43,6 +43,7 @@ static NSString *const UDKeyProxyImgurDDG = @"ProxyImgurDDG";
 static NSString *const UDKeyImageUploadProvider = @"ImageUploadProvider";
 static NSString *const UDKeyShowUserAvatars = @"ShowUserAvatars";
 static NSString *const UDKeyUseProfileAvatarTabIcon = @"UseProfileAvatarTabIcon";
+static NSString *const UDKeySocialLinksInProfile = @"SocialLinksInProfile";
 static NSString *const UDKeyShowSubredditHeaders = @"ShowSubredditHeaders";
 static NSString *const UDKeyAutoHideTabBarShowOnIdle = @"AutoHideTabBarShowOnIdle";
 // When ON, focusing the main feed / subreddit search keeps the nav bar and the search

@@ -30,6 +30,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloSubredditCustomIconCache.m \
     $(SRC_DIR)/ApolloSubredditDefaultAssets.c \
     $(SRC_DIR)/ApolloUserAvatars.xm \
+    $(SRC_DIR)/ApolloProfileSocialLinks.m \
     $(SRC_DIR)/ApolloModeratorAvatars.xm \
     $(SRC_DIR)/ApolloSubredditHeaders.xm \
     $(SRC_DIR)/ApolloBannedProfile.xm \
