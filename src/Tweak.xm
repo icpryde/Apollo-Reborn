@@ -12,6 +12,7 @@
 #import "ApolloRedditMediaUpload.h"
 #import "ApolloDeletedCommentsData.h"
 #import "ApolloImageUploadHost.h"
+#import "ApolloImgChestUpload.h"
 #import "ApolloNotificationBackend.h"
 #import "ApolloState.h"
 #import "Tweak.h"
@@ -588,10 +589,26 @@ static NSURLRequest *ApolloLocalFastFailRequest(NSString *path) {
 
 %hook NSURLSession
 
+// Async image loaders (PINRemoteImage etc.) send no User-Agent on imgchest
+// requests, which its CDN rejects with 403; add one across every
+// task-creation entry point.
+- (NSURLSessionDownloadTask *)downloadTaskWithRequest:(NSURLRequest *)request {
+    NSURLRequest *ua = ApolloImgChestRequestByAddingUserAgentIfNeeded(request);
+    return ua ? %orig(ua) : %orig;
+}
+
+- (NSURLSessionDownloadTask *)downloadTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSURL *, NSURLResponse *, NSError *))completionHandler {
+    NSURLRequest *ua = ApolloImgChestRequestByAddingUserAgentIfNeeded(request);
+    return ua ? %orig(ua, completionHandler) : %orig;
+}
+
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
     ApolloRedditCaptureBearerTokenFromRequest(request, @"NSURLSession dataTaskWithRequest:");
     ApolloDeletedCommentsHandleRequestObservation(request, @"dataTaskWithRequest:");
     ApolloDeletedCommentsInstallDelegateTransformerIfNeeded((NSURLSession *)self, request);
+
+    NSURLRequest *imgChestUARequest = ApolloImgChestRequestByAddingUserAgentIfNeeded(request);
+    if (imgChestUARequest) return %orig(imgChestUARequest);
 
     NSURLRequest *redditMediaSubmitRequest = ApolloRedditMaybeRewriteSubmitRequest(request);
     if (redditMediaSubmitRequest) {
@@ -699,6 +716,9 @@ static NSURLRequest *ApolloLocalFastFailRequest(NSString *path) {
     ApolloRedditCaptureBearerTokenFromRequest(request, @"NSURLSession dataTaskWithRequest:completionHandler:");
     ApolloDeletedCommentsHandleRequestObservation(request, @"dataTaskWithRequest:completionHandler:");
 
+    NSURLRequest *imgChestUARequest = ApolloImgChestRequestByAddingUserAgentIfNeeded(request);
+    if (imgChestUARequest) return %orig(imgChestUARequest, completionHandler);
+
     NSURLRequest *redditMediaSubmitRequest = ApolloRedditMaybeRewriteSubmitRequest(request);
     if (redditMediaSubmitRequest) {
         void (^wrappedSubmitCompletionHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
@@ -733,6 +753,29 @@ static NSURLRequest *ApolloLocalFastFailRequest(NSString *path) {
             completionHandler(redditAlbumResponseData, fakeHTTPResponse, nil);
         };
         return %orig(ApolloLocalFastFailRequest(@"apollo-reddit-gallery-album"), wrappedHandler);
+    }
+
+    // ImgChest host: combine the member uploads into one multi-image ImgChest
+    // post and answer the Imgur album creation with its link.
+    ApolloImgChestAlbumResponder imgChestAlbumResponder = nil;
+    if (sImageUploadProvider == ImageUploadProviderImgChest) {
+        imgChestAlbumResponder = ApolloImgChestAlbumCreationResponderForRequest(request);
+    }
+    if (completionHandler && imgChestAlbumResponder) {
+        void (^wrappedHandler)(NSData *, NSURLResponse *, NSError *) = ^(__unused NSData *data, __unused NSURLResponse *response, __unused NSError *error) {
+            imgChestAlbumResponder(completionHandler);
+        };
+        return %orig(ApolloLocalFastFailRequest(@"apollo-imgchest-album"), wrappedHandler);
+    }
+
+    // Manage Uploads (issue #414): deletes of uploads this tweak created are
+    // routed to their real provider (ImgChest server-side delete; Reddit and
+    // merged interim entries acknowledged so they leave Apollo's list).
+    if (completionHandler && ApolloUploadRegistryShouldInterceptDelete(request)) {
+        void (^wrappedHandler)(NSData *, NSURLResponse *, NSError *) = ^(__unused NSData *data, __unused NSURLResponse *response, __unused NSError *error) {
+            ApolloUploadRegistryHandleImgurDelete(request, completionHandler);
+        };
+        return %orig(ApolloLocalFastFailRequest(@"apollo-upload-registry-delete"), wrappedHandler);
     }
 
     if ([host isEqualToString:@"imgur-apiv3.p.rapidapi.com"] && [path hasPrefix:@"/3/album"]) {
