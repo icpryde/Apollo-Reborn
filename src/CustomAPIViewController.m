@@ -1,6 +1,7 @@
 #import "CustomAPIViewController.h"
 #import "ApolloCommon.h"
 #import "ApolloNotificationBackend.h"
+#import "ApolloWebSessionLoginViewController.h"
 #import "ApolloState.h"
 #import "ApolloUserProfileCache.h"
 #import "ApolloLinkPreviewCache.h"
@@ -49,6 +50,30 @@ static NSInteger ApolloMediaPhysicalRow(NSInteger logicalRow) {
         return logicalRow - kApolloMediaInlineDependentRows;
     }
     return logicalRow;
+}
+
+// Canonical (mode-on) row indices within SectionAPIKeys. The Web Session Login
+// row only exists while API-Key-Free Mode is on; with it off, that row is absent
+// and every row at or below it slides up one slot. Mirrors the Media-section
+// mapping above so the API Keys index math lives in one place instead of being
+// inlined at each call site.
+typedef NS_ENUM(NSInteger, ApolloAPIKeyRow) {
+    // Rows 0-5 are the API-key text fields, row 6 is the Universal OAuth Sign-In
+    // switch, and row 7 is the User Agent field; the navigable/auxiliary rows below
+    // follow it.
+    kAPIKeyRowTroubleshooting = 8,
+    kAPIKeyRowSetupGuide      = 9,
+    kAPIKeyRowWebJSONSwitch   = 10,
+    kAPIKeyRowWebSessionLogin = 11,
+    kAPIKeyRowWidgetSetupCode = 12,
+};
+
+// Map a displayed (visible) API Keys row to its canonical index (ApolloAPIKeyRow).
+static NSInteger ApolloAPIKeyCanonicalRow(NSInteger displayedRow) {
+    if (!sWebJSONEnabled && displayedRow >= kAPIKeyRowWebSessionLogin) {
+        return displayedRow + 1;
+    }
+    return displayedRow;
 }
 
 static BOOL sLinkPreviewModeRefreshPending = NO;
@@ -137,6 +162,26 @@ typedef NS_ENUM(NSInteger, Tag) {
         }
     }
     return NO;
+}
+
+- (BOOL)apollo_usesCustomOAuthSignIn {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyUseCustomOAuthSignIn];
+}
+
+- (NSString *)apollo_redirectURIDetailText {
+    if ([self apollo_usesCustomOAuthSignIn]) {
+        return @"Must match the redirect URI registered with your Reddit API app. Any URI scheme is supported.";
+    }
+
+    NSString *registered = [[self registeredURLSchemes] componentsJoinedByString:@", "];
+    if (registered.length == 0) registered = @"none";
+    return [NSString stringWithFormat:@"Must match the app whose API key you're using. URI scheme (part before ://) must be registered in Info.plist under CFBundleURLTypes. Registered: %@", registered];
+}
+
+- (void)apollo_applyRedirectURITextColorToCell:(UITableViewCell *)cell {
+    UITextField *textField = [self apollo_textFieldInCell:cell];
+    if (!textField) return;
+    textField.textColor = ([self apollo_usesCustomOAuthSignIn] || [self isRedirectURISchemeValid:textField.text]) ? [UIColor labelColor] : [UIColor systemRedColor];
 }
 
 - (UIImage *)decodeBase64ToImage:(NSString *)strEncodeData {
@@ -352,9 +397,10 @@ typedef NS_ENUM(NSInteger, Tag) {
 
 - (NSString *)mediaUploadProviderText {
     switch (sImageUploadProvider) {
-        case ImageUploadProviderReddit: return @"Reddit";
+        case ImageUploadProviderReddit:   return @"Reddit";
+        case ImageUploadProviderImgChest: return @"Img Chest";
         case ImageUploadProviderImgur:
-        default:                        return @"Imgur";
+        default:                          return @"Imgur";
     }
 }
 
@@ -375,12 +421,23 @@ typedef NS_ENUM(NSInteger, Tag) {
 
     NSString *imgurTitle = (sImageUploadProvider == ImageUploadProviderImgur) ? @"Imgur (Current)" : @"Imgur";
     NSString *redditTitle = (sImageUploadProvider == ImageUploadProviderReddit) ? @"Reddit (Current)" : @"Reddit";
+    NSString *imgChestTitle = (sImageUploadProvider == ImageUploadProviderImgChest) ? @"Img Chest (Current)" : @"Img Chest";
 
     [sheet addAction:[UIAlertAction actionWithTitle:imgurTitle style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
         [self setImageUploadProvider:ImageUploadProviderImgur];
     }]];
     [sheet addAction:[UIAlertAction actionWithTitle:redditTitle style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
         [self setImageUploadProvider:ImageUploadProviderReddit];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:imgChestTitle style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+        // Uploading requires an API token (free at imgchest.com); without one
+        // there is nothing to authenticate the POST with.
+        if (sImageChestAPIToken.length == 0) {
+            [self showAlertWithTitle:@"Img Chest API Key Required"
+                             message:@"Add your Img Chest API key in the API Keys section first, then select Img Chest as the upload host."];
+            return;
+        }
+        [self setImageUploadProvider:ImageUploadProviderImgChest];
     }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
 
@@ -615,6 +672,12 @@ typedef NS_ENUM(NSInteger, Tag) {
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
     [self apollo_applyTheme];
+    // Refresh the Web Session Login status line after returning from the login
+    // flow (signed-in user / write-token availability may have just changed).
+    if (sWebJSONEnabled && [self.tableView numberOfRowsInSection:SectionAPIKeys] > kAPIKeyRowWebSessionLogin) {
+        [self.tableView reloadRowsAtIndexPaths:@[[NSIndexPath indexPathForRow:kAPIKeyRowWebSessionLogin inSection:SectionAPIKeys]]
+                              withRowAnimation:UITableViewRowAnimationNone];
+    }
 }
 
 - (void)viewWillDisappear:(BOOL)animated {
@@ -660,7 +723,12 @@ typedef NS_ENUM(NSInteger, Tag) {
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     switch (section) {
         case SectionBackupRestore: return 4;
-        case SectionAPIKeys: return 10; // 7 text fields + Can't sign in? + API key setup guide + Copy Widget Setup Code
+        // 7 text fields + Universal OAuth switch + Can't sign in? + API key setup
+        // guide + Web JSON switch + Copy Widget Setup Code (+ Web Session Login row,
+        // only while Web JSON mode is on). Widget Setup Code is the last canonical
+        // row, so the count is its index + 1, minus the Web Session Login row when
+        // the mode is off.
+        case SectionAPIKeys: return kAPIKeyRowWidgetSetupCode + (sWebJSONEnabled ? 1 : 0);
         case SectionGeneral: return sShowDeletedComments ? 11 : 10;
         case SectionMedia: return 13 + (sEnableInlineImages ? 0 : -kApolloMediaInlineDependentRows);
         case SectionSubreddits: return sSubredditListEnhancements ? 8 : 7;
@@ -893,7 +961,10 @@ typedef NS_ENUM(NSInteger, Tag) {
 
 - (UITableViewCell *)apiKeyCellForRow:(NSInteger)row tableView:(UITableView *)tableView {
     UITableViewCell *cell = nil;
-    switch (row) {
+    // Web Session Login only exists while Web JSON mode is on; when it's off the
+    // rows below it slide up one slot, so map back to the canonical index.
+    NSInteger effectiveRow = ApolloAPIKeyCanonicalRow(row);
+    switch (effectiveRow) {
         case 0:
             cell = [self textFieldCellWithIdentifier:@"Cell_API_Reddit"
                                                label:@"Reddit API Key"
@@ -939,16 +1010,23 @@ typedef NS_ENUM(NSInteger, Tag) {
                                                                 placeholder:defaultRedirectURI
                                                                        text:sRedirectURI
                                                                         tag:TagRedirectURI
-                                                                     detail:@"Must match the redirect URI registered with your Reddit API app. Any URI scheme is supported."];
+                                                                      detail:[self apollo_redirectURIDetailText]];
+            [self apollo_applyRedirectURITextColorToCell:cell];
             return cell;
         }
         case 6:
+            return [self switchCellWithIdentifier:@"Cell_API_CustomOAuth"
+                                            label:@"Universal OAuth Sign-In"
+                                           detail:@"Signs in with an in-app web view so any Redirect URI works. Turn off for Apollo's native sign-in."
+                                               on:[self apollo_usesCustomOAuthSignIn]
+                                           action:@selector(customOAuthSignInSwitchToggled:)];
+        case 7:
             return [self stackedTextFieldCellWithIdentifier:@"Cell_API_UserAgent"
                                                       label:@"User Agent"
                                                 placeholder:defaultUserAgent
-                                                       text:sUserAgent
+                                                        text:sUserAgent
                                                         tag:TagUserAgent];
-        case 7: {
+        case kAPIKeyRowTroubleshooting: {
             UITableViewCell *cell = [self.tableView dequeueReusableCellWithIdentifier:@"Cell_Troubleshooting"];
             if (!cell) {
                 cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"Cell_Troubleshooting"];
@@ -957,7 +1035,7 @@ typedef NS_ENUM(NSInteger, Tag) {
             cell.textLabel.text = @"Can't sign in?";
             return cell;
         }
-        case 8: {
+        case kAPIKeyRowSetupGuide: {
             UITableViewCell *cell = [self.tableView dequeueReusableCellWithIdentifier:@"Cell_Instructions"];
             if (!cell) {
                 cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"Cell_Instructions"];
@@ -967,7 +1045,42 @@ typedef NS_ENUM(NSInteger, Tag) {
             cell.textLabel.text = @"Giphy & ImgChest API Key Setup";
             return cell;
         }
-        case 9: {
+        case kAPIKeyRowWebJSONSwitch:
+            return [self switchCellWithIdentifier:@"Cell_API_WebJSON"
+                                            label:@"API-Key-Free Mode (Experimental)"
+                                           detail:@"Use Apollo by signing in to reddit.com instead of using API keys (OAuth). Supports browsing, voting, commenting, and saving."
+                                               on:sWebJSONEnabled
+                                           action:@selector(webJSONSwitchToggled:)];
+        case kAPIKeyRowWebSessionLogin: {
+            // Subtitle style so we can surface the harvested account / status.
+            UITableViewCell *cell = [self.tableView dequeueReusableCellWithIdentifier:@"Cell_API_WebSessionLogin"];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"Cell_API_WebSessionLogin"];
+                cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+                cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+            }
+            cell.textLabel.text = @"Web Session Login (Experimental)";
+            BOOL pendingRestart = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyWebJSONPendingRestart];
+            if (pendingRestart && sWebSessionCookieHeader.length > 0) {
+                // Mid-session login synthesized an account AccountManager hasn't
+                // loaded yet — nudge the user to quit & reopen so it activates.
+                cell.detailTextLabel.text = sWebSessionUsername.length > 0
+                    ? [NSString stringWithFormat:@"Signed in as u/%@ — quit & reopen Apollo to activate", sWebSessionUsername]
+                    : @"Signed in — quit & reopen Apollo to activate";
+                cell.detailTextLabel.textColor = [UIColor systemOrangeColor];
+            } else if (sWebSessionCookieHeader.length > 0) {
+                cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+                cell.detailTextLabel.text = sWebSessionUsername.length > 0
+                    ? [NSString stringWithFormat:@"Signed in as u/%@%@", sWebSessionUsername,
+                       sWebSessionModhash.length > 0 ? @"" : @" (read-only — no write token)"]
+                    : @"Session active";
+            } else {
+                cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+                cell.detailTextLabel.text = @"Not signed in — tap to harvest a cookie";
+            }
+            return cell;
+        }
+        case kAPIKeyRowWidgetSetupCode: {
             UITableViewCell *cell = [self.tableView dequeueReusableCellWithIdentifier:@"Cell_WidgetSetupCode"];
             if (!cell) {
                 cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"Cell_WidgetSetupCode"];
@@ -1551,11 +1664,18 @@ typedef NS_ENUM(NSInteger, Tag) {
             [self promptClearCustomSubredditBannersFromSourceView:cell];
         }
     } else if (indexPath.section == SectionAPIKeys) {
-        if (indexPath.row == 7) {
+        NSInteger row = ApolloAPIKeyCanonicalRow(indexPath.row);
+        if (row == kAPIKeyRowTroubleshooting) {
             [self pushTroubleshootingViewController];
-        } else if (indexPath.row == 8) {
+        } else if (row == kAPIKeyRowSetupGuide) {
             [self pushInstructionsViewController];
-        } else if (indexPath.row == 9) {
+        } else if (row == kAPIKeyRowWebSessionLogin) {
+            if ([[NSUserDefaults standardUserDefaults] boolForKey:UDKeyWebJSONPendingRestart] && sWebSessionCookieHeader.length > 0) {
+                [self promptQuitToActivateWebSession];
+            } else {
+                [self presentWebSessionLoginViewController];
+            }
+        } else if (row == kAPIKeyRowWidgetSetupCode) {
             [self copyWidgetSetupCode];
         }
     } else if (indexPath.section == SectionAbout) {
@@ -1656,7 +1776,11 @@ typedef NS_ENUM(NSInteger, Tag) {
 
 - (BOOL)tableView:(UITableView *)tableView shouldHighlightRowAtIndexPath:(NSIndexPath *)indexPath {
     if (indexPath.section == SectionBackupRestore) return YES;
-    if (indexPath.section == SectionAPIKeys && (indexPath.row == 7 || indexPath.row == 8 || indexPath.row == 9)) return YES;
+    if (indexPath.section == SectionAPIKeys) {
+        NSInteger row = ApolloAPIKeyCanonicalRow(indexPath.row);
+        if (row == kAPIKeyRowTroubleshooting || row == kAPIKeyRowSetupGuide ||
+            row == kAPIKeyRowWebSessionLogin || row == kAPIKeyRowWidgetSetupCode) return YES;
+    }
     if (indexPath.section == SectionMedia) {
         NSInteger row = ApolloMediaLogicalRow(indexPath.row);
         return (row == 0 || row == 1 || row == 2 || row == 5 || row == 6 || row == 7 || row == 8 || row == 9);
@@ -1887,7 +2011,7 @@ typedef NS_ENUM(NSInteger, Tag) {
         textField.text = [textField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
         sRedirectURI = textField.text;
         [[NSUserDefaults standardUserDefaults] setValue:sRedirectURI forKey:UDKeyRedirectURI];
-        textField.textColor = [UIColor labelColor];
+        textField.textColor = ([self apollo_usesCustomOAuthSignIn] || [self isRedirectURISchemeValid:textField.text]) ? [UIColor labelColor] : [UIColor systemRedColor];
     } else if (textField.tag == TagUserAgent) {
         textField.text = [textField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
         sUserAgent = textField.text;
@@ -1948,6 +2072,47 @@ typedef NS_ENUM(NSInteger, Tag) {
     [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyEnableFLEX];
 }
 
+- (void)webJSONSwitchToggled:(UISwitch *)sender {
+    BOOL wasOn = sWebJSONEnabled;
+    sWebJSONEnabled = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sWebJSONEnabled forKey:UDKeyWebJSONEnabled];
+    if (sWebJSONEnabled == wasOn) return;
+
+    // The Web Session Login row only exists while the mode is on.
+    NSArray<NSIndexPath *> *loginPaths = @[[NSIndexPath indexPathForRow:kAPIKeyRowWebSessionLogin inSection:SectionAPIKeys]];
+    if (sWebJSONEnabled) {
+        [self.tableView insertRowsAtIndexPaths:loginPaths withRowAnimation:UITableViewRowAnimationFade];
+    } else {
+        [self.tableView deleteRowsAtIndexPaths:loginPaths withRowAnimation:UITableViewRowAnimationFade];
+    }
+}
+
+- (void)presentWebSessionLoginViewController {
+    ApolloWebSessionLoginViewController *vc = [[ApolloWebSessionLoginViewController alloc] init];
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+    [self presentViewController:nav animated:YES completion:nil];
+}
+
+// A mid-session web login synthesized an account that AccountManager only loads at
+// launch. Offer to quit & reopen so it activates; "Re-sign In" falls back to the
+// login flow. The pending flag clears itself on the next launch (Tweak.xm %ctor).
+- (void)promptQuitToActivateWebSession {
+    NSString *who = sWebSessionUsername.length > 0 ? [NSString stringWithFormat:@"u/%@", sWebSessionUsername] : @"your account";
+    UIAlertController *alert = [UIAlertController
+        alertControllerWithTitle:@"Quit & Reopen to Activate"
+                         message:[NSString stringWithFormat:
+                             @"You're signed in as %@, but Apollo needs to quit and reopen to load the account and enable voting and commenting.", who]
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Quit Apollo" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        exit(0);
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Re-sign In" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        [self presentWebSessionLoginViewController];
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
 - (void)flairColorsSwitchToggled:(UISwitch *)sender {
     BOOL on = sender.isOn;
     sEnableFlairColors = on;
@@ -1957,6 +2122,12 @@ typedef NS_ENUM(NSInteger, Tag) {
 
 - (void)randNsfwSwitchToggled:(UISwitch *)sender {
     [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyShowRandNsfw];
+}
+
+- (void)customOAuthSignInSwitchToggled:(UISwitch *)sender {
+    [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyUseCustomOAuthSignIn];
+    [self.tableView reloadRowsAtIndexPaths:@[[NSIndexPath indexPathForRow:5 inSection:SectionAPIKeys]]
+                          withRowAnimation:UITableViewRowAnimationNone];
 }
 
 - (void)subredditListEnhancementsSwitchToggled:(UISwitch *)sender {
