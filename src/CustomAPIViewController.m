@@ -9,6 +9,7 @@
 #import "ApolloSubredditCustomIconCache.h"
 #import "ApolloSubredditInfoCache.h"
 #import "ApolloBannedProfile.h"
+#import "ApolloProfileSocialLinks.h"
 #import "UserDefaultConstants.h"
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <Security/Security.h>
@@ -730,7 +731,7 @@ typedef NS_ENUM(NSInteger, Tag) {
         // the mode is off.
         case SectionAPIKeys: return kAPIKeyRowWidgetSetupCode + (sWebJSONEnabled ? 1 : 0);
         case SectionGeneral: return sShowDeletedComments ? 11 : 10;
-        case SectionMedia: return 13 + (sEnableInlineImages ? 0 : -kApolloMediaInlineDependentRows);
+        case SectionMedia: return 14 + (sEnableInlineImages ? 0 : -kApolloMediaInlineDependentRows);
         case SectionSubreddits: return sSubredditListEnhancements ? 10 : 9;
         case SectionNotificationBackend: return 3; // URL + Registration Token + Test Connection
         case SectionAbout: return 5; // GitHub + Reddit + Thanks To + Export Logs + Version
@@ -1297,6 +1298,11 @@ typedef NS_ENUM(NSInteger, Tag) {
                                             label:@"Profile Picture Tab Icon"
                                                on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyUseProfileAvatarTabIcon]
                                            action:@selector(profileTabAvatarSwitchToggled:)];
+        case 13:
+            return [self switchCellWithIdentifier:@"Cell_Media_SocialLinks"
+                                            label:@"Social Links in Profile"
+                                               on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeySocialLinksInProfile]
+                                           action:@selector(socialLinksInProfileSwitchToggled:)];
         default: return [[UITableViewCell alloc] init];
     }
 }
@@ -2251,6 +2257,12 @@ typedef NS_ENUM(NSInteger, Tag) {
     sUseProfileAvatarTabIcon = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:sUseProfileAvatarTabIcon forKey:UDKeyUseProfileAvatarTabIcon];
     [[NSNotificationCenter defaultCenter] postNotificationName:@"ApolloProfileTabAvatarIconChangedNotification" object:nil];
+}
+
+- (void)socialLinksInProfileSwitchToggled:(UISwitch *)sender {
+    sSocialLinksInProfile = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sSocialLinksInProfile forKey:UDKeySocialLinksInProfile];
+    [[NSNotificationCenter defaultCenter] postNotificationName:ApolloSocialLinksToggleChangedNotification object:nil];
 }
 
 - (void)promptClearAllCachesFromSourceView:(UIView *)sourceView {
