@@ -607,7 +607,22 @@ static void ApolloShareGalleryPrepare(id previewNode) {
     NSNumber *stateNum = objc_getAssociatedObject(previewNode, &kApolloShareGalleryStateKey);
     ApolloShareGalleryState state = stateNum ? (ApolloShareGalleryState)stateNum.integerValue
                                              : ApolloShareGalleryStateNone;
-    if (state != ApolloShareGalleryStateNone) return; // already placeholder/applied
+    if (state == ApolloShareGalleryStateApplied) {
+        // Toggling a preview option (e.g. "Include Post Details") makes Apollo
+        // rebuild the node and RESET imageForImagePost/linkButtonNode back to its
+        // native compact link card. Our state is still "Applied", so without this
+        // the collage would be lost and the compact card would show. Re-assert the
+        // cached collage when we detect the reset. Comment / non-gallery shares
+        // never cache a collage, so they no-op here.
+        UIImage *cached = objc_getAssociatedObject(previewNode, &kApolloShareGalleryCollageKey);
+        if ([cached isKindOfClass:[UIImage class]] &&
+            ApolloShareIvarObject(previewNode, "imageForImagePost") == nil) {
+            ApolloLog(@"[ShareGallery] collage reset by a toggle, re-injecting cached image");
+            ApolloShareGalleryInstallImageOnMain(previewNode, cached, YES);
+        }
+        return;
+    }
+    if (state != ApolloShareGalleryStateNone) return; // placeholder in flight
 
     // Comment-share mode: when the user is sharing a COMMENT (not the post),
     // the node still carries the post's `link` ivar, but the shared image
