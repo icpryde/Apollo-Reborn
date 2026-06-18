@@ -62,6 +62,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloShareAsImageGallery.xm \
     $(SRC_DIR)/ApolloShareAsImageLink.xm \
     $(SRC_DIR)/ApolloShareAsVideo.xm \
+    $(SRC_DIR)/ApolloShareAsImagePreviewFix.xm \
     $(SRC_DIR)/ApolloTranslation.xm \
     $(SRC_DIR)/ApolloVideoUnmute.xm \
     $(SRC_DIR)/ApolloVideoSwipeFix.xm \
