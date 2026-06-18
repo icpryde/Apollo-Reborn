@@ -264,6 +264,11 @@ static void CollectContextMenuInteractions(UIView *view,
 @property (nonatomic, assign) BOOL inZone;     // current touch began in the right third
 @property (nonatomic, assign) BOOL active;     // 2× currently engaged
 @property (nonatomic, assign) float preHoldRate;
+// The exact AVPlayer we sped up, held strongly so we restore *that* instance on
+// release — not one re-resolved from the (possibly torn-down) media viewer. For
+// shared v.redd.it players, re-resolving could miss the restore and leave the
+// feed/comments copy stuck at 2×.
+@property (nonatomic, strong) AVPlayer *engagedPlayer;
 - (void)installOnView:(UIView *)view;
 @end
 
@@ -354,6 +359,7 @@ static void CollectContextMenuInteractions(UIView *view,
     AVPlayer *player = MediaViewerPlayer(self.mediaViewer);
     if (!player) { ApolloLog(@"VideoHoldSpeed: holdElapsed — no player"); return; }
 
+    self.engagedPlayer = player;      // restore THIS exact instance on release
     self.preHoldRate = player.rate;   // 0 if paused, 1.0, or a custom menu speed
     self.active = YES;
     [player setRate:kHoldSpeed];
@@ -366,10 +372,24 @@ static void CollectContextMenuInteractions(UIView *view,
     self.inZone = NO;
     if (!self.active) return;
     self.active = NO;
-    AVPlayer *player = MediaViewerPlayer(self.mediaViewer);
-    if (player) [player setRate:self.preHoldRate];
+    // Restore the SAME player we sped up — not one re-resolved from the media
+    // viewer, which may be a different instance (compact posts spin up a fresh
+    // comments player) or nil (a swipe-to-dismiss while holding can tear down the
+    // weak mediaViewer before the finger lifts). Missing the restore on a shared
+    // v.redd.it player would leave the feed/comments copy stuck at 2×.
+    [self.engagedPlayer setRate:self.preHoldRate];
+    self.engagedPlayer = nil;
     [self hideOverlay];
     ApolloLog(@"VideoHoldSpeed: released (restored rate=%.2f)", self.preHoldRate);
+}
+
+// Safety net: if the handler is deallocated mid-hold (e.g. the media viewer is
+// torn down by a flick-dismiss before the touch ends, so -touchUp never fires),
+// still reset the player we sped up. engagedPlayer is strong, so it's alive here.
+- (void)dealloc {
+    if (self.active && self.engagedPlayer) {
+        [self.engagedPlayer setRate:self.preHoldRate];
+    }
 }
 
 #pragma mark Overlay
