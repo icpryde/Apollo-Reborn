@@ -1772,7 +1772,21 @@ static BOOL ApolloUserFlairPresenterHasFlairSelector(UIViewController *presenter
             // layout pass renders them (the thread-locals are cleared by then);
             // textRepresentation drives the label, `flairs` the sprite image. The
             // committed selection is the bare template (we never touch the model).
+            //
+            // Only do this for templates that have NO real text of their own. Some
+            // subs (e.g. r/steinsgate) give each template BOTH a css class AND a real
+            // flair_text name ("suzuha amane") — for those the name is the right label,
+            // so leave them to Apollo's native rendering instead of prettifying the
+            // css class into nonsense like "Avatar Img Sg Rc 0".
             NSString *cssClass = ApolloUserFlairCssClassForOption((UIViewController *)self, opt);
+            // Use the template's REAL text only (textRepresentation / flair_text), NOT
+            // ApolloUserFlairOptionText — that falls back to the `flairs` getter, which
+            // we override with our synthetic sprite+name, so it would read back our own
+            // label on re-render and wrongly suppress the sprite (feedback loop).
+            NSString *realText = ApolloUserFlairObjectString(opt, @[@"textRepresentation", @"text", @"flairText", @"flair_text", @"plainText"]);
+            if (cssClass && !ApolloUserFlairStringIsBlank(realText)) {
+                cssClass = nil; // labeled template — render its real name natively
+            }
             if (cssClass) {
                 NSString *name = ApolloUserFlairPrettifyClass(cssClass);
                 NSString *spriteFile = ApolloUserFlairSpriteFileForClass((UIViewController *)self, cssClass);
