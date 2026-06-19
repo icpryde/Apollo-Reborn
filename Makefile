@@ -20,6 +20,8 @@ SSZIPARCHIVE_FILES = $(wildcard $(SSZIPARCHIVE_DIR)/*.m) \
     $(wildcard $(SSZIPARCHIVE_DIR)/minizip/compat/*.c)
 
 ApolloReborn_FILES = \
+    $(SRC_DIR)/ApolloFoundationModels.swift \
+    $(SRC_DIR)/ApolloAISummary.xm \
     $(SRC_DIR)/Tweak.xm \
     $(SRC_DIR)/ApolloCommon.m \
     $(SRC_DIR)/ApolloRedditMediaUpload.m \
@@ -91,6 +93,10 @@ ApolloReborn_FILES = \
     $(SSZIPARCHIVE_FILES)
 ApolloReborn_FRAMEWORKS = UIKit Security AVFoundation OSLog NaturalLanguage ImageIO StoreKit PhotosUI SafariServices SystemConfiguration WebKit AuthenticationServices
 ApolloReborn_LIBRARIES = z iconv
+# FoundationModels (Apple on-device AI, iOS 26+) is weak-linked so the dylib
+# still loads on older OSes; the Swift bridge (ApolloFoundationModels.swift)
+# guards every call behind #available(iOS 26).
+ApolloReborn_LDFLAGS = -weak_framework FoundationModels
 ApolloReborn_CFLAGS = -fobjc-arc -Wno-error=unguarded-availability-new -Wno-module-import-in-extern-c -I$(THEOS_PROJECT_DIR)/$(SRC_DIR) -I$(THEOS_PROJECT_DIR)/liquid-glass/generated -I$(THEOS_PROJECT_DIR)/$(MODULES_DIR) -I$(THEOS_PROJECT_DIR)/$(SSZIPARCHIVE_DIR) -I$(THEOS_PROJECT_DIR)/$(SSZIPARCHIVE_DIR)/minizip -DHAVE_ARC4RANDOM_BUF -DHAVE_ICONV -DHAVE_INTTYPES_H -DHAVE_PKCRYPT -DHAVE_STDINT_H -DHAVE_WZAES -DHAVE_ZLIB -DZLIB_COMPAT
 
 ApolloReborn_BUNDLE_RESOURCE_DIRS = resources
@@ -109,6 +115,11 @@ ifeq ($(APOLLO_SIM_BUILD),1)
 # MobileSubstrate generator does, so force-include it for the MSHookIvar template
 # (a pure ObjC-runtime helper with no CydiaSubstrate link dependency).
 ApolloReborn_CFLAGS += -DAPOLLO_SIM_BUILD=1 -include substrate.h
+# Xcode 27 sim builds raise DEPLOY_MIN to 15.0 (older targets fail libc++'s
+# "no longer supported" check), which turns UIApplication.windows deprecation
+# warnings into -Werror failures. Silence them rather than rewriting working
+# device-targeted call sites just for the sim build.
+ApolloReborn_CFLAGS += -Wno-deprecated-declarations
 else
 ApolloReborn_OBJ_FILES = $(shell find $(FFMPEG_KIT_DIR) -name '*.a')
 
