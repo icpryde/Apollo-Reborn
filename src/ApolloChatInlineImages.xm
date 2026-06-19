@@ -19,6 +19,7 @@
 #import "ApolloCommon.h"
 #import "ApolloUserProfileCache.h"
 #import "ApolloState.h"
+#import "ApolloImageChestResolver.h"
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -87,10 +88,20 @@ static NSURL *ApolloChatImageURLFromAttributed(NSAttributedString *attr) {
             NSURL *u = nil;
             if ([val isKindOfClass:[NSURL class]]) u = val;
             else if ([val isKindOfClass:[NSString class]] && [(NSString *)val hasPrefix:@"http"]) u = [NSURL URLWithString:val];
-            if (u && ApolloChatIsImageURL(u)) { found = u; *stop = YES; return; }
+            if (u && (ApolloChatIsImageURL(u) || ApolloImageChestIsPostURL(u))) { found = u; *stop = YES; return; }
         }
     }];
     return found;
+}
+
+// Pull the direct CDN image URL out of an ImageChest resolver result (single image, or first of album).
+static NSURL *ApolloChatDirectURLFromImageChest(NSDictionary *res) {
+    if (![res isKindOfClass:[NSDictionary class]]) return nil;
+    NSArray *imgs = [res[@"images"] isKindOfClass:[NSArray class]] ? res[@"images"] : nil;
+    id first = imgs.firstObject;
+    if ([first isKindOfClass:[NSDictionary class]] && [first[@"url"] isKindOfClass:[NSURL class]]) return first[@"url"];
+    if ([res[@"url"] isKindOfClass:[NSURL class]]) return res[@"url"];
+    return nil;
 }
 
 #pragma mark - ivar access
@@ -476,24 +487,21 @@ static void ApolloChatRenderImageInCell(id vc, id cell, NSURL *url, NSIndexPath 
         iv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         objc_setAssociatedObject(cell, &kApolloChatImgViewKey, iv, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
-    // A real image/gif fills a rounded, neutral-backed thumbnail bubble; an emoji/snoomoji sticker
-    // is transparent and unrounded (the glyph carries its own padding) so it floats on the message
-    // bubble like an iMessage jumbo emoji rather than sitting in a grey box.
+    // Rendered media floats on the chat background with NO bubble — matching how Reddit shows
+    // images/GIFs/emoji. A real image/gif gets rounded corners + aspect-fill; an emoji/snoomoji
+    // sticker is transparent + unrounded (the glyph carries its own padding). We clear BOTH our image
+    // view's background AND Apollo's blue/grey message container, so a transparent PNG (folder icon)
+    // or a snoomoji shows the chat background through its margins instead of sitting in a box.
+    // MessageKit re-applies the bubble colour when this cell is reused for a text message.
     if (sticker) {
         iv.contentMode = UIViewContentModeScaleAspectFit;
         iv.layer.cornerRadius = 0.0;
-        iv.backgroundColor = [UIColor clearColor];
     } else {
         iv.contentMode = UIViewContentModeScaleAspectFill;
         iv.layer.cornerRadius = 15.0;   // rounds opaque photos; transparent PNGs ignore it
-        // No bubble for images: clear BOTH Apollo's message container (the blue/grey bubble) AND our
-        // image view's own background. A transparent PNG (e.g. a folder icon) then shows the chat
-        // background through its margins instead of a grey box. MessageKit re-applies the bubble
-        // colour when this cell is reused for text, so text bubbles keep theirs. Stickers are left
-        // alone (Apollo already jumbo-blanks a lone-emoji bubble).
-        iv.backgroundColor = [UIColor clearColor];
-        container.backgroundColor = [UIColor clearColor];
     }
+    iv.backgroundColor = [UIColor clearColor];
+    container.backgroundColor = [UIColor clearColor];
     iv.userInteractionEnabled = !sticker;   // tappable for images/gifs, not for emoji stickers
     if (iv.superview != container) [container addSubview:iv];
     [container bringSubviewToFront:iv];
@@ -608,6 +616,21 @@ static void ApolloChatProcessCell(id vc, id collectionView, id cell, NSIndexPath
                     if (e) s = ApolloChatEmojiStickerURL(e);
                 }
                 if (s) { imgURL = s; sticker = YES; }
+            }
+            // An ImgChest post URL (imgchest.com/p/<id>) isn't a direct image — resolve it to the CDN
+            // image via the shared resolver, then render that. Our own sent images use this short link;
+            // inbound ImgChest links resolve the same way. Until resolved, leave it as text/link.
+            if (imgURL && !sticker && ApolloImageChestIsPostURL(imgURL)) {
+                NSURL *direct = ApolloChatDirectURLFromImageChest(ApolloImageChestCachedResolution(imgURL));
+                if (direct) {
+                    imgURL = direct;
+                } else {
+                    __weak id wcv = collectionView;
+                    ApolloImageChestResolveURL(imgURL, ^(__unused NSDictionary *r) {
+                        if (wcv) ApolloChatScheduleReflow(wcv);
+                    });
+                    imgURL = nil;
+                }
             }
         }
         if (imgURL) {

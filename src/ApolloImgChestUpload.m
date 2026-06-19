@@ -69,6 +69,14 @@ static NSDictionary *_Nullable ApolloUploadRegistryEntry(NSString *token) {
     }
 }
 
+NSURL *ApolloImgChestPostURLForUploadedLink(NSURL *cdnLink) {
+    if (![cdnLink isKindOfClass:[NSURL class]]) return nil;
+    NSDictionary *entry = ApolloUploadRegistryEntry(cdnLink.lastPathComponent);
+    NSString *postID = [entry[@"post"] isKindOfClass:[NSString class]] ? entry[@"post"] : nil;
+    if (postID.length == 0) return nil;
+    return [NSURL URLWithString:[@"https://imgchest.com/p/" stringByAppendingString:postID]];
+}
+
 void ApolloUploadRegistryRecordRedditUpload(NSURL *mediaURL) {
     NSString *token = mediaURL.lastPathComponent;
     if (token.length == 0) return;

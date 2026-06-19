@@ -2841,6 +2841,7 @@ static void ApolloCompleteRedditNativeMediaUpload(NSData *mediaData, NSURL *medi
     // ImgChest uses its own API key (not Reddit's bearer), so this runs ahead of
     // the keyless Web JSON fallback below and always returns when it applies.
     if ((sImageUploadProvider == ImageUploadProviderImgChest || ApolloChatImageUploadPending()) && completionHandler && ApolloIsImgurImageUploadRequest(request)) {
+        BOOL chestForChat = ApolloChatImageUploadPending();   // capture now; the upload completes asynchronously
         NSString *chestMIMEType = ApolloMediaMIMETypeForFilename(nil, [request valueForHTTPHeaderField:@"Content-Type"]);
         if (!ApolloImgChestUploadAvailable() || ApolloMediaMIMETypeIsVideo(chestMIMEType)) {
             ApolloLog(@"[ImgChestUpload] %@ — falling back to Imgur (fromData)",
@@ -2858,7 +2859,10 @@ static void ApolloCompleteRedditNativeMediaUpload(NSData *mediaData, NSURL *medi
                     completionHandler(nil, nil, uploadError);
                     return;
                 }
-                NSData *synthetic = ApolloSyntheticImgurUploadResponseData(link, chestMIMEType);
+                // For a chat send, swap the long CDN file URL for the short imgchest.com/p/<id> post URL
+                // (the chat renderer resolves it back to the image inline via ApolloImageChestResolver).
+                NSURL *sendLink = (chestForChat ? (ApolloImgChestPostURLForUploadedLink(link) ?: link) : link);
+                NSData *synthetic = ApolloSyntheticImgurUploadResponseData(sendLink, chestMIMEType);
                 NSHTTPURLResponse *fake = [[NSHTTPURLResponse alloc] initWithURL:requestURL
                                                                       statusCode:200
                                                                      HTTPVersion:@"HTTP/1.1"
@@ -2962,6 +2966,7 @@ static void ApolloCompleteRedditNativeMediaUpload(NSData *mediaData, NSURL *medi
     // fallback since it authenticates with its own API key, and always returns when
     // ImgChest is the selected provider for an Imgur upload request.
     if ((sImageUploadProvider == ImageUploadProviderImgChest || ApolloChatImageUploadPending()) && completionHandler && ApolloIsImgurImageUploadRequest(request)) {
+        BOOL chestForChat = ApolloChatImageUploadPending();   // capture now; the upload completes asynchronously
         NSString *chestFilename = fileURL.lastPathComponent.length > 0 ? fileURL.lastPathComponent : @"apollo-upload.jpg";
         NSString *chestMIMEType = ApolloMediaMIMETypeForFilename(chestFilename, [request valueForHTTPHeaderField:@"Content-Type"]);
         NSData *chestData = [NSData dataWithContentsOfURL:fileURL];
@@ -2979,7 +2984,10 @@ static void ApolloCompleteRedditNativeMediaUpload(NSData *mediaData, NSURL *medi
                     completionHandler(nil, nil, uploadError);
                     return;
                 }
-                NSData *synthetic = ApolloSyntheticImgurUploadResponseData(link, chestMIMEType);
+                // For a chat send, swap the long CDN file URL for the short imgchest.com/p/<id> post URL
+                // (the chat renderer resolves it back to the image inline via ApolloImageChestResolver).
+                NSURL *sendLink = (chestForChat ? (ApolloImgChestPostURLForUploadedLink(link) ?: link) : link);
+                NSData *synthetic = ApolloSyntheticImgurUploadResponseData(sendLink, chestMIMEType);
                 NSHTTPURLResponse *fake = [[NSHTTPURLResponse alloc] initWithURL:requestURL
                                                                       statusCode:200
                                                                      HTTPVersion:@"HTTP/1.1"

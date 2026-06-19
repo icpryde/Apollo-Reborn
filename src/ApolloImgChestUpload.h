@@ -19,6 +19,11 @@ void ApolloImgChestUploadData(NSData *data,
                               NSString *mimeType,
                               void (^completion)(NSURL *_Nullable directLink, NSError *_Nullable error));
 
+/// Map a CDN image link this tweak just uploaded (cdn.imgchest.com/files/<id>.<ext>) to its short
+/// ImgChest post URL (imgchest.com/p/<post>), via the upload registry. nil if not one of our uploads.
+/// Used by the chat send path to send the short post link instead of the long CDN file URL.
+NSURL *_Nullable ApolloImgChestPostURLForUploadedLink(NSURL *cdnLink);
+
 /// When `request` is an Imgur album-creation request whose member tokens are
 /// all cached ImgChest uploads, returns a block that asynchronously creates
 /// the combined ImgChest post and replies with a synthetic Imgur album
