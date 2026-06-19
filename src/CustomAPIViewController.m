@@ -717,7 +717,7 @@ typedef NS_ENUM(NSInteger, Tag) {
         // row, so the count is its index + 1, minus the Web Session Login row when
         // the mode is off.
         case SectionAPIKeys: return kAPIKeyRowWidgetSetupCode + (sWebJSONEnabled ? 1 : 0);
-        case SectionGeneral: return sShowDeletedComments ? 11 : 10;
+        case SectionGeneral: return sShowDeletedComments ? 12 : 11;
         case SectionMedia: return 13 + (sEnableInlineImages ? 0 : -kApolloMediaInlineDependentRows);
         case SectionSubreddits: return sSubredditListEnhancements ? 8 : 7;
         case SectionNotificationBackend: return 3; // URL + Registration Token + Test Connection
@@ -1156,6 +1156,12 @@ typedef NS_ENUM(NSInteger, Tag) {
                                             label:@"Color Flairs"
                                                on:[defaults boolForKey:UDKeyEnableFlairColors]
                                            action:@selector(flairColorsSwitchToggled:)];
+        case 11:
+            return [self switchCellWithIdentifier:@"Cell_Gen_AISummaries"
+                                            label:@"AI Summaries"
+                                           detail:@"On-device post summaries and discussion summaries for larger threads. Discussions require at least 5 substantive comments and ignore AutoModerator and removed comments. Requires Apple Intelligence on iOS 26 or later."
+                                               on:[defaults boolForKey:UDKeyEnableAISummaries]
+                                           action:@selector(aiSummariesSwitchToggled:)];
         default: return [[UITableViewCell alloc] init];
     }
 }
@@ -2110,6 +2116,11 @@ typedef NS_ENUM(NSInteger, Tag) {
 
 - (void)randNsfwSwitchToggled:(UISwitch *)sender {
     [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyShowRandNsfw];
+}
+
+- (void)aiSummariesSwitchToggled:(UISwitch *)sender {
+    sEnableAISummaries = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sEnableAISummaries forKey:UDKeyEnableAISummaries];
 }
 
 - (void)customOAuthSignInSwitchToggled:(UISwitch *)sender {

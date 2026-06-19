@@ -42,6 +42,12 @@ extern BOOL sEnableFlairColors;
 // link + optional link card) is preserved. See ApolloInlineImages.xm.
 extern BOOL sEnableInlineImages;
 
+// On-device AI summaries (Apple FoundationModels, iOS 26+). Off by default.
+// When on, a post summary is rendered at the bottom of the post and a comment
+// summary at the top of the comments, generated automatically on open. See
+// ApolloAISummary.xm.
+extern BOOL sEnableAISummaries;
+
 // Horizontal alignment for inline media containers narrower than the row width
 // (tall portrait images, height-capped images). Has no effect on full-width media.
 typedef NS_ENUM(NSInteger, ApolloInlineImageAlignment) {

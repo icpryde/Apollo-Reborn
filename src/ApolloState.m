@@ -31,6 +31,7 @@ BOOL sModernSubredditDividers = YES;
 BOOL sSubredditListEnhancements = YES;
 BOOL sEnableFlairColors = NO;
 BOOL sEnableInlineImages = NO;
+BOOL sEnableAISummaries = NO;
 NSInteger sInlineImageAlignment = ApolloInlineImageAlignmentCenter;
 NSInteger sAutoplayInlineGIFMode = ApolloAutoplayInlineGIFModeDefault;
 NSInteger sLinkPreviewBodyMode = ApolloLinkPreviewModeOff;

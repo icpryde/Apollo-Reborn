@@ -68,6 +68,9 @@ static NSString *const UDKeyLibreTranslateAPIKey = @"LibreTranslateAPIKey";
 // Array<String> of 2-letter language codes to leave untranslated (detected source language).
 static NSString *const UDKeyTranslationSkipLanguages = @"TranslationSkipLanguages";
 
+// On-device AI summaries (Apple FoundationModels, iOS 26+). Off by default.
+static NSString *const UDKeyEnableAISummaries = @"EnableAISummaries";
+
 // Tag filters (NSFW / Spoiler) — hide or blur posts in the feed based on
 // Reddit's built-in tags. Brand Affiliate is intentionally absent because
 // Apollo's RDKLink does not deserialize that field.
