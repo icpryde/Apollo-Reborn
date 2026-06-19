@@ -8,6 +8,7 @@
 #import "ApolloUserProfileCache.h"
 #import "ApolloSubredditInfoCache.h"
 #import "ApolloBannedProfile.h"
+#import "ApolloProfileSocialLinks.h"
 
 static NSString *const ApolloUserAvatarsToggleChangedNotification = @"ApolloUserAvatarsToggleChangedNotification";
 static NSString *const ApolloProfileTabAvatarIconChangedNotification = @"ApolloProfileTabAvatarIconChangedNotification";
@@ -65,6 +66,7 @@ static const void *kApolloProfileTabAvatarImageMarkerKey = &kApolloProfileTabAva
 @property(nonatomic, strong) UILabel *usernameLabel;
 @property(nonatomic, strong) UIButton *editProfileButton;
 @property(nonatomic, strong) UILabel *aboutLabel;
+@property(nonatomic, strong) ApolloProfileSocialLinksView *socialLinksView;
 @property(nonatomic, weak) UIViewController *hostViewController;
 @property(nonatomic, copy) NSString *username;
 @property(nonatomic, copy) void (^heightInvalidationBlock)(void);
@@ -156,6 +158,19 @@ static void ApolloProfileScheduleTabAvatarRefresh(NSString *reason);
         _aboutLabel.numberOfLines = 0;
         _aboutLabel.adjustsFontForContentSizeCategory = YES;
         [self addSubview:_aboutLabel];
+
+        // Social-links band, positioned between the username line and the bio.
+        // It self-manages its data; when its rendered height changes (links arrive,
+        // toggle flips) it re-measures the header so the tableHeaderView grows.
+        _socialLinksView = [[ApolloProfileSocialLinksView alloc] init];
+        __weak ApolloProfileHeaderView *weakSelf = self;
+        _socialLinksView.heightChangedBlock = ^{
+            ApolloProfileHeaderView *strongSelf = weakSelf;
+            if (!strongSelf) return;
+            [strongSelf setNeedsLayout];
+            if (strongSelf.heightInvalidationBlock) strongSelf.heightInvalidationBlock();
+        };
+        [self addSubview:_socialLinksView];
     }
     return self;
 }
@@ -210,6 +225,7 @@ static CGFloat const ApolloProfileTextTopGap = 12.0;
 static CGFloat const ApolloProfileAboutSideInset = 20.0;
 static CGFloat const ApolloProfileAboutMaxHeight = 220.0; // ~10 lines @ footnote font, covers 200+ chars at full width
 static CGFloat const ApolloProfileBottomPadding = 16.0;
+static CGFloat const ApolloProfileSocialAboutGap = 8.0;   // gap below the social band, above the bio
 
 - (CGRect)apollo_avatarFrame {
     CGFloat borderSize = ApolloProfileAvatarDiameter + 6.0;
@@ -232,11 +248,11 @@ static CGFloat const ApolloProfileBottomPadding = 16.0;
     return MIN(ApolloProfileAboutMaxHeight, MAX(18.0, ceil(rect.size.height)));
 }
 
-// Computes the y-coordinate where the about text should start, full-width,
-// based on the bottom of whichever of (avatar/snoovatar, displayName/username
-// stack) reaches further down. This ensures the about text always sits below
-// the avatar — no empty space wasted beneath the picture when about is long.
-- (CGFloat)apollo_aboutYForWidth:(CGFloat)width {
+// The y-coordinate where the post-name content (the social band, else the bio)
+// starts — full-width, below whichever of the avatar/snoovatar or the
+// displayName/username stack reaches further down. No empty space is wasted
+// beneath the picture when the bio is long.
+- (CGFloat)apollo_socialYForWidth:(CGFloat)width {
     BOOL showSnoovatar = !self.snoovatarImageView.hidden;
     CGRect mediaFrame = showSnoovatar ? [self apollo_snoovatarFrame] : [self apollo_avatarFrame];
     CGFloat mediaBottom = CGRectGetMaxY(mediaFrame);
@@ -251,8 +267,24 @@ static CGFloat const ApolloProfileBottomPadding = 16.0;
     CGFloat usernameBottom = displayNameY + displayNameH + usernameTopGap + usernameH;
     (void)textWidth;
 
-    CGFloat candidateY = MAX(mediaBottom + ApolloProfileTextTopGap, usernameBottom + 10.0);
-    return candidateY;
+    return MAX(mediaBottom + ApolloProfileTextTopGap, usernameBottom + 10.0);
+}
+
+// Height the social-links band wants at this header width (0 when off / no links).
+- (CGFloat)apollo_socialHeightForWidth:(CGFloat)width {
+    if (!self.socialLinksView) return 0.0;
+    CGFloat bandWidth = MAX(120.0, width - ApolloProfileAboutSideInset * 2.0);
+    return [self.socialLinksView preferredHeightForWidth:bandWidth];
+}
+
+// The about text sits below the social band (which sits below the name stack /
+// avatar). When the band is empty it collapses to zero and the bio sits where it
+// always did.
+- (CGFloat)apollo_aboutYForWidth:(CGFloat)width {
+    CGFloat socialY = [self apollo_socialYForWidth:width];
+    CGFloat socialH = [self apollo_socialHeightForWidth:width];
+    if (socialH > 0.0) return socialY + socialH + ApolloProfileSocialAboutGap;
+    return socialY;
 }
 
 - (CGFloat)preferredHeightForWidth:(CGFloat)width {
@@ -295,6 +327,12 @@ static CGFloat const ApolloProfileBottomPadding = 16.0;
     self.usernameLabel.frame = CGRectMake(textX, CGRectGetMaxY(self.displayNameLabel.frame) + 1.0, textWidth, 18.0);
 
     CGFloat aboutWidth = MAX(120.0, width - ApolloProfileAboutSideInset * 2.0);
+
+    CGFloat socialY = [self apollo_socialYForWidth:width];
+    CGFloat socialH = [self apollo_socialHeightForWidth:width];
+    self.socialLinksView.frame = CGRectMake(ApolloProfileAboutSideInset, socialY, aboutWidth, socialH);
+    self.socialLinksView.hidden = (socialH <= 0.0);
+
     CGFloat aboutHeight = [self apollo_aboutHeightForWidth:aboutWidth];
     CGFloat aboutY = [self apollo_aboutYForWidth:width];
     self.aboutLabel.frame = CGRectMake(ApolloProfileAboutSideInset, aboutY, aboutWidth, aboutHeight);
@@ -319,6 +357,9 @@ static CGFloat const ApolloProfileBottomPadding = 16.0;
     self.displayNameLabel.hidden = self.displayNameLabel.text.length == 0;
     self.usernameLabel.hidden = self.usernameLabel.text.length == 0;
     self.aboutLabel.hidden = self.aboutLabel.text.length == 0;
+    // Feed the social-links band the username so it can load/render (no-op if the
+    // username is unchanged; the band re-measures the header when links arrive).
+    self.socialLinksView.username = username;
     [self setNeedsLayout];
     if (self.heightInvalidationBlock) {
         self.heightInvalidationBlock();
@@ -1575,6 +1616,7 @@ static void ApolloProfileInstallOrUpdateHeader(id viewControllerObject) {
         objc_setAssociatedObject(viewControllerObject, kApolloProfileOriginalHeaderKey, originalHeader, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
     header.hostViewController = viewController;
+    header.socialLinksView.hostViewController = viewController;
     header.username = username;
     [header apollo_updateEditProfileButtonColors];
     __weak UIViewController *weakProfileController = viewController;
@@ -2300,6 +2342,7 @@ static void ApolloAvatarApplySubredditIconToSharePreview(id postInfo, NSString *
     if (!header) return;
     ApolloLog(@"[UserAvatars] Pull-to-refresh forcing avatar/banner refetch for u/%@", username);
     ApolloProfileLoadImages(header, username, YES);
+    [header.socialLinksView refresh];
 }
 
 - (void)redditAccountChangedWithNotification:(id)notification {

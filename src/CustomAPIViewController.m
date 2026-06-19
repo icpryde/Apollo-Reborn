@@ -9,6 +9,7 @@
 #import "ApolloSubredditCustomIconCache.h"
 #import "ApolloSubredditInfoCache.h"
 #import "ApolloBannedProfile.h"
+#import "ApolloProfileSocialLinks.h"
 #import "UserDefaultConstants.h"
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <Security/Security.h>
@@ -82,7 +83,7 @@ static NSInteger sPendingLinkPreviewModeRefreshMode = ApolloLinkPreviewModeFull;
 
 #pragma mark - Thanks To VC (forward decl)
 
-@interface ApolloThanksToViewController : UITableViewController
+@interface ApolloThanksToViewController : ApolloSettingsTableViewController
 @end
 
 static NSString *const kApolloRebornSubredditName = @"ApolloReborn";
@@ -198,93 +199,31 @@ typedef NS_ENUM(NSInteger, Tag) {
     [self presentViewController:alert animated:YES completion:nil];
 }
 
-- (UITableView *)apollo_findTableViewInView:(UIView *)view {
-    if (!view) return nil;
-    if ([view isKindOfClass:[UITableView class]]) return (UITableView *)view;
-    for (UIView *subview in view.subviews) {
-        UITableView *tableView = [self apollo_findTableViewInView:subview];
-        if (tableView) return tableView;
-    }
-    return nil;
-}
-
-- (UITableView *)apollo_sourceThemeTableView {
-    NSArray<UIViewController *> *stack = self.navigationController.viewControllers;
-    NSUInteger index = [stack indexOfObject:self];
-    if (index == NSNotFound || index == 0) return nil;
-
-    UIViewController *source = stack[index - 1];
-    if ([source respondsToSelector:@selector(tableView)]) {
-        id tableView = ((id (*)(id, SEL))objc_msgSend)(source, @selector(tableView));
-        if ([tableView isKindOfClass:[UITableView class]]) return tableView;
-    }
-    return [self apollo_findTableViewInView:source.view];
-}
-
-- (UIColor *)apollo_themeTableBackgroundColor {
-    UITableView *source = [self apollo_sourceThemeTableView];
-    return source.backgroundColor ?: self.tableView.backgroundColor;
-}
-
-- (UIColor *)apollo_themeCellBackgroundColor {
-    UITableView *source = [self apollo_sourceThemeTableView];
-    for (UITableViewCell *cell in source.visibleCells) {
-        UIColor *color = cell.backgroundColor ?: cell.contentView.backgroundColor;
-        if (color) return color;
-    }
-    return [UIColor secondarySystemGroupedBackgroundColor];
-}
-
-- (UIColor *)apollo_themeSeparatorColor {
-    UITableView *source = [self apollo_sourceThemeTableView];
-    return source.separatorColor ?: [UIColor separatorColor];
-}
-
-- (UIColor *)apollo_themeAccentColor {
-    NSMutableArray<UIColor *> *candidates = [NSMutableArray array];
-    if (self.tabBarController.tabBar.tintColor) [candidates addObject:self.tabBarController.tabBar.tintColor];
-    if (self.navigationController.navigationBar.tintColor) [candidates addObject:self.navigationController.navigationBar.tintColor];
-    if (self.view.tintColor) [candidates addObject:self.view.tintColor];
-    if (self.tableView.tintColor) [candidates addObject:self.tableView.tintColor];
-    if (self.view.window.tintColor) [candidates addObject:self.view.window.tintColor];
-    for (UIColor *color in candidates) {
-        if ([color isKindOfClass:[UIColor class]]) return color;
-    }
-    return self.view.tintColor ?: [UIColor systemBlueColor];
-}
-
 - (void)apollo_applyThemeToCell:(UITableViewCell *)cell {
-    if (!cell) return;
-
-    UIColor *cellColor = [self apollo_themeCellBackgroundColor];
-    cell.backgroundColor = cellColor;
-    cell.contentView.backgroundColor = cellColor;
+    [super apollo_applyThemeToCell:cell];
 
     UIView *selectedBackground = [[UIView alloc] init];
     selectedBackground.backgroundColor = [UIColor colorWithWhite:0.5 alpha:0.18];
     cell.selectedBackgroundView = selectedBackground;
+}
 
+- (void)apollo_refreshFooterTextViews {
     UIColor *accentColor = [self apollo_themeAccentColor];
-    cell.tintColor = accentColor;
-    if (cell.accessoryView) cell.accessoryView.tintColor = accentColor;
+    NSInteger sectionCount = [self numberOfSectionsInTableView:self.tableView];
+    for (NSInteger section = 0; section < sectionCount; section++) {
+        UIView *footerView = [self.tableView footerViewForSection:section];
+        if (![footerView isKindOfClass:[UITextView class]]) continue;
 
-    for (UIView *subview in cell.contentView.subviews) {
-        subview.tintColor = accentColor;
+        UITextView *textView = (UITextView *)footerView;
+        textView.tintColor = accentColor;
+        textView.linkTextAttributes = @{NSForegroundColorAttributeName: accentColor};
+        textView.attributedText = [self footerAttributedTextForSection:section];
     }
 }
 
 - (void)apollo_applyTheme {
-    UIColor *backgroundColor = [self apollo_themeTableBackgroundColor];
-    UIColor *accentColor = [self apollo_themeAccentColor];
-    self.view.backgroundColor = backgroundColor;
-    self.tableView.backgroundColor = backgroundColor;
-    self.tableView.separatorColor = [self apollo_themeSeparatorColor];
-    self.view.tintColor = accentColor;
-    self.tableView.tintColor = accentColor;
-    self.navigationController.navigationBar.tintColor = accentColor;
-    for (UITableViewCell *cell in self.tableView.visibleCells) {
-        [self apollo_applyThemeToCell:cell];
-    }
+    [super apollo_applyTheme];
+    [self apollo_refreshFooterTextViews];
 }
 
 - (UIImage *)roundedImage:(UIImage *)image size:(CGFloat)size cornerRadius:(CGFloat)radius {
@@ -397,9 +336,10 @@ typedef NS_ENUM(NSInteger, Tag) {
 
 - (NSString *)mediaUploadProviderText {
     switch (sImageUploadProvider) {
-        case ImageUploadProviderReddit: return @"Reddit";
+        case ImageUploadProviderReddit:   return @"Reddit";
+        case ImageUploadProviderImgChest: return @"Img Chest";
         case ImageUploadProviderImgur:
-        default:                        return @"Imgur";
+        default:                          return @"Imgur";
     }
 }
 
@@ -420,12 +360,23 @@ typedef NS_ENUM(NSInteger, Tag) {
 
     NSString *imgurTitle = (sImageUploadProvider == ImageUploadProviderImgur) ? @"Imgur (Current)" : @"Imgur";
     NSString *redditTitle = (sImageUploadProvider == ImageUploadProviderReddit) ? @"Reddit (Current)" : @"Reddit";
+    NSString *imgChestTitle = (sImageUploadProvider == ImageUploadProviderImgChest) ? @"Img Chest (Current)" : @"Img Chest";
 
     [sheet addAction:[UIAlertAction actionWithTitle:imgurTitle style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
         [self setImageUploadProvider:ImageUploadProviderImgur];
     }]];
     [sheet addAction:[UIAlertAction actionWithTitle:redditTitle style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
         [self setImageUploadProvider:ImageUploadProviderReddit];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:imgChestTitle style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+        // Uploading requires an API token (free at imgchest.com); without one
+        // there is nothing to authenticate the POST with.
+        if (sImageChestAPIToken.length == 0) {
+            [self showAlertWithTitle:@"Img Chest API Key Required"
+                             message:@"Add your Img Chest API key in the API Keys section first, then select Img Chest as the upload host."];
+            return;
+        }
+        [self setImageUploadProvider:ImageUploadProviderImgChest];
     }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
 
@@ -650,7 +601,6 @@ typedef NS_ENUM(NSInteger, Tag) {
     self.title = @"Apollo Reborn";
     self.tableView.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
     [self apollo_disableAutoHideTabBarIdleIfUnsupported];
-    [self apollo_applyTheme];
 
     [[ApolloSubredditInfoCache sharedCache] requestInfoForSubreddit:kApolloRebornSubredditName completion:^(ApolloSubredditInfo *info) {
         (void)info;
@@ -697,11 +647,6 @@ typedef NS_ENUM(NSInteger, Tag) {
     });
 }
 
-- (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
-    [super traitCollectionDidChange:previousTraitCollection];
-    [self apollo_applyTheme];
-}
-
 #pragma mark - UITableViewDataSource
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
@@ -717,8 +662,11 @@ typedef NS_ENUM(NSInteger, Tag) {
         // row, so the count is its index + 1, minus the Web Session Login row when
         // the mode is off.
         case SectionAPIKeys: return kAPIKeyRowWidgetSetupCode + (sWebJSONEnabled ? 1 : 0);
-        case SectionGeneral: return sShowDeletedComments ? 12 : 11;
-        case SectionMedia: return 13 + (sEnableInlineImages ? 0 : -kApolloMediaInlineDependentRows);
+        // General base rows + the search-in-place toggle (effectiveRow 11) and the
+        // AI Summaries toggle (effectiveRow 12), minus the "Tap to Show Deleted
+        // Comments" row when Show Deleted Comments is off.
+        case SectionGeneral: return sShowDeletedComments ? 13 : 12;
+        case SectionMedia: return 14 + (sEnableInlineImages ? 0 : -kApolloMediaInlineDependentRows);
         case SectionSubreddits: return sSubredditListEnhancements ? 8 : 7;
         case SectionNotificationBackend: return 3; // URL + Registration Token + Test Connection
         case SectionAbout: return 5; // GitHub + Reddit + Thanks To + Export Logs + Version
@@ -751,7 +699,6 @@ typedef NS_ENUM(NSInteger, Tag) {
         case SectionAbout: cell = [self aboutCellForRow:indexPath.row tableView:tableView]; break;
         default: cell = [[UITableViewCell alloc] init]; break;
     }
-    [self apollo_applyThemeToCell:cell];
     return cell;
 }
 
@@ -1156,7 +1103,20 @@ typedef NS_ENUM(NSInteger, Tag) {
                                             label:@"Color Flairs"
                                                on:[defaults boolForKey:UDKeyEnableFlairColors]
                                            action:@selector(flairColorsSwitchToggled:)];
-        case 11:
+        case 11: {
+            BOOL lgSupported = IsLiquidGlass();
+            UITableViewCell *cell = [self switchCellWithIdentifier:@"Cell_Gen_KeepSearchInPlace"
+                                                             label:@"Keep Search Bar In Place"
+                                                            detail:@"Requires Liquid Glass."
+                                                                on:lgSupported && [defaults boolForKey:UDKeyKeepSearchBarInPlace]
+                                                            action:@selector(keepSearchBarInPlaceSwitchToggled:)];
+            UISwitch *toggleSwitch = [cell.accessoryView isKindOfClass:[UISwitch class]] ? (UISwitch *)cell.accessoryView : nil;
+            toggleSwitch.enabled = lgSupported;
+            cell.textLabel.enabled = lgSupported;
+            cell.detailTextLabel.enabled = lgSupported;
+            return cell;
+        }
+        case 12:
             return [self switchCellWithIdentifier:@"Cell_Gen_AISummaries"
                                             label:@"AI Summaries"
                                            detail:@"On-device post summaries and discussion summaries for larger threads. Discussions require at least 5 substantive comments and ignore AutoModerator and removed comments. Requires Apple Intelligence on iOS 26 or later."
@@ -1291,6 +1251,11 @@ typedef NS_ENUM(NSInteger, Tag) {
                                             label:@"Profile Picture Tab Icon"
                                                on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyUseProfileAvatarTabIcon]
                                            action:@selector(profileTabAvatarSwitchToggled:)];
+        case 13:
+            return [self switchCellWithIdentifier:@"Cell_Media_SocialLinks"
+                                            label:@"Social Links in Profile"
+                                               on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeySocialLinksInProfile]
+                                           action:@selector(socialLinksInProfileSwitchToggled:)];
         default: return [[UITableViewCell alloc] init];
     }
 }
@@ -1385,7 +1350,7 @@ typedef NS_ENUM(NSInteger, Tag) {
         cell.selectionStyle = UITableViewCellSelectionStyleDefault;
     }
     cell.textLabel.text = @"Test Connection";
-    cell.textLabel.textColor = self.view.tintColor;
+    [self apollo_applyAccentActionTextColorToCell:cell];
     return cell;
 }
 
@@ -1405,7 +1370,7 @@ typedef NS_ENUM(NSInteger, Tag) {
             cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"Cell_Backup"];
         }
         cell.textLabel.text = (row == 0) ? @"Backup Settings" : @"Restore Settings";
-        cell.textLabel.textColor = self.view.tintColor;
+        [self apollo_applyAccentActionTextColorToCell:cell];
         cell.selectionStyle = UITableViewCellSelectionStyleDefault;
         return cell;
     }
@@ -1416,7 +1381,7 @@ typedef NS_ENUM(NSInteger, Tag) {
         cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:identifier];
     }
     cell.textLabel.text = (row == 2) ? @"Clear Tweak Caches" : @"Clear Custom Banners & Icons";
-    cell.textLabel.textColor = self.view.tintColor;
+    [self apollo_applyAccentActionTextColorToCell:cell];
     cell.selectionStyle = UITableViewCellSelectionStyleDefault;
     return cell;
 }
@@ -1454,7 +1419,7 @@ typedef NS_ENUM(NSInteger, Tag) {
                 cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"Cell_About_Logs"];
             }
             cell.textLabel.text = @"Export Debug Logs";
-            cell.textLabel.textColor = self.view.tintColor;
+            [self apollo_applyAccentActionTextColorToCell:cell];
             cell.selectionStyle = UITableViewCellSelectionStyleDefault;
             return cell;
         }
@@ -1609,11 +1574,13 @@ typedef NS_ENUM(NSInteger, Tag) {
     NSAttributedString *text = [self footerAttributedTextForSection:section];
     if (!text) return nil;
 
-    UITextView *textView = [[UITextView alloc] init];
+    UITextView *textView = [[ApolloFooterLinkTextView alloc] init];
     textView.editable = NO;
     textView.scrollEnabled = NO;
     textView.backgroundColor = [UIColor clearColor];
     textView.textContainerInset = UIEdgeInsetsMake(8, 16, 8, 16);
+    textView.tintColor = [self apollo_themeAccentColor];
+    textView.linkTextAttributes = @{NSForegroundColorAttributeName: [self apollo_themeAccentColor]};
     textView.attributedText = text;
 
     return textView;
@@ -1826,8 +1793,8 @@ typedef NS_ENUM(NSInteger, Tag) {
 - (void)pushTroubleshootingViewController {
     UIViewController *vc = [[UIViewController alloc] init];
     vc.title = @"Can't sign in?";
-    vc.view.backgroundColor = [self apollo_themeTableBackgroundColor];
-    vc.view.tintColor = [self apollo_themeAccentColor];
+    vc.view.backgroundColor = self.tableView.backgroundColor;
+    vc.view.tintColor = self.view.tintColor;
 
     UITextView *textView = [[UITextView alloc] init];
     textView.editable = NO;
@@ -1889,8 +1856,8 @@ typedef NS_ENUM(NSInteger, Tag) {
 - (void)pushInstructionsViewController {
     UIViewController *vc = [[UIViewController alloc] init];
     vc.title = @"Giphy & ImgChest API Key Setup";
-    vc.view.backgroundColor = [self apollo_themeTableBackgroundColor];
-    vc.view.tintColor = [self apollo_themeAccentColor];
+    vc.view.backgroundColor = self.tableView.backgroundColor;
+    vc.view.tintColor = self.view.tintColor;
 
     UITextView *textView = [[UITextView alloc] init];
     textView.editable = NO;
@@ -2218,6 +2185,11 @@ typedef NS_ENUM(NSInteger, Tag) {
     [[NSUserDefaults standardUserDefaults] setBool:sFeedTextPostThumbnails forKey:UDKeyFeedTextPostThumbnails];
 }
 
+- (void)keepSearchBarInPlaceSwitchToggled:(UISwitch *)sender {
+    sKeepSearchBarInPlace = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sKeepSearchBarInPlace forKey:UDKeyKeepSearchBarInPlace];
+}
+
 - (void)userAvatarsSwitchToggled:(UISwitch *)sender {
     sShowUserAvatars = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:sShowUserAvatars forKey:UDKeyShowUserAvatars];
@@ -2228,6 +2200,12 @@ typedef NS_ENUM(NSInteger, Tag) {
     sUseProfileAvatarTabIcon = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:sUseProfileAvatarTabIcon forKey:UDKeyUseProfileAvatarTabIcon];
     [[NSNotificationCenter defaultCenter] postNotificationName:@"ApolloProfileTabAvatarIconChangedNotification" object:nil];
+}
+
+- (void)socialLinksInProfileSwitchToggled:(UISwitch *)sender {
+    sSocialLinksInProfile = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sSocialLinksInProfile forKey:UDKeySocialLinksInProfile];
+    [[NSNotificationCenter defaultCenter] postNotificationName:ApolloSocialLinksToggleChangedNotification object:nil];
 }
 
 - (void)promptClearAllCachesFromSourceView:(UIView *)sourceView {

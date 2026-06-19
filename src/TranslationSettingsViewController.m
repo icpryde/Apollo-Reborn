@@ -523,7 +523,7 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *ApolloTranslationLanguag
             cell.selectionStyle = UITableViewCellSelectionStyleDefault;
         }
         cell.textLabel.text = @"Add Language…";
-        cell.textLabel.textColor = [UIColor systemBlueColor];
+        [self apollo_applyAccentActionTextColorToCell:cell];
         cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
         return cell;
     }

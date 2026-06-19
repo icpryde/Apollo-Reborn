@@ -24,6 +24,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloAISummary.xm \
     $(SRC_DIR)/Tweak.xm \
     $(SRC_DIR)/ApolloCommon.m \
+    $(SRC_DIR)/ApolloSettingsTableViewController.m \
     $(SRC_DIR)/ApolloRedditMediaUpload.m \
     $(SRC_DIR)/ApolloNotificationBackend.m \
     $(SRC_DIR)/ApolloUserProfileCache.m \
@@ -32,6 +33,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloSubredditCustomIconCache.m \
     $(SRC_DIR)/ApolloSubredditDefaultAssets.c \
     $(SRC_DIR)/ApolloUserAvatars.xm \
+    $(SRC_DIR)/ApolloProfileSocialLinks.m \
     $(SRC_DIR)/ApolloModeratorAvatars.xm \
     $(SRC_DIR)/ApolloSubredditHeaders.xm \
     $(SRC_DIR)/ApolloBannedProfile.xm \
@@ -64,12 +66,16 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloTranslation.xm \
     $(SRC_DIR)/ApolloVideoUnmute.xm \
     $(SRC_DIR)/ApolloVideoSwipeFix.xm \
+    $(SRC_DIR)/ApolloVideoPlaybackSpeed.xm \
     $(SRC_DIR)/ApolloMediaPreviewErrorFix.xm \
     $(SRC_DIR)/ApolloSubredditIndexPolish.xm \
     $(SRC_DIR)/ApolloQuickActions.xm \
     $(SRC_DIR)/ApolloHideModSubreddits.xm \
     $(SRC_DIR)/ApolloTagFilters.xm \
+    $(SRC_DIR)/ApolloSearchInPlace.xm \
+    $(SRC_DIR)/ApolloSearchHeaderOverlapFix.xm \
     $(SRC_DIR)/ApolloImageChestResolver.m \
+    $(SRC_DIR)/ApolloImgChestUpload.m \
     $(SRC_DIR)/ApolloLinkPreviewModel.m \
     $(SRC_DIR)/ApolloLinkPreviewCache.m \
     $(SRC_DIR)/ApolloLinkPreviewFetcher.m \
@@ -91,7 +97,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/UIWindow+Apollo.m \
     $(SRC_DIR)/fishhook.c \
     $(SSZIPARCHIVE_FILES)
-ApolloReborn_FRAMEWORKS = UIKit Security AVFoundation OSLog NaturalLanguage ImageIO StoreKit PhotosUI SafariServices SystemConfiguration WebKit AuthenticationServices
+ApolloReborn_FRAMEWORKS = UIKit Security AVFoundation OSLog NaturalLanguage ImageIO StoreKit Photos PhotosUI SafariServices SystemConfiguration WebKit AuthenticationServices
 ApolloReborn_LIBRARIES = z iconv
 # FoundationModels (Apple on-device AI, iOS 26+) is weak-linked so the dylib
 # still loads on older OSes; the Swift bridge (ApolloFoundationModels.swift)

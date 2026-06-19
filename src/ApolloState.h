@@ -26,8 +26,18 @@ extern NSInteger sUnmuteCommentsVideos;
 extern BOOL sProxyImgurDDG;
 extern BOOL sShowUserAvatars;
 extern BOOL sUseProfileAvatarTabIcon;
+// When ON, a redditor's profile social links (Buy Me a Coffee, Instagram, X, …) are
+// shown in the profile header between the username and bio: a tappable pill for a
+// single link, or a row of brand badges that opens a slide-up sheet for several.
+// Rendered inside the tweak's custom profile header, so it needs sShowUserAvatars ON.
+// See ApolloProfileSocialLinks.{h,m}.
+extern BOOL sSocialLinksInProfile;
 extern BOOL sShowSubredditHeaders;
 extern BOOL sAutoHideTabBarShowOnIdle;
+// When ON, neutralizes Apollo's feed/subreddit search takeover (nav-hide + fade + toolbar
+// dock/grow); the field stays put and results populate the feed in place. Liquid Glass only;
+// mutually exclusive with the default nav-hide mode. See ApolloSearchInPlace.xm.
+extern BOOL sKeepSearchBarInPlace;
 extern BOOL sModernSubredditDividers;
 // Master toggle for subreddit list enhancements (see UDKeySubredditListEnhancements).
 extern BOOL sSubredditListEnhancements;
@@ -103,10 +113,12 @@ extern NSInteger sLinkPreviewCommentsMode;
 extern NSInteger sLinkPreviewCardColor;
 
 // Media upload host selection. Imgur is the default; Reddit uses Apollo's signed-in
-// session to upload directly to Reddit's media storage.
+// session to upload directly to Reddit's media storage; ImgChest uploads to
+// imgchest.com via the user's API token (see ApolloImgChestUpload.m).
 typedef NS_ENUM(NSInteger, ImageUploadProvider) {
     ImageUploadProviderImgur = 0,
     ImageUploadProviderReddit = 1,
+    ImageUploadProviderImgChest = 2,
 };
 extern NSInteger sImageUploadProvider;
 
