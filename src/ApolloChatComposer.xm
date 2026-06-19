@@ -18,6 +18,7 @@
 #import "ApolloCommon.h"
 #import "ApolloUserProfileCache.h"
 #import "ApolloState.h"
+#import "ApolloImgChestUpload.h"
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -122,6 +123,41 @@ static void ApolloComposerResolveTitle(id vc, NSInteger attempt) {
     });
 }
 
+#pragma mark - chat image upload -> ImgChest
+
+// Reddit can't reliably host an image sent in a PM (a chat-uploaded asset is never claimed/published
+// to i.redd.it). ImgChest gives a permanent public URL that renders inline in chat, so we route chat
+// photo uploads to ImgChest regardless of the global Media Upload Host. It needs the user's ImgChest
+// API key; if none is set we prompt them to add one instead of letting the send fail silently.
+static double sApolloChatUploadUntil = 0.0;   // wall-clock deadline; an upload within this window -> ImgChest
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+void ApolloChatMarkImageUpload(void) {
+    if (!sEnableChatMedia) return;
+    sApolloChatUploadUntil = [NSDate timeIntervalSinceReferenceDate] + 180.0;   // generous window for the picker
+}
+BOOL ApolloChatImageUploadPending(void) {
+    return sEnableChatMedia && ([NSDate timeIntervalSinceReferenceDate] < sApolloChatUploadUntil);
+}
+#ifdef __cplusplus
+}
+#endif
+
+static void ApolloChatPromptImgChestSetup(UIViewController *vc) {
+    if (![vc isKindOfClass:[UIViewController class]]) return;
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:@"ImgChest API Key Needed"
+                         message:@"To send images in chat, add a free ImgChest API key in Apollo's settings (Media → ImgChest API Key). Reddit can't reliably host images in private messages, so chat images upload to ImgChest instead."
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"Get a Free Key" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+        [[UIApplication sharedApplication] openURL:[NSURL URLWithString:@"https://imgchest.com/"] options:@{} completionHandler:nil];
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
+    [vc presentViewController:a animated:YES completion:nil];
+}
+
 %hook _TtC6Apollo28PrivateMessageViewController
 - (void)viewWillAppear:(BOOL)animated {
     %orig;
@@ -129,6 +165,15 @@ static void ApolloComposerResolveTitle(id vc, NSInteger attempt) {
     if (objc_getAssociatedObject(self, &kApolloComposerSetupKey)) return;   // once per VC
     objc_setAssociatedObject(self, &kApolloComposerSetupKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     ApolloComposerResolveTitle(self, 0);
+}
+- (void)photosButtonTappedWithSender:(id)sender {
+    // Route the chat photo upload to ImgChest (Reddit can't host PM images). Require an ImgChest key
+    // first — otherwise prompt the user to add one rather than letting the send fail.
+    if (sEnableChatMedia) {
+        if (!ApolloImgChestUploadAvailable()) { ApolloChatPromptImgChestSetup((UIViewController *)self); return; }
+        ApolloChatMarkImageUpload();
+    }
+    %orig;
 }
 %end
 
@@ -169,20 +214,31 @@ static NSString *ApolloChatRewriteGifTokens(NSString *body) {
     return out;
 }
 
+// Make an outgoing chat body sendable: strip ![alt](url) markdown embeds to plain URLs (Reddit
+// rejects media embeds on a t4/message parent; the gif button inserts ![gif](giphy|id), the photo
+// button inserts ![img](url)). Chat photo uploads are routed to ImgChest (see the photo-button hook
+// below + ApolloImageUploadHost), giving a public CDN URL that renders inline in Apollo. Gated on the
+// master chat-media toggle so OFF reverts to stock Apollo send behaviour.
+static NSString *ApolloChatFixOutgoing(NSString *body) {
+    if (![body isKindOfClass:[NSString class]]) return body;
+    if (!sEnableChatMedia) return body;
+    return ApolloChatRewriteGifTokens(body);
+}
+
 %hook RDKClient
 - (id)sendMessage:(id)message subject:(id)subject recipient:(id)recipient completion:(id)completion {
-    NSString *fixed = ApolloChatRewriteGifTokens(message);
-    if (fixed != message) return %orig(fixed, subject, recipient, completion);
+    NSString *fixed = ApolloChatFixOutgoing(message);
+    if ([message isKindOfClass:[NSString class]] && ![fixed isEqualToString:message]) return %orig(fixed, subject, recipient, completion);
     return %orig;
 }
 - (id)replyToMessage:(id)message withText:(id)text completion:(id)completion {
-    NSString *fixed = ApolloChatRewriteGifTokens(text);
-    if (fixed != text) return %orig(message, fixed, completion);
+    NSString *fixed = ApolloChatFixOutgoing(text);
+    if ([text isKindOfClass:[NSString class]] && ![fixed isEqualToString:text]) return %orig(message, fixed, completion);
     return %orig;
 }
 - (id)replyToMessageWithFullname:(id)fullname withText:(id)text completion:(id)completion {
-    NSString *fixed = ApolloChatRewriteGifTokens(text);
-    if (fixed != text) return %orig(fullname, fixed, completion);
+    NSString *fixed = ApolloChatFixOutgoing(text);
+    if ([text isKindOfClass:[NSString class]] && ![fixed isEqualToString:text]) return %orig(fullname, fixed, completion);
     return %orig;
 }
 %end

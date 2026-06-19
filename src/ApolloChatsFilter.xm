@@ -18,6 +18,8 @@
 #import "ApolloCommon.h"
 #import "ApolloState.h"
 #import "ApolloUserProfileCache.h"
+#import "ApolloSubredditInfoCache.h"
+#import "ApolloSubredditCustomIconCache.h"
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -219,27 +221,153 @@ static BOOL sChatFilterActive = NO;
 }
 %end
 
-#pragma mark - sender avatar in the Direct Chat list
+#pragma mark - sender avatar / subreddit icon on inbox rows
 
-// The inbox is AsyncDisplayKit (Texture): each row is an Apollo.InboxCellNode whose username is an
-// ApolloButtonNode (text "to <user>" / "<user>") near the bottom-left. We overlay a small circular
-// avatar just to its left, scoped to chat-room cells, gated by the Show User Avatars toggle.
-static char kInboxAvatarKey;       // on the cell's view: our avatar UIImageView
-static char kInboxAvatarUserKey;   // on the avatar view: username it currently shows
+// The inbox is AsyncDisplayKit (Texture): each row is an Apollo.InboxCellNode backed by an RDKMessage
+// in its `message` ivar. We overlay a small circular image to the left of the row's identity button,
+// gated by the Show User Avatars toggle. Identity is resolved from the MODEL (not parsed text):
+//   - reply/mention notifications (contentType 0/1/2) -> the other user's avatar (message.author)
+//   - PM to/from a subreddit (modmail / "to #sub")     -> the subreddit's icon (message.subreddit)
+//   - sent PM        -> the recipient's avatar (message.recipient)
+//   - received PM / direct chat room -> the sender's avatar (message.author)
+//   - new-modmail rows (message nil) -> the conversation's subreddit icon, else the participant avatar
+#define APOLLO_INBOX_AVATAR_DEBUG 0   // flip to 1 for verbose per-row resolved kind/identity logging
+
+static char kInboxAvatarKey;          // on the cell's view: our image UIImageView
+static char kInboxAvatarIdentityKey;  // on the image view: the identity it currently shows ("u:name" / "r:sub")
+
+typedef NS_ENUM(NSInteger, ApolloInboxIconKind) {
+    ApolloInboxIconNone = 0,
+    ApolloInboxIconUser,
+    ApolloInboxIconSubreddit,
+};
 
 static CGRect ApolloNodeFrame(id node) {
     if (![node respondsToSelector:@selector(frame)]) return CGRectZero;
     return ((CGRect (*)(id, SEL))objc_msgSend)(node, @selector(frame));
 }
-static NSString *ApolloNodeText(id node) {
-    if (![node respondsToSelector:@selector(attributedText)]) return nil;
-    id at = ((id (*)(id, SEL))objc_msgSend)(node, @selector(attributedText));
-    return [at isKindOfClass:[NSAttributedString class]] ? [(NSAttributedString *)at string] : nil;
+
+// Read a Swift/ObjC ivar by name off any object (the InboxCellNode's model + button-node ivars).
+static id ApolloInboxIvarValue(id object, NSString *name) {
+    if (!object || name.length == 0) return nil;
+    for (Class cls = [object class]; cls && cls != [NSObject class]; cls = class_getSuperclass(cls)) {
+        Ivar ivar = class_getInstanceVariable(cls, name.UTF8String);
+        if (!ivar) continue;
+        @try { return object_getIvar(object, ivar); }
+        @catch (__unused NSException *e) { return nil; }
+    }
+    return nil;
 }
-static NSArray *ApolloNodeSubnodes(id node) {
-    if (![node respondsToSelector:@selector(subnodes)]) return nil;
-    id s = ((id (*)(id, SEL))objc_msgSend)(node, @selector(subnodes));
-    return [s isKindOfClass:[NSArray class]] ? s : nil;
+
+static NSString *ApolloInboxStringProp(id obj, SEL sel) {
+    if (!obj || ![obj respondsToSelector:sel]) return nil;
+    id v = ((id (*)(id, SEL))objc_msgSend)(obj, sel);
+    return [v isKindOfClass:[NSString class]] ? v : nil;
+}
+
+static NSString *ApolloInboxNormUser(NSString *username) {
+    if (![username isKindOfClass:[NSString class]]) return nil;
+    NSString *clean = [username stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if ([clean hasPrefix:@"u/"] || [clean hasPrefix:@"U/"]) clean = [clean substringFromIndex:2];
+    if (clean.length == 0) return nil;
+    if ([clean isEqualToString:@"[deleted]"] || [clean isEqualToString:@"deleted"]) return nil;
+    return clean;
+}
+
+// Subreddit name as the icon caches want it: the caches strip "r/" variants + lowercase internally,
+// but they do NOT strip a leading "#" (modmail dests like "#dbz"), so do that here.
+static NSString *ApolloInboxSubredditClean(NSString *name) {
+    if (![name isKindOfClass:[NSString class]]) return nil;
+    NSString *s = [name stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    while ([s hasPrefix:@"#"]) s = [[s substringFromIndex:1] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+    if (s.length == 0 || [s isEqualToString:@"[deleted]"]) return nil;
+    return s;
+}
+
+static NSString *ApolloInboxUsernameFromObject(id object) {
+    if (!object) return nil;
+    if ([object isKindOfClass:[NSString class]]) return ApolloInboxNormUser(object);
+    NSString *u = ApolloInboxStringProp(object, @selector(author));
+    if (!u) u = ApolloInboxStringProp(object, @selector(username));
+    if (!u) u = ApolloInboxStringProp(object, @selector(name));
+    return ApolloInboxNormUser(u);
+}
+
+static NSString *ApolloInboxCurrentUser(void) {
+    Class clientClass = objc_getClass("RDKClient");
+    if (!clientClass || ![clientClass respondsToSelector:@selector(sharedClient)]) return nil;
+    id client = ((id (*)(id, SEL))objc_msgSend)(clientClass, @selector(sharedClient));
+    if (!client || ![client respondsToSelector:@selector(currentUser)]) return nil;
+    id user = ((id (*)(id, SEL))objc_msgSend)(client, @selector(currentUser));
+    return ApolloInboxUsernameFromObject(user);
+}
+
+// Resolve the row's icon kind + identity string + the button node to anchor the overlay to.
+static ApolloInboxIconKind ApolloInboxResolveIdentity(id cellNode, NSString **outIdentity, id *outAnchor) {
+    *outIdentity = nil;
+    if (outAnchor) *outAnchor = nil;
+
+    id msg = ApolloInboxIvarValue(cellNode, @"message");
+    if (msg) {
+        long long ct = [msg respondsToSelector:@selector(contentType)]
+            ? ((long long (*)(id, SEL))objc_msgSend)(msg, @selector(contentType)) : -1;
+        NSString *author    = ApolloInboxStringProp(msg, @selector(author));
+        NSString *recipient = ApolloInboxStringProp(msg, @selector(recipient));
+        NSString *subreddit = ApolloInboxStringProp(msg, @selector(subreddit));
+
+        if (ct == 0 || ct == 1 || ct == 2) {
+            // post reply / comment reply / username mention -> the other user (the replier/mentioner).
+            NSString *u = ApolloInboxNormUser(author);
+            if (u) { *outIdentity = u; if (outAnchor) *outAnchor = ApolloInboxIvarValue(cellNode, @"authorButtonNode"); return ApolloInboxIconUser; }
+            // Replier/mentioner is deleted/suspended: fall back to the community icon if we know it.
+            NSString *s = ApolloInboxSubredditClean(subreddit);
+            if (s) {
+                *outIdentity = s;
+                if (outAnchor) *outAnchor = ApolloInboxIvarValue(cellNode, @"subredditButtonNode") ?: ApolloInboxIvarValue(cellNode, @"authorButtonNode");
+                return ApolloInboxIconSubreddit;
+            }
+        } else {
+            // PM (contentType 3) or unknown: a non-empty subreddit means a modmail/subreddit message.
+            NSString *s = ApolloInboxSubredditClean(subreddit);
+            if (s) { *outIdentity = s; if (outAnchor) *outAnchor = ApolloInboxIvarValue(cellNode, @"subredditButtonNode"); return ApolloInboxIconSubreddit; }
+
+            // Sent vs received: I sent it IFF I'm the author. recipientButtonNode exists on BOTH sent
+            // and received rows (Apollo renders "to <other>" / the sender alike), so it can't decide
+            // this — it's only a fallback when the current user is unknown. Show the OTHER party.
+            NSString *me = ApolloInboxCurrentUser();
+            BOOL sent;
+            if (me.length && author.length) sent = ([me caseInsensitiveCompare:author] == NSOrderedSame);
+            else                            sent = (ApolloInboxIvarValue(cellNode, @"recipientButtonNode") != nil);
+
+            NSString *other = sent ? ApolloInboxNormUser(recipient) : ApolloInboxNormUser(author);
+            // Never paint the logged-in user's own avatar (e.g. a note-to-self where recipient == me).
+            if (other.length && me.length && [other caseInsensitiveCompare:me] == NSOrderedSame) other = nil;
+            if (other.length) {
+                *outIdentity = other;
+                if (outAnchor) *outAnchor = sent ? (ApolloInboxIvarValue(cellNode, @"recipientButtonNode") ?: ApolloInboxIvarValue(cellNode, @"authorButtonNode"))
+                                                 : ApolloInboxIvarValue(cellNode, @"authorButtonNode");
+                return ApolloInboxIconUser;
+            }
+        }
+        return ApolloInboxIconNone;   // a message is present but nothing resolvable — don't guess
+    }
+
+    // New-modmail rows (no classic RDKMessage). RDKModmailConversationInfo has no subreddit ivar — the
+    // community lives in its `_owner` dict (Reddit owner:{type,displayName,id}); the participant is
+    // RDKModmailMessage._author (an RDKModmailAuthor exposing `name`). Best-effort + fully defensive.
+    id mmConv = ApolloInboxIvarValue(cellNode, @"newModmailConversationInfo");
+    id mmMsg  = ApolloInboxIvarValue(cellNode, @"newModmailMessage");
+    if (mmConv || mmMsg) {
+        id owner = ApolloInboxIvarValue(mmConv, @"_owner") ?: ApolloInboxIvarValue(mmConv, @"owner");
+        if ([owner isKindOfClass:[NSDictionary class]]) {
+            NSString *s = ApolloInboxSubredditClean([(NSDictionary *)owner objectForKey:@"displayName"]);
+            if (s) { *outIdentity = s; if (outAnchor) *outAnchor = ApolloInboxIvarValue(cellNode, @"subredditButtonNode"); return ApolloInboxIconSubreddit; }
+        }
+        id mmAuthor = ApolloInboxIvarValue(mmMsg, @"_author") ?: ApolloInboxIvarValue(mmMsg, @"author");
+        NSString *u = ApolloInboxUsernameFromObject(mmAuthor);
+        if (u) { *outIdentity = u; if (outAnchor) *outAnchor = ApolloInboxIvarValue(cellNode, @"authorButtonNode"); return ApolloInboxIconUser; }
+    }
+    return ApolloInboxIconNone;
 }
 
 static void ApolloInboxCellApplyAvatar(id cellNode) {
@@ -250,35 +378,11 @@ static void ApolloInboxCellApplyAvatar(id cellNode) {
 
     if (!sShowUserAvatars) { if (av) av.hidden = YES; return; }   // toggle off — definitive hide
 
-    // Walk the node tree: detect a "chat room" subject (scope to chats) and find the leftmost
-    // username button (an ApolloButtonNode whose text has letters and isn't the "…" overflow glyph).
-    BOOL isChat = NO, foundAnyText = NO;
-    id usernameBtn = nil; CGRect ubf = CGRectZero; NSString *ubText = nil;
-    NSMutableArray *q = [NSMutableArray arrayWithObject:cellNode];
-    while (q.count) {
-        id nd = q.firstObject; [q removeObjectAtIndex:0];
-        NSString *t = ApolloNodeText(nd);
-        if (t.length) { foundAnyText = YES; if ([t localizedCaseInsensitiveContainsString:@"chat room"]) isChat = YES; }
-        if ([NSStringFromClass([nd class]) containsString:@"ApolloButtonNode"]) {
-            for (id sub in ApolloNodeSubnodes(nd)) {
-                NSString *st = ApolloNodeText(sub);
-                if (st.length && ![st hasPrefix:@"…"] &&
-                    [st rangeOfCharacterFromSet:[NSCharacterSet letterCharacterSet]].location != NSNotFound) {
-                    CGRect f = ApolloNodeFrame(nd);
-                    if (!usernameBtn || f.origin.x < ubf.origin.x) { usernameBtn = nd; ubf = f; ubText = st; }
-                }
-            }
-        }
-        NSArray *subs = ApolloNodeSubnodes(nd);
-        if (subs) [q addObjectsFromArray:subs];
-    }
+    NSString *identity = nil; id anchorBtn = nil;
+    ApolloInboxIconKind kind = ApolloInboxResolveIdentity(cellNode, &identity, &anchorBtn);
 
-    // Texture removes foreign subviews on cell reuse, so we must re-add + re-position the avatar on
-    // EVERY layout pass — not bail early — or it vanishes during scroll.
-    //  - a populated NON-chat cell (comment reply, etc.) -> hide and stop
-    //  - nothing known yet and no existing avatar -> wait
-    if (foundAnyText && !isChat) { if (av) av.hidden = YES; return; }
-    if (!isChat && !av) return;
+    // Nothing resolvable (unsupported row, or the model isn't attached yet): don't show a stale image.
+    if (kind == ApolloInboxIconNone || identity.length == 0) { if (av) av.hidden = YES; return; }
 
     static const CGFloat d = 20.0, gap = 6.0;
     if (!av) {
@@ -292,32 +396,59 @@ static void ApolloInboxCellApplyAvatar(id cellNode) {
     if (av.superview != cellView) [cellView addSubview:av];   // re-add if Texture stripped it
     [cellView bringSubviewToFront:av];
     av.hidden = NO;
-    // Use the username button's frame when it's resolved; fall back to a cell-relative position
-    // (the username row sits ~25px above the cell bottom) so the avatar stays put mid-reconfigure.
-    BOOL frameOK = usernameBtn && ubf.origin.x > 10.0;
-    CGFloat ax = frameOK ? ubf.origin.x - d - gap : 12.0;
-    CGFloat ay = frameOK ? ubf.origin.y + (ubf.size.height - d) / 2.0 : cellView.bounds.size.height - 27.0;
+    // Anchor to the kind-specific identity button; fall back to a cell-relative position (the identity
+    // row sits ~25px above the cell bottom) so the image stays put before the buttons are laid out.
+    CGRect bf = ApolloNodeFrame(anchorBtn);
+    BOOL frameOK = anchorBtn && bf.origin.x > 10.0 && bf.size.height > 0.0;
+    CGFloat ax = frameOK ? bf.origin.x - d - gap : 12.0;
+    CGFloat ay = frameOK ? bf.origin.y + (bf.size.height - d) / 2.0 : cellView.bounds.size.height - 27.0;
     av.frame = CGRectMake(ax, ay, d, d);
 
-    // Refresh the image only when a username is actually resolved (skip transient passes).
-    if (!usernameBtn || ubText.length == 0) return;
-    NSString *username = [ubText hasPrefix:@"to "] ? [ubText substringFromIndex:3] : ubText;
-    username = [username stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-    if (username.length == 0) return;
-    if ([objc_getAssociatedObject(av, &kInboxAvatarUserKey) isEqualToString:username]) return;   // already set
-    objc_setAssociatedObject(av, &kInboxAvatarUserKey, username, OBJC_ASSOCIATION_COPY_NONATOMIC);
-    av.image = nil;
-    ApolloUserProfileCache *cache = [ApolloUserProfileCache sharedCache];
+    // Composite identity key so a recycled cell that flipped user<->subreddit can't paint a stale image.
+    NSString *idKey = [NSString stringWithFormat:@"%@:%@", kind == ApolloInboxIconSubreddit ? @"r" : @"u", identity];
+    BOOL identityChanged = ![objc_getAssociatedObject(av, &kInboxAvatarIdentityKey) isEqualToString:idKey];
+    // Skip only when we're already SHOWING the right image. If the identity matches but the image is
+    // still nil (a prior fetch failed or hasn't returned yet), fall through and retry — otherwise one
+    // transient failure would leave a permanent grey placeholder for that identity.
+    if (av.image && !identityChanged) return;
+    if (identityChanged) {
+        objc_setAssociatedObject(av, &kInboxAvatarIdentityKey, idKey, OBJC_ASSOCIATION_COPY_NONATOMIC);
+        av.image = nil;
+#if APOLLO_INBOX_AVATAR_DEBUG
+        ChatsFilterLog(@"inbox icon -> %@", idKey);
+#endif
+    }
+
     __weak UIImageView *wav = av;
     void (^applyImg)(UIImage *) = ^(UIImage *img) {
         UIImageView *sav = wav;
-        if (img && sav && [objc_getAssociatedObject(sav, &kInboxAvatarUserKey) isEqualToString:username]) sav.image = img;
+        if (img && sav && [objc_getAssociatedObject(sav, &kInboxAvatarIdentityKey) isEqualToString:idKey]) sav.image = img;
     };
-    ApolloUserProfileInfo *info = [cache cachedInfoForUsername:username];
+
+    if (kind == ApolloInboxIconSubreddit) {
+        // user-set custom icon wins, then a cached community icon, then async fetch.
+        ApolloSubredditCustomIconCache *cic = [ApolloSubredditCustomIconCache sharedCache];
+        UIImage *custom = [cic cachedIconForSubreddit:identity];
+        if (custom) { applyImg(custom); return; }
+        ApolloSubredditInfoCache *sic = [ApolloSubredditInfoCache sharedCache];
+        ApolloUserProfileCache *imgCache = [ApolloUserProfileCache sharedCache];
+        ApolloSubredditInfo *sinfo = [sic cachedInfoForSubreddit:identity];
+        UIImage *subImg = sinfo.iconURL ? [imgCache cachedImageForURL:sinfo.iconURL] : nil;
+        if (subImg) { applyImg(subImg); return; }
+        [sic requestInfoForSubreddit:identity completion:^(ApolloSubredditInfo *i2) {
+            if ([cic hasCustomIconForSubreddit:identity]) return;   // a custom icon arrived meanwhile
+            if (i2.iconURL) [imgCache requestImageForURL:i2.iconURL completion:applyImg];
+        }];
+        return;
+    }
+
+    // user avatar
+    ApolloUserProfileCache *cache = [ApolloUserProfileCache sharedCache];
+    ApolloUserProfileInfo *info = [cache cachedInfoForUsername:identity];
     NSURL *u = info ? (info.iconURL ?: info.snoovatarURL) : nil;
-    UIImage *ci = u ? [cache cachedImageForURL:u] : nil;
-    if (ci) { applyImg(ci); return; }
-    [cache requestInfoForUsername:username completion:^(ApolloUserProfileInfo *i2) {
+    UIImage *userImg = u ? [cache cachedImageForURL:u] : nil;
+    if (userImg) { applyImg(userImg); return; }
+    [cache requestInfoForUsername:identity completion:^(ApolloUserProfileInfo *i2) {
         NSURL *uu = i2.iconURL ?: i2.snoovatarURL;
         if (uu) [cache requestImageForURL:uu completion:applyImg];
     }];
@@ -331,8 +462,8 @@ static void ApolloInboxCellApplyAvatar(id cellNode) {
 - (void)didEnterVisibleState {
     %orig;
     @try { ApolloInboxCellApplyAvatar(self); } @catch (__unused id e) {}
-    // The username ASTextNode may not have its attributedText yet on first visibility; re-apply a
-    // couple of times shortly after so the avatar resolves + re-attaches without needing a scroll.
+    // The identity button nodes may not be laid out yet on first visibility; re-apply a couple of
+    // times shortly after so the image anchors correctly + re-attaches without needing a scroll.
     __weak id wself = self;
     for (NSTimeInterval delay = 0.25; delay <= 0.8; delay += 0.55) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{

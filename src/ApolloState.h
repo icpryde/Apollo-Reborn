@@ -51,6 +51,10 @@ extern BOOL sEnableFlairColors;
 // fresh installs (registerDefaults). When NO, Apollo's native behavior (text
 // link + optional link card) is preserved. See ApolloInlineImages.xm.
 extern BOOL sEnableInlineImages;
+// Master toggle for chat media enhancements (inline images/GIFs/emoji/snoomoji in DM/chat
+// bubbles + working media sends + tap-to-fullscreen). Default ON via registerDefaults; OFF =
+// stock Apollo chat. Independent of sShowUserAvatars. See ApolloChatInlineImages/Composer.xm.
+extern BOOL sEnableChatMedia;
 
 // Horizontal alignment for inline media containers narrower than the row width
 // (tall portrait images, height-capped images). Has no effect on full-width media.

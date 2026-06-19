@@ -377,6 +377,9 @@ static UIViewController *ApolloChatHostVC(UIView *view) {
         [close setTitle:@"Close" forState:UIControlStateNormal];
         [close setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     }
+    [close addTarget:self action:@selector(dismissSelf) forControlEvents:UIControlEventTouchUpInside];
+    // Give the tap target room (the glyph alone is a tiny hit area) and keep it above the scroll view.
+    close.frame = CGRectMake(0, 0, 44, 44);
     close.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:close];
     [NSLayoutConstraint activateConstraints:@[
@@ -482,8 +485,14 @@ static void ApolloChatRenderImageInCell(id vc, id cell, NSURL *url, NSIndexPath 
         iv.backgroundColor = [UIColor clearColor];
     } else {
         iv.contentMode = UIViewContentModeScaleAspectFill;
-        iv.layer.cornerRadius = 15.0;   // match Apollo's bubble rounding
-        iv.backgroundColor = [UIColor secondarySystemFillColor];   // placeholder while loading (never white)
+        iv.layer.cornerRadius = 15.0;   // rounds opaque photos; transparent PNGs ignore it
+        // No bubble for images: clear BOTH Apollo's message container (the blue/grey bubble) AND our
+        // image view's own background. A transparent PNG (e.g. a folder icon) then shows the chat
+        // background through its margins instead of a grey box. MessageKit re-applies the bubble
+        // colour when this cell is reused for text, so text bubbles keep theirs. Stickers are left
+        // alone (Apollo already jumbo-blanks a lone-emoji bubble).
+        iv.backgroundColor = [UIColor clearColor];
+        container.backgroundColor = [UIColor clearColor];
     }
     iv.userInteractionEnabled = !sticker;   // tappable for images/gifs, not for emoji stickers
     if (iv.superview != container) [container addSubview:iv];
@@ -577,24 +586,29 @@ static BOOL ApolloChatRunIsEmoji(NSString *s);                       // defined 
 static void ApolloChatProcessCell(id vc, id collectionView, id cell, NSIndexPath *indexPath) {
     @try {
         UILabel *label = ApolloChatMessageLabel(cell);
-        // Kick the snoomoji table load (dispatch_once) so a single-snoomoji bubble can resolve to
-        // a sticker. On the very first open the table isn't ready yet; ApolloChatLoadSnoomoji's
-        // completion re-runs this pipeline for the visible cells once it lands.
-        ApolloChatLoadSnoomoji(collectionView);
-
-        NSURL *imgURL = label ? ApolloChatImageURLFromAttributed(label.attributedText) : nil;
+        NSURL *imgURL = nil;
         BOOL sticker = NO;
-        if (!imgURL && label) {
-            // Apollo "jumbo-blanks" a message that is just emoji (a Reddit snoomoji renders as the
-            // bare NAME, a unicode emoji renders invisibly), and its TextKit-backed MessageLabel
-            // won't reliably draw a glyph/attachment we inject. So render any pure-emoji bubble as a
-            // sticker overlay — the same proven path as inline gifs/images.
-            NSURL *s = ApolloChatSnoomojiStickerURL(label);          // :snoo_hearteyes: -> emoji CDN URL
-            if (!s) {
-                NSString *e = ApolloChatPureEmojiBody(label);        // 👍 / 🤜🤛 -> rasterized sticker
-                if (e) s = ApolloChatEmojiStickerURL(e);
+        // Master toggle: when OFF we render nothing (fall through to clear any overlay + show the
+        // stock text/link), so chat reverts to stock Apollo. Avatars below stay ungated (own toggle).
+        if (sEnableChatMedia) {
+            // Kick the snoomoji table load (dispatch_once) so a single-snoomoji bubble can resolve to
+            // a sticker. On the very first open the table isn't ready yet; ApolloChatLoadSnoomoji's
+            // completion re-runs this pipeline for the visible cells once it lands.
+            ApolloChatLoadSnoomoji(collectionView);
+
+            imgURL = label ? ApolloChatImageURLFromAttributed(label.attributedText) : nil;
+            if (!imgURL && label) {
+                // Apollo "jumbo-blanks" a message that is just emoji (a Reddit snoomoji renders as the
+                // bare NAME, a unicode emoji renders invisibly), and its TextKit-backed MessageLabel
+                // won't reliably draw a glyph/attachment we inject. So render any pure-emoji bubble as a
+                // sticker overlay — the same proven path as inline gifs/images.
+                NSURL *s = ApolloChatSnoomojiStickerURL(label);          // :snoo_hearteyes: -> emoji CDN URL
+                if (!s) {
+                    NSString *e = ApolloChatPureEmojiBody(label);        // 👍 / 🤜🤛 -> rasterized sticker
+                    if (e) s = ApolloChatEmojiStickerURL(e);
+                }
+                if (s) { imgURL = s; sticker = YES; }
             }
-            if (s) { imgURL = s; sticker = YES; }
         }
         if (imgURL) {
             ChatImgLog(@"detected %@ %@ -> %@", sticker ? @"snoomoji" : @"image", ApolloChatIndexKey(indexPath), imgURL.absoluteString);

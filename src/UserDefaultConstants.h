@@ -54,6 +54,11 @@ static NSString *const UDKeyKeepSearchBarInPlace = @"KeepSearchBarInPlace";
 // Render image URLs (i.redd.it, preview.redd.it, i.imgur.com, generic .png/.jpg/.jpeg/.webp)
 // inline within post selftext and comments instead of leaving them as plain text links.
 static NSString *const UDKeyEnableInlineImages = @"EnableInlineImages";
+// Master toggle for the chat media enhancements: render inbound images/GIFs/emoji/snoomoji
+// inline in DM/chat bubbles, rewrite outgoing media embeds so image/GIF sends work, and tap an
+// image/GIF to open it full screen. OFF = stock Apollo chat (media shown as plain text links).
+// Independent of "Show User Profile Pictures" (avatars have their own toggle). See ApolloChat*.xm.
+static NSString *const UDKeyEnableChatMedia = @"EnableChatMedia";
 // Horizontal alignment for inline media that is narrower than the row (e.g. tall portrait images).
 // 0 = Center (default), 1 = Left, 2 = Right.
 static NSString *const UDKeyInlineImageAlignment = @"InlineImageAlignment";
