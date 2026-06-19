@@ -15,9 +15,18 @@
 //
 
 import Foundation
+import os
 #if canImport(FoundationModels)
 import FoundationModels
 #endif
+
+// Matches ApolloLog's os_log subsystem ("apollofix") so these diagnostics land
+// in the same stream the rest of the tweak (and run-in-sim.sh) reads. Plain
+// NSLog is wrong here: on iOS 26 it redacts every `%@` argument to <private>
+// (the same reason ApolloCommon switched to os_log), so the identifiers and
+// timings below would have been unreadable. These are dev diagnostics, so they
+// log at `.debug` (not persisted in release unless debug logging is enabled).
+private let aiLog = Logger(subsystem: "apollofix", category: "AISummary")
 
 @objc(ApolloFoundationModels)
 public final class ApolloFoundationModels: NSObject {
@@ -134,20 +143,14 @@ public final class ApolloFoundationModels: NSObject {
                     if !loggedFirstToken, !latest.isEmpty {
                         loggedFirstToken = true
                         let elapsed = ContinuousClock.now - startedAt
-                        NSLog("[ApolloReborn][AISummary] first text %@ after %@",
-                              identifier, String(describing: elapsed))
+                        aiLog.debug("first text \(identifier, privacy: .public) after \(String(describing: elapsed), privacy: .public)")
                     }
                     onPartial(latest)
                 }
-                NSLog("[ApolloReborn][AISummary] completed %@ after %@",
-                      identifier, String(describing: ContinuousClock.now - startedAt))
+                aiLog.debug("completed \(identifier, privacy: .public) after \(String(describing: ContinuousClock.now - startedAt), privacy: .public)")
                 if #available(iOS 27.0, *) {
                     let usage = session.usage
-                    NSLog("[ApolloReborn][AISummary] tokens input=%ld cached=%ld output=%ld reasoning=%ld",
-                          usage.input.totalTokenCount,
-                          usage.input.cachedTokenCount,
-                          usage.output.totalTokenCount,
-                          usage.output.reasoningTokenCount)
+                    aiLog.debug("tokens \(identifier, privacy: .public) input=\(usage.input.totalTokenCount) cached=\(usage.input.cachedTokenCount) output=\(usage.output.totalTokenCount) reasoning=\(usage.output.reasoningTokenCount)")
                 }
                 onComplete(latest, nil)
             } catch {
@@ -155,7 +158,7 @@ public final class ApolloFoundationModels: NSObject {
                 if Task.isCancelled {
                     onComplete(nil, Self.makeError(code: 6, message: "Generation cancelled"))
                 } else {
-                    onComplete(nil, error as NSError)
+                    onComplete(nil, Self.classify(error))
                 }
             }
             activeTasks.removeValue(forKey: identifier)
@@ -171,5 +174,51 @@ public final class ApolloFoundationModels: NSObject {
         return NSError(domain: "ApolloFoundationModels",
                        code: code,
                        userInfo: [NSLocalizedDescriptionKey: message])
+    }
+
+    /// Map a thrown FoundationModels error to a stable integer code the ObjC
+    /// side branches on (see `ApolloAIFriendlyError` / the transient-retry path
+    /// in ApolloAISummary.xm). Classifying here, against the typed error enums,
+    /// is robust across OS locales — the previous English substring matching on
+    /// `localizedDescription` broke under localization. The original
+    /// description is preserved for logging.
+    ///   6  = cancelled            7  = guardrail / refusal
+    ///   8  = context window full  9  = rate limited / concurrent (transient)
+    ///   10 = unsupported language  2 = assets unavailable / model not ready
+    ///   5  = unknown
+    private static func classify(_ error: Error) -> NSError {
+        var code = 5
+        #if canImport(FoundationModels)
+        if #available(iOS 27.0, *) {
+            if let e = error as? LanguageModelError {
+                switch e {
+                case .guardrailViolation, .refusal:  code = 7
+                case .contextSizeExceeded:           code = 8
+                case .rateLimited:                   code = 9
+                case .unsupportedLanguageOrLocale:   code = 10
+                default:                             code = 5
+                }
+            } else if let e = error as? LanguageModelSession.Error {
+                switch e {
+                case .concurrentRequests:            code = 9
+                default:                             code = 5
+                }
+            }
+        }
+        if code == 5, #available(iOS 26.0, *), let e = error as? LanguageModelSession.GenerationError {
+            switch e {
+            case .guardrailViolation, .refusal:      code = 7
+            case .exceededContextWindowSize:         code = 8
+            case .rateLimited, .concurrentRequests:  code = 9
+            case .unsupportedLanguageOrLocale:       code = 10
+            case .assetsUnavailable:                 code = 2
+            default:                                 code = 5
+            }
+        }
+        #endif
+        let ns = error as NSError
+        return NSError(domain: "ApolloFoundationModels",
+                       code: code,
+                       userInfo: [NSLocalizedDescriptionKey: ns.localizedDescription])
     }
 }

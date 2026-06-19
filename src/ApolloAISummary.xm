@@ -1135,23 +1135,38 @@ static void ApolloAIRestoreStateForHeader(id headerNode, NSString *fullName) {
     }
 }
 
-// Short, user-facing message for a generation error shown inside the box.
+// Short, user-facing message for a generation error shown inside the box. The
+// bridge classifies thrown FoundationModels errors into stable codes (see
+// ApolloFoundationModels.classify); we branch on those rather than on the
+// localized text, which differs per language.
 static NSString *ApolloAIFriendlyError(NSError *error) {
+    switch (error.code) {
+        case 1:
+            return @"Apple Intelligence isn't enabled. Turn it on in Settings, and make sure your device and Siri language match a supported language.";
+        case 2:
+            return @"The on-device model is still downloading. Try again shortly.";
+        case 7:
+            return @"The model declined to summarize this content.";
+        case 8:
+            return @"This thread is too long to summarize on-device.";
+        case 10:
+            return @"Summaries aren't available for this language yet.";
+        default:
+            break;
+    }
+    // Last-resort fallback for an uncategorized error (e.g. a non-bridge NSError).
     NSString *d = error.localizedDescription ?: @"";
     if ([d localizedCaseInsensitiveContainsString:@"not enabled"])
         return @"Apple Intelligence isn't enabled. Turn it on in Settings, and make sure your device and Siri language match a supported language.";
-    if ([d localizedCaseInsensitiveContainsString:@"not ready"] || [d localizedCaseInsensitiveContainsString:@"download"])
+    if ([d localizedCaseInsensitiveContainsString:@"download"])
         return @"The on-device model is still downloading. Try again shortly.";
-    if ([d localizedCaseInsensitiveContainsString:@"guardrail"] || [d localizedCaseInsensitiveContainsString:@"safety"] || [d localizedCaseInsensitiveContainsString:@"unsafe"])
-        return @"The model declined to summarize this content.";
     return @"Couldn't generate this summary.";
 }
 
+// Code 9 = rate-limited / concurrent-request throttling: the model is busy, not
+// a hard failure, so the caller retries shortly instead of showing an error.
 static BOOL ApolloAIErrorIsTransientConcurrency(NSError *error) {
-    NSString *d = error.localizedDescription ?: @"";
-    return [d localizedCaseInsensitiveContainsString:@"concurrent"] ||
-           [d localizedCaseInsensitiveContainsString:@"rate limit"] ||
-           [d localizedCaseInsensitiveContainsString:@"rate-limit"];
+    return error.code == 9;
 }
 
 static void ApolloAIForceHeaderRemeasure(NSString *fullName) {
