@@ -100,26 +100,49 @@ static NSString *ApolloUserFlairSwiftStringIvar(id object, NSString *name) {
 
         ptrdiff_t offset = ivar_getOffset(ivar);
         uint8_t *base = (uint8_t *)(__bridge void *)object + offset;
-        uint64_t low = 0;
-        uint64_t high = 0;
+        uint64_t low = 0;   // _countAndFlags (word 0)
+        uint64_t high = 0;  // _object / BridgeObject (word 1)
         memcpy(&low, base, sizeof(low));
         memcpy(&high, base + sizeof(low), sizeof(high));
 
         uint8_t discriminator = (uint8_t)(high >> 56);
-        if (discriminator < 0xE0 || discriminator > 0xEF) return nil;
 
-        NSUInteger length = discriminator - 0xE0;
-        if (length == 0 || length > 15) return nil;
+        // Small string: up to 15 UTF-8 bytes stored inline across both words; the
+        // discriminator byte is 0xE0 | count.
+        if (discriminator >= 0xE0 && discriminator <= 0xEF) {
+            NSUInteger length = discriminator - 0xE0;
+            if (length == 0 || length > 15) return nil;
 
-        char buffer[16] = {0};
-        for (NSUInteger i = 0; i < length && i < 8; i++) {
-            buffer[i] = (char)((low >> (i * 8)) & 0xFF);
+            char buffer[16] = {0};
+            for (NSUInteger i = 0; i < length && i < 8; i++) {
+                buffer[i] = (char)((low >> (i * 8)) & 0xFF);
+            }
+            for (NSUInteger i = 8; i < length; i++) {
+                buffer[i] = (char)((high >> ((i - 8) * 8)) & 0xFF);
+            }
+            return [[NSString alloc] initWithBytes:buffer length:length encoding:NSUTF8StringEncoding];
         }
-        for (NSUInteger i = 8; i < length; i++) {
-            buffer[i] = (char)((high >> ((i - 8) * 8)) & 0xFF);
-        }
 
-        return [[NSString alloc] initWithBytes:buffer length:length encoding:NSUTF8StringEncoding];
+        // Large string (>15 bytes, OR any string that was bridged in from an NSString —
+        // e.g. a subreddit name passed through Apollo's ObjC RDKClient API, which never
+        // takes the inline small-string form). Word 1 is a Swift BridgeObject whose
+        // payload (with the top discriminator byte cleared) is the backing storage
+        // object. Both Swift's native __StringStorage and a lazily-bridged Cocoa string
+        // are NSString subclasses, so we read the value by messaging that pointer as an
+        // NSString. Guard hard: a bad read must never crash the flair selector.
+        uintptr_t storagePtr = (uintptr_t)(high & 0x00FFFFFFFFFFFFFFULL);
+        if (storagePtr < 0x1000) return nil; // not a plausible heap pointer
+        @try {
+            id storage = (__bridge id)(void *)storagePtr;
+            if ([storage isKindOfClass:[NSString class]]) {
+                // Copy out of Swift's storage so we own a stable, ObjC-managed string.
+                NSString *value = [(NSString *)storage copy];
+                if (value.length > 0) return value;
+            }
+        } @catch (__unused NSException *exception) {
+            return nil;
+        }
+        return nil;
     }
     return nil;
 }
@@ -1401,6 +1424,17 @@ static void ApolloUserFlairFetchCurrentFlair(UIViewController *controller, NSStr
     NSString *enc = [subreddit stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLPathAllowedCharacterSet]] ?: subreddit;
     __weak UIViewController *weakController = controller;
 
+    // Reddit's /api/flairselector `current` reliably returns the applied flair_text but
+    // often omits flair_template_id (comes back empty), so we can't map the flair back
+    // to its row from the response alone. Apollo's own selector, however, resolves the
+    // applied template into its `currentFlairID` ivar (a Swift String) — that's what
+    // drives its native checkmark. Capture it synchronously now (at open, before the
+    // user taps anything) so we can use it as the authoritative template id when the
+    // server's is missing. Without this the editor pre-fills the template's DEFAULT text
+    // and re-saving silently overwrites the user's real flair.
+    NSString *nativeTemplateID = ApolloUserFlairSwiftStringIvar(controller, @"currentFlairID");
+    if (![nativeTemplateID isKindOfClass:[NSString class]]) nativeTemplateID = nil;
+
     // Fetch the emoji map FIRST so :token: flairs can render as images, then the
     // current flair, then reload the table once both are available.
     ApolloUserFlairFetchEmojis(subreddit, ^(NSArray *emojis) {
@@ -1420,6 +1454,9 @@ static void ApolloUserFlairFetchCurrentFlair(UIViewController *controller, NSStr
                 id t = current[@"flair_text"]; if ([t isKindOfClass:[NSString class]]) text = t;
                 id tid = current[@"flair_template_id"]; if ([tid isKindOfClass:[NSString class]]) templateID = tid;
             }
+            // The server frequently omits flair_template_id; fall back to the template id
+            // Apollo itself resolved (its native checkmark source), captured above.
+            if (templateID.length == 0 && nativeTemplateID.length > 0) templateID = nativeTemplateID;
             dispatch_async(dispatch_get_main_queue(), ^{
                 UIViewController *strongController = weakController;
                 if (!strongController) return;
