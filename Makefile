@@ -99,10 +99,17 @@ ApolloReborn_FILES = \
     $(SSZIPARCHIVE_FILES)
 ApolloReborn_FRAMEWORKS = UIKit Security AVFoundation OSLog NaturalLanguage ImageIO StoreKit Photos PhotosUI SafariServices SystemConfiguration WebKit AuthenticationServices
 ApolloReborn_LIBRARIES = z iconv
-# FoundationModels (Apple on-device AI, iOS 26+) is weak-linked so the dylib
-# still loads on older OSes; the Swift bridge (ApolloFoundationModels.swift)
-# guards every call behind #available(iOS 26).
-ApolloReborn_LDFLAGS = -weak_framework FoundationModels
+# FoundationModels (Apple on-device AI) only ships in the iOS 26+ SDK. Weak-link
+# it so the dylib still loads on older OSes (the Swift bridge guards every call
+# behind #available(iOS 26)), but ONLY when the build SDK actually contains the
+# framework. Older toolchains — e.g. CI's Xcode 16 / iOS 18 SDK, which predates
+# it — would otherwise fail at link with "framework 'FoundationModels' not
+# found". On those SDKs `#if canImport(FoundationModels)` is already false, so
+# the Swift bridge references no FM symbols and the flag isn't needed (the
+# feature simply reports unavailable in that build).
+ifneq ($(wildcard $(SYSROOT)/System/Library/Frameworks/FoundationModels.framework),)
+ApolloReborn_LDFLAGS += -weak_framework FoundationModels
+endif
 ApolloReborn_CFLAGS = -fobjc-arc -Wno-error=unguarded-availability-new -Wno-module-import-in-extern-c -I$(THEOS_PROJECT_DIR)/$(SRC_DIR) -I$(THEOS_PROJECT_DIR)/liquid-glass/generated -I$(THEOS_PROJECT_DIR)/$(MODULES_DIR) -I$(THEOS_PROJECT_DIR)/$(SSZIPARCHIVE_DIR) -I$(THEOS_PROJECT_DIR)/$(SSZIPARCHIVE_DIR)/minizip -DHAVE_ARC4RANDOM_BUF -DHAVE_ICONV -DHAVE_INTTYPES_H -DHAVE_PKCRYPT -DHAVE_STDINT_H -DHAVE_WZAES -DHAVE_ZLIB -DZLIB_COMPAT
 
 ApolloReborn_BUNDLE_RESOURCE_DIRS = resources
