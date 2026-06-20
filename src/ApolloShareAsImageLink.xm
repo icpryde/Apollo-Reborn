@@ -25,6 +25,18 @@
 // No hardcoded binary addresses: everything is ObjC-runtime ivar access (ivar
 // names from class-dump headers) plus public UIKit selectors, with defensive
 // guards throughout.
+//
+// MODULE ORDERING (Makefile ApolloReborn_FILES): this module is listed after
+// ApolloShareAsImageGallery and before ApolloShareAsVideo, i.e.
+// Gallery -> Link -> Video -> PreviewFix. All four hook
+// _TtC6Apollo26ShareAsImageViewController (and the first three also
+// SourdoughPresentationController); they compose via %ctor/%init() order. This
+// module's option row stacks one row below Gallery's in its viewDidLayoutSubviews
+// pass, and ApolloShareAsVideo's share-button hook installs after ours (so it is
+// outermost and can suppress the native share). The link-append below is written to
+// be idempotent (see ApolloShareLinkAlreadyHasLinkSource), so it no longer depends
+// on that hook order to avoid a double link — but if you reorder these in the
+// Makefile, re-verify the option-row layout still stacks correctly.
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -285,22 +297,49 @@ static void ApolloShareLinkLayoutRow(id vc) {
     ApolloLog(@"[ShareLink] share tapped includeLink=%d", (int)sActiveShareIncludeLink);
     %orig;
     // Safety net: clear the handshake shortly after, in case no activity sheet is
-    // built (the init hook also clears it immediately on a successful append).
+    // built (the init hook also clears it immediately on a successful append). Reset
+    // both fields so neither is left latched into a later, unrelated share.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ sActiveShareVC = nil; });
+                   dispatch_get_main_queue(), ^{ sActiveShareVC = nil; sActiveShareIncludeLink = NO; });
 }
 
 %end
+
+// Does this share sheet ALREADY carry one of our Reddit-link item sources? Both this
+// module (ApolloShareLinkItemSource) and ApolloShareAsVideo (ApolloSVLinkItemSource)
+// attach one when their feature is on, and ApolloShareAsVideo presents its OWN
+// activity sheet — whose initWithActivityItems: flows through THIS very hook. When
+// the video path took over the share (both toggles on) it already added the link, so
+// re-appending here would produce a double link. Gating on this makes the append
+// idempotent regardless of Makefile hook order or how long the handshake timer below
+// stays open — directly addressing the latent double-link path. We match the two
+// concrete source classes (this module's directly; the video module's via a runtime
+// objc_getClass lookup so there's no hard link/symbol or Makefile-order dependency),
+// rather than an open-ended name match that could false-positive on a native class.
+static BOOL ApolloShareLinkAlreadyHasLinkSource(NSArray *items) {
+    if (![items isKindOfClass:[NSArray class]]) return NO;
+    Class svLinkClass = objc_getClass("ApolloSVLinkItemSource"); // ApolloShareAsVideo's link source, if loaded
+    for (id item in items) {
+        if ([item isKindOfClass:[ApolloShareLinkItemSource class]]) return YES;
+        if (svLinkClass && [item isKindOfClass:svLinkClass]) return YES;
+    }
+    return NO;
+}
 
 %hook UIActivityViewController
 
 - (instancetype)initWithActivityItems:(NSArray *)activityItems
                 applicationActivities:(NSArray *)applicationActivities {
+    // This hook fires for EVERY UIActivityViewController in the app; the
+    // sActiveShareVC handshake (set only by the share-as-image Share tap) scopes it,
+    // and the link-source check keeps us from double-appending onto the video path's
+    // own sheet.
     id vc = sActiveShareVC;
-    if (vc && sActiveShareIncludeLink) {
+    if (vc && sActiveShareIncludeLink && !ApolloShareLinkAlreadyHasLinkSource(activityItems)) {
         NSURL *url = ApolloShareLinkURLForVC(vc);
         if ([url isKindOfClass:[NSURL class]]) {
-            sActiveShareVC = nil; // consume the handshake so we only append once
+            sActiveShareVC = nil;          // consume the handshake so we only append once
+            sActiveShareIncludeLink = NO;  // reset too, so the flag is never left latched
             ApolloShareLinkItemSource *source = [[ApolloShareLinkItemSource alloc] init];
             source.url = url;
             NSMutableArray *items = [activityItems isKindOfClass:[NSArray class]]

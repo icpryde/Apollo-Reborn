@@ -47,6 +47,17 @@
 //
 // No hardcoded binary addresses: everything is ObjC-runtime ivar access (ivar
 // names from class-dump headers) plus public AVFoundation/UIKit, guarded.
+//
+// MODULE ORDERING (Makefile ApolloReborn_FILES): this module is listed AFTER
+// ApolloShareAsImageLink and BEFORE ApolloShareAsImagePreviewFix, i.e.
+// Gallery -> Link -> Video -> PreviewFix. %ctor/%init() runs in that order, so this
+// module's shareButtonTappedWithSender: hook installs last and is therefore the
+// OUTERMOST link in the chain — it runs first and, when the video toggle is on,
+// suppresses the native image share before Link's handler runs. Each module's row
+// also stacks below the previous one's in its post-%orig viewDidLayoutSubviews pass.
+// If you reorder these in the Makefile, re-verify the share-button chain and the row
+// layout. (The Include-Link double-append guard in ApolloShareAsImageLink no longer
+// depends on this order — see that file — but the layout stacking still does.)
 
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
@@ -419,23 +430,40 @@ static BOOL ApolloSVMediaRectNormalized(id vc, CGRect *outNorm) {
 // removes the CALayer coordinate-flip guesswork. AVAssetExportSession still muxes
 // the audio track for us — only the video is custom-composited.
 //
-// One export runs at a time (guarded by the exporting flag), so the per-export
-// draw parameters are handed to the compositor through file statics.
-static CGImageRef sSVCardCG = NULL;          // +1 retained full card image
-static CGSize sSVRenderSize;                 // output pixels
-static CGRect sSVMediaRect;                  // media rect, pixels, UIKit top-left
-static CGAffineTransform sSVVideoPreferred;  // source video preferredTransform
-static int32_t sSVVideoTrackID;
+// Per-export draw parameters travel WITH the composition, as a custom
+// AVVideoCompositionInstruction (the documented pattern — cf. Apple's AVCustomEdit),
+// rather than through file statics. The compositor reads them back per frame from
+// request.videoCompositionInstruction, so two exports running at once (e.g. two
+// Share-as-Image sheets in iPad multi-window) can never clobber each other's card,
+// media rect, or transform. Combined with the unique per-export temp filename in
+// ApolloSVExport, nothing about the export relies on only one running at a time.
+@interface ApolloSVInstruction : NSObject <AVVideoCompositionInstruction>
+// AVVideoCompositionInstruction protocol requirements (declared readwrite here):
+@property (nonatomic, assign) CMTimeRange timeRange;
+@property (nonatomic, assign) BOOL enablePostProcessing;
+@property (nonatomic, assign) BOOL containsTweening;
+@property (nonatomic, strong) NSArray<NSValue *> *requiredSourceTrackIDs;
+@property (nonatomic, assign) CMPersistentTrackID passthroughTrackID;
+// Our per-frame draw inputs:
+@property (nonatomic, assign) CGImageRef cardImage;             // retained (see setter)
+@property (nonatomic, assign) CGRect mediaRect;                 // pixels, UIKit top-left
+@property (nonatomic, assign) CGAffineTransform videoPreferred; // source preferredTransform
+@property (nonatomic, assign) int32_t videoTrackID;
+@end
 
-static void ApolloSVSetCompositorParams(CGImageRef card, CGSize renderSize, CGRect mediaRect,
-                                        CGAffineTransform pref, int32_t trackID) {
-    if (sSVCardCG) { CGImageRelease(sSVCardCG); sSVCardCG = NULL; }
-    sSVCardCG = card ? CGImageRetain(card) : NULL;
-    sSVRenderSize = renderSize;
-    sSVMediaRect = mediaRect;
-    sSVVideoPreferred = pref;
-    sSVVideoTrackID = trackID;
+@implementation ApolloSVInstruction
+// CGImageRef isn't ARC-managed; retain on set, release the old one + on dealloc, so
+// the card image lives exactly as long as the instruction (i.e. the export).
+- (void)setCardImage:(CGImageRef)cardImage {
+    if (cardImage == _cardImage) return;
+    if (cardImage) CGImageRetain(cardImage);
+    if (_cardImage) CGImageRelease(_cardImage);
+    _cardImage = cardImage;
 }
+- (void)dealloc {
+    if (_cardImage) CGImageRelease(_cardImage);
+}
+@end
 
 // CVPixelBuffer (BGRA) -> UIImage, mapping the source preferredTransform to a
 // UIImageOrientation so portrait clips recorded as rotated landscape draw upright.
@@ -452,11 +480,19 @@ static UIImage *ApolloSVImageFromBuffer(CVPixelBufferRef buf, CGAffineTransform 
     CGColorSpaceRelease(cs);
     CVPixelBufferUnlockBaseAddress(buf, kCVPixelBufferLock_ReadOnly);
     if (!cg) return nil;
+    // Map the source preferredTransform to a UIImageOrientation. All eight
+    // orientations are covered (the four mirrored ones included) so a flipped clip
+    // would still draw upright; real v.redd.it/Giphy sources won't be mirrored, but
+    // this is exhaustive rather than falling through to Up.
     UIImageOrientation orient = UIImageOrientationUp;
     CGFloat a = pref.a, b = pref.b, c = pref.c, d = pref.d;
-    if (a == 0 && b == 1 && c == -1 && d == 0)       orient = UIImageOrientationRight; // 90° CW
-    else if (a == 0 && b == -1 && c == 1 && d == 0)  orient = UIImageOrientationLeft;  // 90° CCW
-    else if (a == -1 && b == 0 && c == 0 && d == -1) orient = UIImageOrientationDown;  // 180°
+    if (a == 0 && b == 1 && c == -1 && d == 0)       orient = UIImageOrientationRight;        // 90° CW
+    else if (a == 0 && b == -1 && c == 1 && d == 0)  orient = UIImageOrientationLeft;         // 90° CCW
+    else if (a == -1 && b == 0 && c == 0 && d == -1) orient = UIImageOrientationDown;         // 180°
+    else if (a == -1 && b == 0 && c == 0 && d == 1)  orient = UIImageOrientationUpMirrored;   // horizontal flip
+    else if (a == 1 && b == 0 && c == 0 && d == -1)  orient = UIImageOrientationDownMirrored; // vertical flip
+    else if (a == 0 && b == -1 && c == -1 && d == 0) orient = UIImageOrientationLeftMirrored;
+    else if (a == 0 && b == 1 && c == 1 && d == 0)   orient = UIImageOrientationRightMirrored;
     UIImage *img = [UIImage imageWithCGImage:cg scale:1.0 orientation:orient];
     CGImageRelease(cg);
     return img;
@@ -477,12 +513,28 @@ static UIImage *ApolloSVImageFromBuffer(CVPixelBufferRef buf, CGAffineTransform 
 
 - (void)startVideoCompositionRequest:(AVAsynchronousVideoCompositionRequest *)request {
     @autoreleasepool {
+        // Per-export draw parameters ride on the instruction (no shared file state).
+        ApolloSVInstruction *inst = nil;
+        id rawInst = request.videoCompositionInstruction;
+        if ([rawInst isKindOfClass:[ApolloSVInstruction class]]) inst = (ApolloSVInstruction *)rawInst;
+        if (!inst) {
+            // Should never happen — only our instruction is installed on the video
+            // composition. Fail loudly rather than composing an all-black frame, so an
+            // unexpected instruction type surfaces as an export error (which falls back
+            // to the native image share) instead of a silently-broken black video.
+            [request finishWithError:[NSError errorWithDomain:@"ApolloShareVideo" code:11 userInfo:nil]];
+            return;
+        }
+
         CVPixelBufferRef dst = [request.renderContext newPixelBuffer];
         if (!dst) {
             [request finishWithError:[NSError errorWithDomain:@"ApolloShareVideo" code:10 userInfo:nil]];
             return;
         }
-        CVPixelBufferRef src = [request sourceFrameByTrackID:sSVVideoTrackID];
+        CVPixelBufferRef src = [request sourceFrameByTrackID:inst.videoTrackID];
+        CGImageRef cardCG = inst.cardImage;
+        CGRect mediaRect = inst.mediaRect;
+        CGAffineTransform pref = inst.videoPreferred;
 
         CVPixelBufferLockBaseAddress(dst, 0);
         size_t w = CVPixelBufferGetWidth(dst), h = CVPixelBufferGetHeight(dst);
@@ -501,19 +553,19 @@ static UIImage *ApolloSVImageFromBuffer(CVPixelBufferRef buf, CGAffineTransform 
             UIRectFill(CGRectMake(0, 0, w, h));
 
             // The full card (header, title, poster, watermark) — full frame.
-            if (sSVCardCG) {
-                [[UIImage imageWithCGImage:sSVCardCG] drawInRect:CGRectMake(0, 0, w, h)];
+            if (cardCG) {
+                [[UIImage imageWithCGImage:cardCG] drawInRect:CGRectMake(0, 0, w, h)];
             }
             // The live video frame, aspect-filled into the media rect (covers poster).
-            UIImage *frame = ApolloSVImageFromBuffer(src, sSVVideoPreferred);
+            UIImage *frame = ApolloSVImageFromBuffer(src, pref);
             if (frame && frame.size.width > 0 && frame.size.height > 0) {
                 CGContextSaveGState(ctx);
-                CGContextClipToRect(ctx, sSVMediaRect);
-                CGFloat sc = MAX(sSVMediaRect.size.width / frame.size.width,
-                                 sSVMediaRect.size.height / frame.size.height);
+                CGContextClipToRect(ctx, mediaRect);
+                CGFloat sc = MAX(mediaRect.size.width / frame.size.width,
+                                 mediaRect.size.height / frame.size.height);
                 CGSize ds = CGSizeMake(frame.size.width * sc, frame.size.height * sc);
-                CGRect dr = CGRectMake(CGRectGetMidX(sSVMediaRect) - ds.width / 2.0,
-                                       CGRectGetMidY(sSVMediaRect) - ds.height / 2.0,
+                CGRect dr = CGRectMake(CGRectGetMidX(mediaRect) - ds.width / 2.0,
+                                       CGRectGetMidY(mediaRect) - ds.height / 2.0,
                                        ds.width, ds.height);
                 [frame drawInRect:dr];
                 CGContextRestoreGState(ctx);
@@ -629,13 +681,20 @@ static void ApolloSVExport(id vc, UIImage *card, CGRect mediaNorm,
             [aTrack insertTimeRange:CMTimeRangeMake(kCMTimeZero, aDur) ofTrack:srcAudio atTime:kCMTimeZero error:nil];
         }
 
-        // Video composition driven by our custom Core Graphics compositor (the
-        // per-frame draw uses card + media rect + preferredTransform passed below).
-        AVMutableVideoCompositionLayerInstruction *li =
-            [AVMutableVideoCompositionLayerInstruction videoCompositionLayerInstructionWithAssetTrack:vTrack];
-        AVMutableVideoCompositionInstruction *inst = [AVMutableVideoCompositionInstruction videoCompositionInstruction];
+        // Video composition driven by our custom Core Graphics compositor. The
+        // per-frame draw inputs (card, media rect, preferredTransform, track id) are
+        // carried ON the instruction (ApolloSVInstruction) rather than via shared
+        // statics, so concurrent exports can't clobber each other.
+        ApolloSVInstruction *inst = [[ApolloSVInstruction alloc] init];
         inst.timeRange = range;
-        inst.layerInstructions = @[li];
+        inst.enablePostProcessing = NO;
+        inst.containsTweening = NO;
+        inst.passthroughTrackID = kCMPersistentTrackID_Invalid; // never pass through — always composite
+        inst.requiredSourceTrackIDs = @[@(vTrack.trackID)];
+        inst.cardImage = card.CGImage;
+        inst.mediaRect = mediaPx;
+        inst.videoPreferred = srcVideo.preferredTransform;
+        inst.videoTrackID = vTrack.trackID;
 
         AVMutableVideoComposition *vc2 = [AVMutableVideoComposition videoComposition];
         vc2.renderSize = renderSize;
@@ -645,10 +704,11 @@ static void ApolloSVExport(id vc, UIImage *card, CGRect mediaNorm,
         vc2.instructions = @[inst];
         vc2.customVideoCompositorClass = [ApolloSVCompositor class];
 
-        // Hand the per-frame draw parameters to the compositor (one export at a time).
-        ApolloSVSetCompositorParams(card.CGImage, renderSize, mediaPx, srcVideo.preferredTransform, vTrack.trackID);
-
-        NSString *outPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"ApolloPost.mp4"];
+        // Unique temp filename per export (don't reuse a fixed "ApolloPost.mp4"), so
+        // two concurrent exports can't overwrite each other's output mid-flight.
+        NSString *outName = [NSString stringWithFormat:@"ApolloShareVideo-%@.mp4",
+                             [[NSProcessInfo processInfo] globallyUniqueString]];
+        NSString *outPath = [NSTemporaryDirectory() stringByAppendingPathComponent:outName];
         [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil];
         NSURL *outURL = [NSURL fileURLWithPath:outPath];
 
@@ -685,7 +745,8 @@ static void ApolloSVExport(id vc, UIImage *card, CGRect mediaNorm,
             finished = YES;
             dispatch_source_cancel(timer);
             AVAssetExportSessionStatus st = ex.status;
-            ApolloSVSetCompositorParams(NULL, CGSizeZero, CGRectZero, CGAffineTransformIdentity, 0);
+            // No shared compositor state to tear down — the instruction (and its
+            // retained card image) is released with the composition after export.
             dispatch_async(dispatch_get_main_queue(), ^{
                 objc_setAssociatedObject(vc, &kApolloShareVideoSessionKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 if (st == AVAssetExportSessionStatusCompleted) {
@@ -703,16 +764,28 @@ static void ApolloSVExport(id vc, UIImage *card, CGRect mediaNorm,
 
 #pragma mark - Progress HUD
 
-static void ApolloSVHideHUD(id vc) {
-    UIView *hud = (UIView *)objc_getAssociatedObject(vc, &kApolloShareVideoHUDKey);
-    if ([hud isKindOfClass:[UIView class]]) {
+// Tears a HUD overlay off the screen directly, by view reference — no VC needed.
+// This is what makes the HUD impossible to orphan: the export blocks capture the
+// overlay view strongly, so even if the VC (and its associated-object handle) is
+// gone, the overlay can still be removed. Idempotent and main-thread-safe.
+static void ApolloSVRemoveHUDView(UIView *hud) {
+    if (![hud isKindOfClass:[UIView class]]) return;
+    dispatch_block_t teardown = ^{
         [UIView animateWithDuration:0.2 animations:^{ hud.alpha = 0; }
                          completion:^(__unused BOOL done) { [hud removeFromSuperview]; }];
-    }
+    };
+    if ([NSThread isMainThread]) teardown();
+    else dispatch_async(dispatch_get_main_queue(), teardown);
+}
+
+static void ApolloSVHideHUD(id vc) {
+    ApolloSVRemoveHUDView((UIView *)objc_getAssociatedObject(vc, &kApolloShareVideoHUDKey));
     objc_setAssociatedObject(vc, &kApolloShareVideoHUDKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
-static void ApolloSVShowHUD(id vc) {
+// Returns the dim overlay view so callers can hold it strongly for the export's
+// lifetime (see ApolloSVRemoveHUDView).
+static UIView *ApolloSVShowHUD(id vc) {
     UIViewController *v = (UIViewController *)vc;
     // The share sheet's own root view is a UIVisualEffectView on iOS 26 — you
     // can't addSubview: to one directly (it asserts). Host the overlay on the
@@ -724,7 +797,7 @@ static void ApolloSVShowHUD(id vc) {
         host = [root isKindOfClass:[UIVisualEffectView class]]
             ? [(UIVisualEffectView *)root contentView] : root;
     }
-    if (![host isKindOfClass:[UIView class]]) return;
+    if (![host isKindOfClass:[UIView class]]) return nil;
 
     UIView *dim = [[UIView alloc] initWithFrame:host.bounds];
     dim.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
@@ -766,6 +839,7 @@ static void ApolloSVShowHUD(id vc) {
     objc_setAssociatedObject(vc, &kApolloShareVideoHUDKey, dim, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(dim, @selector(text), label, OBJC_ASSOCIATION_ASSIGN); // quick label handle
     [UIView animateWithDuration:0.2 animations:^{ dim.alpha = 1.0; }];
+    return dim;
 }
 
 static void ApolloSVUpdateHUD(id vc, float p) {
@@ -891,12 +965,17 @@ static BOOL ApolloSVBeginVideoShare(id vc) {
     }
 
     objc_setAssociatedObject(vc, &kApolloShareVideoExportingKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    ApolloSVShowHUD(vc);
+    // Hold the HUD overlay STRONGLY in the export blocks below. If the VC is
+    // deallocated mid-export, ApolloSVHideHUD (keyed off the VC's associated object)
+    // never fires, so without this strong handle the overlay would stay stuck on the
+    // window with no way to dismiss it. Capturing the view lets every exit path tear
+    // it down regardless of the VC's fate.
+    UIView *hud = ApolloSVShowHUD(vc);
 
     __weak id weakVC = vc;
     ApolloSVResolveForVC(vc, ^(NSURL *videoURL, NSURL *audioURL) {
         id strongVC = weakVC;
-        if (!strongVC) return;
+        if (!strongVC) { ApolloSVRemoveHUDView(hud); return; }
         if (!videoURL) {
             ApolloLog(@"[ShareVideo] no exportable source — falling back to image share");
             objc_setAssociatedObject(strongVC, &kApolloShareVideoExportingKey, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -909,7 +988,11 @@ static BOOL ApolloSVBeginVideoShare(id vc) {
             ^(float p) { ApolloSVUpdateHUD(weakVC, p); },
             ^(NSURL *outURL, NSError *error) {
                 id sVC = weakVC;
-                if (!sVC) { if (outURL) [[NSFileManager defaultManager] removeItemAtURL:outURL error:nil]; return; }
+                if (!sVC) {
+                    ApolloSVRemoveHUDView(hud); // VC gone — tear the overlay down ourselves
+                    if (outURL) [[NSFileManager defaultManager] removeItemAtURL:outURL error:nil];
+                    return;
+                }
                 objc_setAssociatedObject(sVC, &kApolloShareVideoExportingKey, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 ApolloSVHideHUD(sVC);
                 if (outURL && !error) {

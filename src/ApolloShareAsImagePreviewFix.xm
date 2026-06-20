@@ -12,11 +12,15 @@
 //       loading AFTER present and grows the node, but that internal Texture
 //       re-measure never drives the view controller's viewDidLayoutSubviews — so the
 //       initial (short, squished) snapshot sticks. Any settings toggle or drag
-//       forces a relayout, which is why it "fixes itself." Fix: after present, force
-//       a few view-controller relayouts (the same path a toggle takes) so the
-//       snapshot is refreshed once the media has loaded and the node measures its
-//       true height. The native re-snapshot is size-gated, so a relayout that finds
-//       nothing changed is a no-op.
+//       forces a relayout, which is why it "fixes itself." Fix: after present, drive
+//       Apollo's own relayout (the same path a toggle takes) on a short polling loop
+//       that OBSERVES the preview node's measured size rather than firing on a fixed
+//       time ladder. It stops as soon as the node has grown (async media arrived) AND
+//       the snapshot has caught up to the node's size — the exact size comparison
+//       Apollo's re-snapshot gate uses — so a fast (cached) load settles in a pass or
+//       two, while a slow/cold-cache load that finishes seconds later is still picked
+//       up (the old fixed 3.5s ceiling could miss it). The native re-snapshot is
+//       size-gated, so a relayout that finds nothing changed is a no-op.
 //
 //   #3  UPWARD-DRAG GLITCH. Press-dragging the preview sheet UPWARD lifts it off the
 //       bottom of the screen: the pan handler moves the presented view's origin.y up
@@ -38,6 +42,13 @@
 //       you can tweak options and try again).
 //
 // Pure ObjC-runtime access + public UIKit; no hardcoded binary addresses.
+//
+// MODULE ORDERING (Makefile ApolloReborn_FILES): this module is listed LAST of the
+// four Share-as-Image modules (Gallery -> Link -> Video -> PreviewFix), so its hooks
+// install last and wrap the others. In particular its presentViewController: hook is
+// outermost, so it sees the activity sheet whether the native image share or
+// ApolloShareAsVideo's own share presents it — which is exactly what the
+// auto-dismiss (#4) needs. Keep it last if you reorder the Makefile.
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -47,6 +58,23 @@
 // Associated-object key: marks that the post-present snapshot refresh has been
 // armed for this VC (so we only schedule it once).
 static char kApolloSIPFRefreshArmedKey;
+
+#pragma mark - Runtime helpers
+
+static id ApolloSIPFIvarObject(id obj, const char *name) {
+    if (!obj || !name) return nil;
+    Ivar ivar = class_getInstanceVariable(object_getClass(obj), name);
+    if (!ivar) return nil;
+    @try { return object_getIvar(obj, ivar); } @catch (__unused NSException *e) { return nil; }
+}
+
+// The preview node's measured bounds size. The concrete ASDisplayNode class isn't
+// headered here, so reach `bounds` via objc_msgSend (CGRect-returning), guarded.
+static CGSize ApolloSIPFNodeSize(id node) {
+    if (!node || ![node respondsToSelector:@selector(bounds)]) return CGSizeZero;
+    @try { CGRect b = ((CGRect (*)(id, SEL))objc_msgSend)(node, @selector(bounds)); return b.size; }
+    @catch (__unused NSException *e) { return CGSizeZero; }
+}
 
 // Forces Apollo's own preview relayout + re-snapshot. This mirrors the relayout a
 // settings toggle performs (lay out the presentation container, then the VC view):
@@ -65,28 +93,75 @@ static void ApolloSIPFForceRelayout(UIViewController *vc) {
     [vc.view layoutIfNeeded];
 }
 
+// Self-rescheduling snapshot poll. Each pass forces a relayout (which drives Apollo's
+// size-gated re-snapshot), then OBSERVES the preview node's height vs the snapshot's:
+//   * `match`  = the snapshot height now equals the node height (Apollo re-snapshotted
+//                at the node's current size — the exact comparison its own gate uses).
+//   * `stable` = the node height also hasn't changed since the previous pass.
+// We STOP once the snapshot has matched a STABLE node height for a few consecutive
+// passes (the card stopped resizing and the snapshot reflects it — squish resolved),
+// or at a hard attempt cap (~10s of backed-off polling) as a backstop. This exits
+// fast both when the media was already cached (matches within a pass or two) AND after
+// a slow/cold-cache load finishes growing the card seconds later — which the old fixed
+// 3.5s ladder could miss. While the card is still actively resizing, the height keeps
+// changing so `stable` resets and we keep polling. A relayout that finds nothing
+// changed is a native no-op, so the trailing confirmation passes are cheap.
+static void ApolloSIPFPollSnapshot(UIViewController *vc, int attempt, CGFloat prevNodeHeight, int stableCount) {
+    if (![vc isViewLoaded] || !vc.viewIfLoaded.window) return; // dismissed — stop
+
+    ApolloSIPFForceRelayout(vc);
+
+    CGFloat nodeH = ApolloSIPFNodeSize(ApolloSIPFIvarObject(vc, "previewNode")).height;
+    UIImageView *snap = (UIImageView *)ApolloSIPFIvarObject(vc, "previewSnapshotImageView");
+    UIImage *snapImg = [snap isKindOfClass:[UIImageView class]] ? snap.image : nil;
+    CGFloat snapH = [snapImg isKindOfClass:[UIImage class]] ? snapImg.size.height : 0.0;
+
+    BOOL match  = nodeH > 1.0 && snapH > 1.0 && fabs(nodeH - snapH) < 1.0;
+    BOOL stable = match && prevNodeHeight > 1.0 && fabs(nodeH - prevNodeHeight) < 1.0;
+    stableCount = stable ? stableCount + 1 : 0;
+
+    if (stableCount >= 3) { // snapshot has matched a settled node height for several passes
+        ApolloLog(@"[SharePreviewFix] snapshot settled after %d pass(es)", attempt + 1);
+        return;
+    }
+    if (attempt >= 24) {
+        ApolloLog(@"[SharePreviewFix] snapshot poll finished after %d passes", attempt + 1);
+        return;
+    }
+
+    double delay = MIN(0.1 + 0.05 * attempt, 0.5); // gentle backoff, capped at 0.5s
+    int nextAttempt = attempt + 1;
+    CGFloat nextPrev = nodeH;
+    int nextStable = stableCount;
+    __weak UIViewController *weakVC = vc;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        UIViewController *strongVC = weakVC;
+        if (strongVC) ApolloSIPFPollSnapshot(strongVC, nextAttempt, nextPrev, nextStable);
+    });
+}
+
 %hook _TtC6Apollo26ShareAsImageViewController
 
 - (void)viewDidLayoutSubviews {
     %orig;
 
-    // Arm a short series of relayouts once, on the first layout after present, so
-    // the snapshot is refreshed as soon as any async comment/post media loads (it's
-    // usually already cached from the thread the user shared from, so this resolves
-    // almost immediately). Idempotent and self-limiting; each relayout is a no-op if
-    // nothing changed.
+    // Arm the snapshot poll once, on the first layout after present. It observes the
+    // preview node's size and refreshes the snapshot as soon as any async comment/post
+    // media loads (usually already cached, so it settles almost immediately).
+    // Idempotent and self-limiting.
     if ([objc_getAssociatedObject(self, &kApolloSIPFRefreshArmedKey) boolValue]) return;
     objc_setAssociatedObject(self, &kApolloSIPFRefreshArmedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
+    // Defer the first pass to the next runloop turn (don't relayout synchronously from
+    // within viewDidLayoutSubviews).
     __weak __typeof__(self) weakSelf = self;
-    static const double kDelays[] = { 0.1, 0.3, 0.6, 1.2, 2.0, 3.5 };
-    for (size_t i = 0; i < sizeof(kDelays) / sizeof(kDelays[0]); i++) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kDelays[i] * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            ApolloSIPFForceRelayout((UIViewController *)weakSelf);
-        });
-    }
-    ApolloLog(@"[SharePreviewFix] armed snapshot refreshes");
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        __typeof__(self) strongSelf = weakSelf;
+        if (strongSelf) ApolloSIPFPollSnapshot((UIViewController *)strongSelf, 0, -1.0, 0);
+    });
+    ApolloLog(@"[SharePreviewFix] armed snapshot poll");
 }
 
 // #4: auto-dismiss the preview once a share completes. Both the native image share
