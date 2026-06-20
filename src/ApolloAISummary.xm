@@ -892,11 +892,33 @@ static BOOL ApolloAIURLIsArticleCandidate(NSURL *url) {
     static NSArray *blocked;
     static dispatch_once_t hostOnce;
     dispatch_once(&hostOnce, ^{
-        blocked = @[@"reddit.com", @"redd.it", @"i.redd.it", @"v.redd.it", @"preview.redd.it",
-                    @"external-preview.redd.it", @"redditmedia.com", @"imgur.com", @"giphy.com",
-                    @"tenor.com", @"redgifs.com", @"gfycat.com", @"imgchest.com", @"youtube.com",
-                    @"youtu.be", @"twitter.com", @"x.com", @"t.co", @"twimg.com", @"tiktok.com",
-                    @"instagram.com", @"discordapp.com"];
+        // Registrable domains only — the matcher below also catches any subdomain
+        // (e.g. "twitch.tv" covers clips.twitch.tv; "redd.it" covers v.redd.it).
+        // The runtime "no prose -> hide" fallback covers anything not listed here
+        // (these clip hosts rotate domains/TLDs faster than a list can track).
+        blocked = @[
+            // Reddit-internal + Reddit media (Apollo renders these natively)
+            @"reddit.com", @"redd.it", @"redditmedia.com",
+            // Image / GIF / screenshot hosts — no article prose
+            @"imgur.com", @"giphy.com", @"tenor.com", @"redgifs.com", @"gfycat.com",
+            @"imgchest.com", @"flickr.com", @"ibb.co", @"postimg.cc", @"postimages.org",
+            @"imgbb.com", @"prnt.sc", @"gyazo.com", @"imgflip.com",
+            // Video / short-clip hosts (r/soccer goal clips etc.) — player-only pages
+            @"youtube.com", @"youtu.be", @"twitch.tv", @"streamable.com", @"streamja.com",
+            @"streamff.com", @"streamff.pro", @"streamff.live", @"streamff.io", @"streamff.net",
+            @"streamff.co", @"streamin.one", @"streamin.me", @"streamin.link", @"streamye.com",
+            @"streamwo.com", @"streamgg.com", @"streamvi.com", @"dubz.co", @"dubz.link",
+            @"dubz.cc", @"dubz.one", @"dropr.co", @"sendvid.com", @"clippituser.tv",
+            @"imgtc.com", @"streamtape.com", @"doodstream.com", @"vidoza.net", @"qu.ax",
+            @"juststream.live", @"vidlii.com", @"fb.watch",
+            // Social / micro-post platforms — content is self-contained + already
+            // shown inline, and the pages are JS-rendered SPAs with no article body
+            @"twitter.com", @"x.com", @"t.co", @"twimg.com", @"fixupx.com", @"fxtwitter.com",
+            @"vxtwitter.com", @"nitter.net", @"bsky.app", @"bsky.social", @"threads.com",
+            @"threads.net", @"instagram.com", @"tiktok.com", @"facebook.com", @"fb.com",
+            @"tumblr.com", @"weibo.com", @"weibo.cn", @"vk.com", @"truthsocial.com",
+            @"mastodon.social", @"mastodon.online", @"discordapp.com",
+        ];
     });
     for (NSString *b in blocked) {
         if ([host isEqualToString:b] || [host hasSuffix:[@"." stringByAppendingString:b]]) return NO;
@@ -1874,16 +1896,19 @@ static void ApolloAIGenerateLinkSummaryForController(NSString *articleURL, NSStr
             return;
         }
         if (fetchError || articleText.length < 200) {
+            // No usable article prose — a video-clip page (streamff/streamin/etc.),
+            // a JS-rendered SPA (Bluesky/Twitter and friends), a paywall, and so on.
+            // Don't show an error card: just HIDE the box, as if the post weren't a
+            // summarizable article. Mark it failed so we don't re-fetch every scroll
+            // this session.
             [sPostInFlight removeObject:fullName];
             [sPostRequestIDs removeObjectForKey:fullName];
             [sPostFailed addObject:fullName];
-            ApolloLog(@"[AISummary] article fetch failed for %@: %@", fullName,
-                      fetchError ? fetchError.localizedDescription : @"(too little text)");
-            ApolloAISetBoxStateOnMatchingHeaders(fullName, YES, ApolloAIBoxStateError,
-                @"Couldn't read this article to summarize.");
-            if (ApolloAIAnyHeaderExpanded(fullName, YES)) {
-                ApolloAIForceHeaderRemeasure(fullName);
-            }
+            [sLinkSummaryPosts removeObject:fullName];
+            ApolloLog(@"[AISummary] no article prose for %@ — hiding link summary (%@)", fullName,
+                      fetchError ? fetchError.localizedDescription : @"too little text");
+            ApolloAISetBoxStateOnMatchingHeaders(fullName, YES, ApolloAIBoxStateNone, nil);
+            ApolloAIForceHeaderRemeasure(fullName);   // drop the loading card from layout
             return;
         }
         sArticleTextCache[fullName] = articleText;
