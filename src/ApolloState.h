@@ -57,6 +57,9 @@ extern BOOL sEnableInlineImages;
 // summary at the top of the comments, generated automatically on open. See
 // ApolloAISummary.xm.
 extern BOOL sEnableAISummaries;
+// Sub-toggles (only consulted while sEnableAISummaries is on). Default YES.
+extern BOOL sEnableAIPostSummaries;     // post / link / both summaries
+extern BOOL sEnableAICommentSummaries;  // the "Discussion so far" summary
 
 // Horizontal alignment for inline media containers narrower than the row width
 // (tall portrait images, height-capped images). Has no effect on full-width media.

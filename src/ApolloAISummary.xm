@@ -186,6 +186,13 @@ static NSString *const kApolloAIArticleInstructions =
     @"main topic and the key facts or points it reports. Summarize the article "
     @"itself, not website navigation or ads. No heading, Markdown, or added facts.";
 
+// When a post has BOTH body text AND a linked article, summarize them together.
+static const NSInteger kApolloAIBothResponseTokens = 150;
+static NSString *const kApolloAIBothInstructions =
+    @"You are given a Reddit post and the article it links to. Summarize BOTH "
+    @"together in 3-4 short plain sentences: the post's point and the article's "
+    @"key facts. No heading, Markdown, or added facts.";
+
 #pragma mark - Per-session caches / in-flight guard
 
 // fullName -> generated summary text. Survives re-opening the same thread.
@@ -196,6 +203,17 @@ static NSMutableDictionary<NSString *, NSString *> *sCommentSummaryCache;
 // and layout position differ. sArticleTextCache memoises fetched+extracted
 // article text per post for the session, so a concurrency retry doesn't re-fetch.
 static NSMutableSet<NSString *> *sLinkSummaryPosts;
+static NSMutableSet<NSString *> *sBothSummaryPosts;   // post box shows a combined post+article summary
+// fullName -> the mode the CACHED post summary was generated under. Persisted so a
+// cached summary is never reused under a different mode — e.g. a post-only summary
+// must not be shown once the post is later detected as "both". Old caches lacking
+// this default to Post(0); a Link/Both post then mismatches and regenerates.
+typedef NS_ENUM(NSInteger, ApolloAIPostMode) {
+    ApolloAIPostModePost = 0,   // self-text post summary
+    ApolloAIPostModeLink = 1,   // external article only
+    ApolloAIPostModeBoth = 2,   // post body + article
+};
+static NSMutableDictionary<NSString *, NSNumber *> *sPostSummaryMode;
 static NSMutableDictionary<NSString *, NSString *> *sArticleTextCache;
 static NSMutableDictionary<NSString *, NSNumber *> *sCommentSummarySourceCounts;
 static NSMutableDictionary<NSString *, NSString *> *sCommentSummarySignatures;
@@ -261,8 +279,10 @@ static void ApolloAILoadPersistedSummaries(void) {
     NSDictionary *comment = root[@"comment"];
     NSDictionary *sourceCounts = root[@"commentSourceCounts"];
     NSDictionary *signatures = root[@"commentSignatures"];
+    NSDictionary *postModes = root[@"postModes"];
     if ([post isKindOfClass:[NSDictionary class]]) [sPostSummaryCache addEntriesFromDictionary:post];
     if ([comment isKindOfClass:[NSDictionary class]]) [sCommentSummaryCache addEntriesFromDictionary:comment];
+    if ([postModes isKindOfClass:[NSDictionary class]]) [sPostSummaryMode addEntriesFromDictionary:postModes];
     if ([sourceCounts isKindOfClass:[NSDictionary class]]) [sCommentSummarySourceCounts addEntriesFromDictionary:sourceCounts];
     if ([signatures isKindOfClass:[NSDictionary class]]) [sCommentSummarySignatures addEntriesFromDictionary:signatures];
     ApolloLog(@"[AISummary] loaded %lu post / %lu comment summaries from disk",
@@ -276,6 +296,7 @@ static void ApolloAIPersistSummaries(void) {
     NSDictionary *commentSnapshot = [sCommentSummaryCache copy];
     NSDictionary *sourceCountSnapshot = [sCommentSummarySourceCounts copy];
     NSDictionary *signatureSnapshot = [sCommentSummarySignatures copy];
+    NSDictionary *postModeSnapshot = [sPostSummaryMode copy];
     dispatch_async(ApolloAIPersistQueue(), ^{
         NSMutableDictionary *post = [postSnapshot mutableCopy];
         NSMutableDictionary *comment = [commentSnapshot mutableCopy];
@@ -288,6 +309,7 @@ static void ApolloAIPersistSummaries(void) {
             @"comment": comment,
             @"commentSourceCounts": sourceCountSnapshot,
             @"commentSignatures": signatureSnapshot,
+            @"postModes": postModeSnapshot ?: @{},
         };
         [root writeToFile:ApolloAISummariesCachePath() atomically:YES];
     });
@@ -299,6 +321,8 @@ static void ApolloAIEnsureState(void) {
         sPostSummaryCache = [NSMutableDictionary dictionary];
         sCommentSummaryCache = [NSMutableDictionary dictionary];
         sLinkSummaryPosts = [NSMutableSet set];
+        sBothSummaryPosts = [NSMutableSet set];
+        sPostSummaryMode = [NSMutableDictionary dictionary];
         sArticleTextCache = [NSMutableDictionary dictionary];
         sCommentSummarySourceCounts = [NSMutableDictionary dictionary];
         sCommentSummarySignatures = [NSMutableDictionary dictionary];
@@ -317,6 +341,16 @@ static void ApolloAIEnsureState(void) {
         sTimedOutRequests = [NSMutableSet set];
         ApolloAILoadPersistedSummaries();
     });
+}
+
+// The post box's current mode for this post, derived from the classification
+// flags set in ApolloAIGenerateForController. Used to validate the cache: a cached
+// summary is only reused if it was generated under the same mode.
+static NSInteger ApolloAIDesiredPostMode(NSString *fullName) {
+    if (fullName.length == 0) return ApolloAIPostModePost;
+    if ([sBothSummaryPosts containsObject:fullName]) return ApolloAIPostModeBoth;
+    if ([sLinkSummaryPosts containsObject:fullName]) return ApolloAIPostModeLink;
+    return ApolloAIPostModePost;
 }
 
 #pragma mark - Runtime helpers (self-contained; mirror ApolloTranslation patterns)
@@ -627,7 +661,8 @@ static void ApolloAICaptureCommentForController(id comment, UIViewController *vc
     [comments addObject:comment];
     // Do not show a discussion card until there is enough material to synthesize.
     // Below this threshold, reading the comments directly is faster and clearer.
-    if (comments.count >= kApolloAIMinComments &&
+    if (sEnableAICommentSummaries &&
+        comments.count >= kApolloAIMinComments &&
         sCommentSummaryCache[fullName].length == 0 &&
         ![sCommentFailed containsObject:fullName]) {
         ApolloAIShowLoadingIfIdle(fullName, NO);
@@ -926,15 +961,17 @@ static BOOL ApolloAIURLIsArticleCandidate(NSURL *url) {
     return YES;
 }
 
-// YES if `link` is a PURE external-article link post — a URL submission (no
-// selftext), not an image/gif/video/gallery, not a crosspost, not a media host.
-// RDKLink.URL is a real ObjC NSURL property, safe to read directly.
+// YES if `link`'s RDKLink.URL is an external article — not an image/gif/video/
+// gallery, not a crosspost, not a reddit-internal or media host. RDKLink.URL is a
+// real ObjC NSURL property, safe to read directly.
+//
+// NOTE: we deliberately do NOT bail on self-posts. A "link + text" post is a
+// self-post (it has selftext) whose URL still points at an external article — that
+// should be treated as an article (→ a Both summary). A PURE self-post's URL is
+// just its own reddit.com permalink, which the host blocklist below rejects, so
+// checking the URL for self-posts too is safe.
 static BOOL ApolloAILinkIsArticle(id link) {
     if (!link) return NO;
-
-    BOOL isSelf = [link respondsToSelector:@selector(isSelfPostWithSelfText)] &&
-        ((BOOL (*)(id, SEL))objc_msgSend)(link, @selector(isSelfPostWithSelfText));
-    if (isSelf) return NO;
 
     NSURL *url = nil;
     if ([link respondsToSelector:@selector(URL)]) {
@@ -991,17 +1028,16 @@ static NSString *ApolloAIFirstArticleURLInSelfText(id link) {
     return nil;
 }
 
-// The article URL to summarize for this post, or nil. A pure link post uses its
-// own URL; a self-post uses a link in its body ONLY when the body is too thin to
-// be worth a post summary (postText == nil) — so substantial posts keep their own
-// post summary, while "just sharing this article" posts summarize the article.
-static NSString *ApolloAIArticleURLToSummarize(id link, NSString *postText) {
+// The external article URL associated with this post, or nil. A pure link post
+// uses its own URL; a self-post uses the first article link found in its body.
+// Returned regardless of how much body text there is — the caller decides the
+// mode: no body -> Link summary; body present -> Both (post + article) summary.
+static NSString *ApolloAIArticleURLForPost(id link) {
     if (ApolloAILinkIsArticle(link)) {
         NSURL *url = ((NSURL *(*)(id, SEL))objc_msgSend)(link, @selector(URL));
         if ([url isKindOfClass:[NSURL class]]) return url.absoluteString;
     }
-    if (postText.length == 0) return ApolloAIFirstArticleURLInSelfText(link);
-    return nil;
+    return ApolloAIFirstArticleURLInSelfText(link);
 }
 
 // Decode the HTML entities that show up in article prose. Self-contained (the
@@ -1366,10 +1402,15 @@ static void ApolloAIRenderSummaryNode(id headerNode, BOOL isPost) {
     ASTextNode *textNode = ApolloAIEnsureSummaryNode(headerNode, isPost);
     NSString *title;
     if (isPost) {
-        // The post box doubles as the LINK summary box for external-article link
-        // posts — same box, different title.
-        title = (fullName.length > 0 && [sLinkSummaryPosts containsObject:fullName])
-            ? @"Link summary" : @"Post summary";
+        // The post box shows one of three titles depending on what was summarized:
+        // the post body, an external article, or both together.
+        if (fullName.length > 0 && [sBothSummaryPosts containsObject:fullName]) {
+            title = @"Post & link summary";
+        } else if (fullName.length > 0 && [sLinkSummaryPosts containsObject:fullName]) {
+            title = @"Link summary";
+        } else {
+            title = @"Post summary";
+        }
     } else {
         title = @"Discussion so far";
     }
@@ -1629,58 +1670,96 @@ static id ApolloAISummaryLayoutSpec(id textNode, id backgroundNode) {
                                            child:card];
 }
 
+// Rebuild a stack spec with new children, preserving its layout attributes.
+static ASStackLayoutSpec *ApolloAIRebuildStack(ASStackLayoutSpec *stack, NSArray *children) {
+    Class stackClass = NSClassFromString(@"ASStackLayoutSpec");
+    ASStackLayoutSpec *s = [stackClass stackLayoutSpecWithDirection:stack.direction
+                                                            spacing:stack.spacing
+                                                     justifyContent:stack.justifyContent
+                                                         alignItems:stack.alignItems
+                                                           children:children];
+    s.flexWrap = stack.flexWrap;
+    s.alignContent = stack.alignContent;
+    s.lineSpacing = stack.lineSpacing;
+    return s;
+}
+
+// Insert the post/link/both summary spec at the right spot, recursing into nested
+// stacks. Preference: directly AFTER the inline link-preview card (LinkButtonNode)
+// — for a link/both post that puts the summary between the preview and the body;
+// for a plain text post (no preview) just before the body MarkdownNode. Self-posts
+// wrap their content (preview + body) in a nested ASStackLayoutSpec, so we must
+// descend to find the anchor rather than only scanning the top level. Returns a
+// rebuilt stack, or nil if no anchor was found anywhere.
+static ASStackLayoutSpec *ApolloAIInsertPostSummary(ASStackLayoutSpec *stack, id spec, NSUInteger depth) {
+    Class stackClass = NSClassFromString(@"ASStackLayoutSpec");
+    if (![stack isKindOfClass:stackClass] || depth > 4) return nil;
+    Class linkButtonClass = NSClassFromString(@"_TtC6Apollo14LinkButtonNode");
+    Class markdownClass = NSClassFromString(@"_TtC6Apollo12MarkdownNode");
+    NSArray *children = stack.children ?: @[];
+
+    // 1) Directly below the inline link-preview card.
+    for (NSUInteger i = 0; i < children.count; i++) {
+        id c = children[i];
+        if ((linkButtonClass && [c isKindOfClass:linkButtonClass]) ||
+            [NSStringFromClass([c class]) isEqualToString:@"Apollo.LinkButtonNode"]) {
+            NSMutableArray *m = [children mutableCopy];
+            [m insertObject:spec atIndex:i + 1];
+            return ApolloAIRebuildStack(stack, m);
+        }
+    }
+    // 2) Just before the body markdown (plain text post: between title and body).
+    for (NSUInteger i = 0; i < children.count; i++) {
+        id c = children[i];
+        if ((markdownClass && [c isKindOfClass:markdownClass]) ||
+            [NSStringFromClass([c class]) isEqualToString:@"Apollo.MarkdownNode"]) {
+            NSMutableArray *m = [children mutableCopy];
+            [m insertObject:spec atIndex:i];
+            return ApolloAIRebuildStack(stack, m);
+        }
+    }
+    // 3) Descend into a nested content stack and splice the rebuilt child back in.
+    for (NSUInteger i = 0; i < children.count; i++) {
+        id c = children[i];
+        if ([c isKindOfClass:stackClass]) {
+            ASStackLayoutSpec *rebuilt = ApolloAIInsertPostSummary((ASStackLayoutSpec *)c, spec, depth + 1);
+            if (rebuilt) {
+                NSMutableArray *m = [children mutableCopy];
+                m[i] = rebuilt;
+                return ApolloAIRebuildStack(stack, m);
+            }
+        }
+    }
+    return nil;
+}
+
 static ASStackLayoutSpec *ApolloAICloneStackWithSummaries(ASStackLayoutSpec *originalStack,
                                                           id postSummarySpec,
                                                           id discussionSummarySpec) {
     if (!originalStack || (!postSummarySpec && !discussionSummarySpec)) return nil;
-    Class stackClass = NSClassFromString(@"ASStackLayoutSpec");
-    NSMutableArray *children = [NSMutableArray arrayWithArray:originalStack.children ?: @[]];
+    ASStackLayoutSpec *working = originalStack;
 
     if (postSummarySpec) {
-        // Self-post header: PostTitleNode -> MarkdownNode -> PostInfoNode -> …
-        // Insert directly before MarkdownNode so a Post summary sits between the
-        // title/flair and the body. A LINK post has no MarkdownNode; it shows the
-        // inline link-preview card (LinkButtonNode) instead, so the Link summary
-        // is placed directly AFTER that card.
-        NSUInteger insertIndex = NSNotFound;
-        Class markdownClass = NSClassFromString(@"_TtC6Apollo12MarkdownNode");
-        for (NSUInteger i = 0; i < children.count; i++) {
-            id child = children[i];
-            if ((markdownClass && [child isKindOfClass:markdownClass]) ||
-                [NSStringFromClass([child class]) isEqualToString:@"Apollo.MarkdownNode"]) {
-                insertIndex = i;
-                break;
-            }
+        ASStackLayoutSpec *rebuilt = ApolloAIInsertPostSummary(working, postSummarySpec, 0);
+        if (rebuilt) {
+            working = rebuilt;
+        } else {
+            // No preview/body anchor anywhere — place near the top, after the title.
+            NSMutableArray *m = [working.children ?: @[] mutableCopy];
+            [m insertObject:postSummarySpec atIndex:MIN((NSUInteger)1, m.count)];
+            working = ApolloAIRebuildStack(working, m);
         }
-        if (insertIndex == NSNotFound) {
-            Class linkButtonClass = NSClassFromString(@"_TtC6Apollo14LinkButtonNode");
-            for (NSUInteger i = 0; i < children.count; i++) {
-                id child = children[i];
-                if ((linkButtonClass && [child isKindOfClass:linkButtonClass]) ||
-                    [NSStringFromClass([child class]) isEqualToString:@"Apollo.LinkButtonNode"]) {
-                    insertIndex = i + 1;   // directly below the preview card
-                    break;
-                }
-            }
-        }
-        if (insertIndex == NSNotFound) insertIndex = MIN((NSUInteger)1, children.count);
-        [children insertObject:postSummarySpec atIndex:MIN(insertIndex, children.count)];
     }
 
-    // Keep the discussion summary in the established bottom-of-post position,
-    // after Apollo's original content/actions and immediately before comments.
-    if (discussionSummarySpec) [children addObject:discussionSummarySpec];
+    // Discussion summary stays at the bottom of the post header, immediately
+    // before the first comment.
+    if (discussionSummarySpec) {
+        NSMutableArray *m = [working.children ?: @[] mutableCopy];
+        [m addObject:discussionSummarySpec];
+        working = ApolloAIRebuildStack(working, m);
+    }
 
-    ASStackLayoutSpec *newStack =
-        [stackClass stackLayoutSpecWithDirection:originalStack.direction
-                                        spacing:originalStack.spacing
-                                 justifyContent:originalStack.justifyContent
-                                     alignItems:originalStack.alignItems
-                                       children:children];
-    newStack.flexWrap = originalStack.flexWrap;
-    newStack.alignContent = originalStack.alignContent;
-    newStack.lineSpacing = originalStack.lineSpacing;
-    return newStack;
+    return working;
 }
 
 // Preserve Apollo's root width/inset semantics. The comments header currently
@@ -1792,10 +1871,12 @@ static void ApolloAIPrepareForController(UIViewController *vc) {
         return;
     }
 
-    BOOL needsPost = ApolloAIPostText(link).length > 0 &&
+    BOOL needsPost = sEnableAIPostSummaries &&
+        ApolloAIPostText(link).length > 0 &&
         sPostSummaryCache[fullName].length == 0 &&
         ![sPostFailed containsObject:fullName];
-    BOOL needsComments = sCommentSummaryCache[fullName].length == 0 &&
+    BOOL needsComments = sEnableAICommentSummaries &&
+        sCommentSummaryCache[fullName].length == 0 &&
         ![sCommentFailed containsObject:fullName];
     if (needsPost) {
         [bridge prepareSession:ApolloAIRequestIdentifier(fullName, YES)
@@ -1809,17 +1890,20 @@ static void ApolloAIPrepareForController(UIViewController *vc) {
     }
 }
 
-// Summarize already-fetched article prose into the post box. Factored out so a
+// Summarize text into the post box with the given instructions/token budget.
+// Used for the Link summary (article), the Both summary (post + article), and the
+// Post-summary fallback when an article can't be fetched. Factored out so a
 // transient-concurrency retry re-summarizes the cached text without re-fetching.
-static void ApolloAISummarizeArticleText(NSString *fullName, NSString *requestID, NSString *articleText) {
+static void ApolloAISummarizeArticleText(NSString *fullName, NSString *requestID, NSString *text,
+                                         NSString *instructions, NSInteger responseTokens) {
     ApolloFoundationModels *bridge = ApolloAIBridge();
-    if (!bridge || fullName.length == 0 || articleText.length == 0) return;
-    ApolloLog(@"[AISummary] generating LINK summary for %@ (%lu chars)…", fullName, (unsigned long)articleText.length);
-    [bridge prepareSession:requestID instructions:kApolloAIArticleInstructions];
-    [bridge summarize:articleText
+    if (!bridge || fullName.length == 0 || text.length == 0) return;
+    ApolloLog(@"[AISummary] generating link/article summary for %@ (%lu chars)…", fullName, (unsigned long)text.length);
+    [bridge prepareSession:requestID instructions:instructions];
+    [bridge summarize:text
            identifier:requestID
-         instructions:kApolloAIArticleInstructions
-maximumResponseTokens:kApolloAIArticleResponseTokens
+         instructions:instructions
+maximumResponseTokens:responseTokens
             onPartial:^(NSString *partial) {
                 ApolloAIApplyStreamingPartial(fullName, YES, partial);
             }
@@ -1856,6 +1940,7 @@ maximumResponseTokens:kApolloAIArticleResponseTokens
                     return;
                 }
                 sPostSummaryCache[fullName] = final;
+                sPostSummaryMode[fullName] = @(ApolloAIDesiredPostMode(fullName));
                 ApolloAISetBoxStateOnMatchingHeaders(fullName, YES, ApolloAIBoxStateReady, final);
                 if (ApolloAIAnyHeaderExpanded(fullName, YES)) {
                     ApolloAIForceHeaderRemeasure(fullName);
@@ -1869,25 +1954,37 @@ maximumResponseTokens:kApolloAIArticleResponseTokens
 // article (or reuse cached text), then summarize it. Shares the post box, cache,
 // in-flight guard, timeout and request id with the self-text post summary, since a
 // given post is one or the other — never both.
-static void ApolloAIGenerateLinkSummaryForController(NSString *articleURL, NSString *fullName) {
+static void ApolloAIGenerateLinkSummaryForController(NSString *articleURL, NSString *fullName, NSString *postText) {
     ApolloFoundationModels *bridge = ApolloAIBridge();
     if (!bridge || fullName.length == 0 || articleURL.length == 0) return;
 
     [sPostInFlight addObject:fullName];
-    ApolloAIShowLoadingIfIdle(fullName, YES);   // box visible immediately ("Link summary")
+    ApolloAIShowLoadingIfIdle(fullName, YES);   // box visible immediately ("Link"/"Post & link summary")
     ApolloAIForceHeaderRemeasure(fullName);
 
     NSString *requestID = ApolloAIRequestIdentifier(fullName, YES);
     sPostRequestIDs[fullName] = requestID;
     ApolloAIScheduleGenerationTimeout(fullName, YES, requestID);   // covers fetch + generation
 
-    NSString *cachedText = sArticleTextCache[fullName];
-    if (cachedText.length > 0) {
-        ApolloAISummarizeArticleText(fullName, requestID, cachedText);
-        return;
-    }
+    // Summarize the fetched article — combined with the post body when there is
+    // one ("Post & link" summary), otherwise the article alone ("Link" summary).
+    void (^summarize)(NSString *) = ^(NSString *articleText) {
+        if (postText.length > 0) {
+            NSString *article = articleText.length > 2000 ? [articleText substringToIndex:2000] : articleText;
+            NSString *combined = [NSString stringWithFormat:@"Post:\n%@\n\nLinked article:\n%@", postText, article];
+            ApolloAISummarizeArticleText(fullName, requestID, combined,
+                                         kApolloAIBothInstructions, kApolloAIBothResponseTokens);
+        } else {
+            ApolloAISummarizeArticleText(fullName, requestID, articleText,
+                                         kApolloAIArticleInstructions, kApolloAIArticleResponseTokens);
+        }
+    };
 
-    ApolloLog(@"[AISummary] fetching article for LINK summary %@ (%@)…", fullName, articleURL);
+    NSString *cachedText = sArticleTextCache[fullName];
+    if (cachedText.length > 0) { summarize(cachedText); return; }
+
+    ApolloLog(@"[AISummary] fetching article for %@ summary %@ (%@)…",
+              postText.length > 0 ? @"POST+LINK" : @"LINK", fullName, articleURL);
     ApolloAIFetchArticleText(articleURL, ^(NSString *articleText, NSError *fetchError) {
         // Back on the main thread. Bail if this request was superseded (timed out
         // or the user navigated and a newer request took over).
@@ -1896,11 +1993,22 @@ static void ApolloAIGenerateLinkSummaryForController(NSString *articleURL, NSStr
             return;
         }
         if (fetchError || articleText.length < 200) {
-            // No usable article prose — a video-clip page (streamff/streamin/etc.),
-            // a JS-rendered SPA (Bluesky/Twitter and friends), a paywall, and so on.
-            // Don't show an error card: just HIDE the box, as if the post weren't a
-            // summarizable article. Mark it failed so we don't re-fetch every scroll
-            // this session.
+            if (postText.length > 0) {
+                // Couldn't read the article (clip page / SPA / paywall), but we DO
+                // have the post body — fall back to a plain Post summary of it
+                // rather than failing or hiding.
+                [sBothSummaryPosts removeObject:fullName];
+                [sLinkSummaryPosts removeObject:fullName];
+                ApolloLog(@"[AISummary] article fetch failed for %@ — falling back to post summary (%@)", fullName,
+                          fetchError ? fetchError.localizedDescription : @"too little text");
+                ApolloAISummarizeArticleText(fullName, requestID, postText,
+                                             kApolloAIPostInstructions, kApolloAIPostResponseTokens);
+                return;
+            }
+            // No body either — a video-clip page (streamff/streamin/etc.), a
+            // JS-rendered SPA (Bluesky/Twitter), a paywall, and so on. Don't show
+            // an error card: just HIDE the box, as if the post weren't a
+            // summarizable article. Marked failed so we don't re-fetch every scroll.
             [sPostInFlight removeObject:fullName];
             [sPostRequestIDs removeObjectForKey:fullName];
             [sPostFailed addObject:fullName];
@@ -1912,7 +2020,7 @@ static void ApolloAIGenerateLinkSummaryForController(NSString *articleURL, NSStr
             return;
         }
         sArticleTextCache[fullName] = articleText;
-        ApolloAISummarizeArticleText(fullName, requestID, articleText);
+        summarize(articleText);
     });
 }
 
@@ -1966,22 +2074,52 @@ static void ApolloAIGenerateForController(UIViewController *vc) {
         objc_setAssociatedObject(vc, &kApolloAIProvisionalCommentRequestKey, nil, OBJC_ASSOCIATION_ASSIGN);
     }
 
-    // ----- Post / Link summary (shared box) -----
-    // A self-text post gets a "Post summary"; an external-article link post gets a
-    // "Link summary" (article fetched + summarized) in the SAME box — titled
-    // differently and placed under the link preview. They're mutually exclusive (a
-    // link post has no self-text), so one box + one cache serves both.
-    NSString *postText = ApolloAIPostText(link);   // nil for link posts / too-short bodies
-    // A pure link post, OR a thin self-post that's really just sharing a link.
-    NSString *articleURL = ApolloAIArticleURLToSummarize(link, postText);
-    BOOL postIsArticleLink = (postText.length == 0) && (articleURL.length > 0);
-    if (postIsArticleLink) [sLinkSummaryPosts addObject:fullName];
-    else [sLinkSummaryPosts removeObject:fullName];
+    // ----- Post / Link / Both summary (shared post box) -----
+    // The post box shows ONE of three things, decided by what the post contains:
+    //   • body text only             -> "Post summary"        (summarize the body)
+    //   • external article link only -> "Link summary"        (fetch + summarize article)
+    //   • body AND an article link   -> "Post & link summary" (summarize both together)
+    // A link post's article URL is its own URL; a self-post's is the first article
+    // link in its body. One box + one cache serves all three.
+    // Gated by the "Post & Link Summaries" sub-toggle.
+    if (sEnableAIPostSummaries) {
+    NSString *postText = ApolloAIPostText(link);            // substantial self-text body, or nil
+    NSString *articleURL = ApolloAIArticleURLForPost(link); // pure-link URL or a link in the body
+    BOOL haveBody = postText.length > 0;
+    BOOL haveArticle = articleURL.length > 0;
+    if (haveBody && haveArticle) {
+        [sBothSummaryPosts addObject:fullName];
+        [sLinkSummaryPosts removeObject:fullName];
+    } else if (!haveBody && haveArticle) {
+        [sLinkSummaryPosts addObject:fullName];
+        [sBothSummaryPosts removeObject:fullName];
+    } else {
+        [sLinkSummaryPosts removeObject:fullName];
+        [sBothSummaryPosts removeObject:fullName];
+    }
 
-    if (sPostSummaryCache[fullName].length > 0) {
+    NSInteger desiredMode = ApolloAIDesiredPostMode(fullName);
+    BOOL cacheValid = sPostSummaryCache[fullName].length > 0 &&
+        [sPostSummaryMode[fullName] integerValue] == desiredMode;
+    if (cacheValid) {
         ApolloAISetBoxStateOnMatchingHeaders(fullName, YES, ApolloAIBoxStateReady, sPostSummaryCache[fullName]);
     } else if (![sPostInFlight containsObject:fullName] && ![sPostFailed containsObject:fullName]) {
-        if (postText.length > 0) {
+        // Drop a stale cache entry generated under a different mode (e.g. a
+        // post-only summary cached before this post was detected as link/both).
+        if (sPostSummaryCache[fullName].length > 0) {
+            [sPostSummaryCache removeObjectForKey:fullName];
+            [sPostSummaryMode removeObjectForKey:fullName];
+        }
+        if (haveArticle) {
+            // Link-only or Both — both fetch the article (Both also folds in the
+            // post body). Discard any provisional post session first.
+            NSString *provisionalID = objc_getAssociatedObject(vc, &kApolloAIProvisionalPostRequestKey);
+            if (provisionalID.length > 0) {
+                [bridge discardPreparedSession:provisionalID];
+                objc_setAssociatedObject(vc, &kApolloAIProvisionalPostRequestKey, nil, OBJC_ASSOCIATION_ASSIGN);
+            }
+            ApolloAIGenerateLinkSummaryForController(articleURL, fullName, haveBody ? postText : nil);
+        } else if (haveBody) {
             [sPostInFlight addObject:fullName];
             ApolloAIShowLoadingIfIdle(fullName, YES);   // box visible immediately
             ApolloAIForceHeaderRemeasure(fullName);
@@ -2032,6 +2170,7 @@ static void ApolloAIGenerateForController(UIViewController *vc) {
                             return;
                         }
                         sPostSummaryCache[fullName] = final;
+                        sPostSummaryMode[fullName] = @(ApolloAIDesiredPostMode(fullName));
                         ApolloAISetBoxStateOnMatchingHeaders(fullName, YES, ApolloAIBoxStateReady, final);
                         if (ApolloAIAnyHeaderExpanded(fullName, YES)) {
                             ApolloAIForceHeaderRemeasure(fullName);
@@ -2039,24 +2178,18 @@ static void ApolloAIGenerateForController(UIViewController *vc) {
                         ApolloAIPersistSummaries();
                         ApolloLog(@"[AISummary] POST summary DONE for %@:\n%@", fullName, final);
                     }];
-        } else if (postIsArticleLink) {
-            // Pure link post, or a thin self-post sharing a link → summarize the
-            // linked article itself.
-            NSString *provisionalID = objc_getAssociatedObject(vc, &kApolloAIProvisionalPostRequestKey);
-            if (provisionalID.length > 0) {
-                [bridge discardPreparedSession:provisionalID];
-                objc_setAssociatedObject(vc, &kApolloAIProvisionalPostRequestKey, nil, OBJC_ASSOCIATION_ASSIGN);
-            }
-            ApolloAIGenerateLinkSummaryForController(articleURL, fullName);
         } else {
+            // Neither summarizable body nor article link (image/video/media post,
+            // or a too-short body with no link). Discard any provisional session.
             NSString *provisionalID = objc_getAssociatedObject(vc, &kApolloAIProvisionalPostRequestKey);
             if (provisionalID.length > 0) {
                 [bridge discardPreparedSession:provisionalID];
                 objc_setAssociatedObject(vc, &kApolloAIProvisionalPostRequestKey, nil, OBJC_ASSOCIATION_ASSIGN);
             }
-            ApolloLog(@"[AISummary] no self-text or article to summarize for %@", fullName);
+            ApolloLog(@"[AISummary] nothing to summarize for %@", fullName);
         }
     }
+    }   // end "Post & Link Summaries" sub-toggle gate
 
     // ----- Comment summary (LOCKED once generated) -----
     // A cached discussion summary ALWAYS wins: once it exists for this post we
@@ -2067,6 +2200,8 @@ static void ApolloAIGenerateForController(UIViewController *vc) {
     // "jitter"). Now the representative set is captured ONCE, from the full
     // loaded comment tree, summarized, and frozen for the session; only a fresh
     // page open (a new controller) restarts it.
+    // Gated by the "Comment Summaries" sub-toggle.
+    if (sEnableAICommentSummaries) {
     NSString *cachedCommentSummary = sCommentSummaryCache[fullName];
     if (cachedCommentSummary.length > 0) {
         ApolloAISetBoxStateOnMatchingHeaders(fullName, NO, ApolloAIBoxStateReady, cachedCommentSummary);
@@ -2155,6 +2290,7 @@ static void ApolloAIGenerateForController(UIViewController *vc) {
             ApolloAISetBoxStateOnMatchingHeaders(fullName, NO, ApolloAIBoxStateNone, nil);
         }
     }
+    }   // end "Comment Summaries" sub-toggle gate
 }
 
 #pragma mark - Diagnostics: comments table structure (informs UI placement)
@@ -2360,8 +2496,10 @@ static void ApolloAILogTableStructure(UIViewController *vc) {
     if (!sEnableAISummaries) return originalSpec;
     ApolloAILogLayoutChildrenOnce((id)self, originalSpec);
 
-    ApolloAIBoxState postState = ApolloAIGetBoxState((id)self, YES);
-    ApolloAIBoxState commentState = ApolloAIGetBoxState((id)self, NO);
+    // Respect the sub-toggles at DISPLAY time too, so flipping one off hides an
+    // already-generated/cached card (not just future ones) on the next layout pass.
+    ApolloAIBoxState postState = sEnableAIPostSummaries ? ApolloAIGetBoxState((id)self, YES) : ApolloAIBoxStateNone;
+    ApolloAIBoxState commentState = sEnableAICommentSummaries ? ApolloAIGetBoxState((id)self, NO) : ApolloAIBoxStateNone;
     if (postState == ApolloAIBoxStateNone && commentState == ApolloAIBoxStateNone) return originalSpec;
     ApolloLog(@"[AISummary][UI] composing header layout postState=%ld commentState=%ld",
               (long)postState, (long)commentState);
