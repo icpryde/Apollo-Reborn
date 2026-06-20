@@ -80,6 +80,9 @@ static NSString *const UDKeyEnableAISummaries = @"EnableAISummaries";
 // turning the master on keeps the original behaviour (post + comment summaries).
 static NSString *const UDKeyEnableAIPostSummaries = @"EnableAIPostSummaries";       // post / link / both
 static NSString *const UDKeyEnableAICommentSummaries = @"EnableAICommentSummaries"; // discussion
+// When on, summaries are generated only when the user taps the card (rather than
+// automatically on open). Off by default. Cached summaries still show instantly.
+static NSString *const UDKeyEnableTapToSummarize = @"EnableTapToSummarize";
 
 // Tag filters (NSFW / Spoiler) — hide or blur posts in the feed based on
 // Reddit's built-in tags. Brand Affiliate is intentionally absent because

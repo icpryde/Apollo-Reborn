@@ -241,6 +241,10 @@ static NSMutableSet<NSString *> *sCommentGenerationScheduled;
 static NSMutableSet<NSString *> *sPostFailed;
 static NSMutableSet<NSString *> *sCommentFailed;
 static NSMutableSet<NSString *> *sTimedOutRequests;
+// "post|fullName" / "comment|fullName" keys for boxes the user TAPPED to generate
+// while Tap-to-Summarize is on. The generation pass consumes the marker and
+// proceeds instead of showing the idle "Tap to summarize" prompt.
+static NSMutableSet<NSString *> *sTapRequested;
 
 #pragma mark - Disk persistence (summaries survive app relaunches)
 
@@ -339,6 +343,7 @@ static void ApolloAIEnsureState(void) {
         sPostFailed = [NSMutableSet set];
         sCommentFailed = [NSMutableSet set];
         sTimedOutRequests = [NSMutableSet set];
+        sTapRequested = [NSMutableSet set];
         ApolloAILoadPersistedSummaries();
     });
 }
@@ -661,7 +666,7 @@ static void ApolloAICaptureCommentForController(id comment, UIViewController *vc
     [comments addObject:comment];
     // Do not show a discussion card until there is enough material to synthesize.
     // Below this threshold, reading the comments directly is faster and clearer.
-    if (sEnableAICommentSummaries &&
+    if (sEnableAICommentSummaries && !sEnableTapToSummarize &&
         comments.count >= kApolloAIMinComments &&
         sCommentSummaryCache[fullName].length == 0 &&
         ![sCommentFailed containsObject:fullName]) {
@@ -1171,10 +1176,11 @@ static void ApolloAIFetchArticleText(NSString *urlString, void (^completion)(NSS
 // loading state) the moment we know a box applies, rather than popping in when
 // the text is ready; failures show an error inside the box instead of hiding it.
 typedef NS_ENUM(NSInteger, ApolloAIBoxState) {
-    ApolloAIBoxStateNone = 0,   // no box for this type (e.g. link post / no comments)
-    ApolloAIBoxStateLoading,    // box visible, generating (shows streamed text or "Summarizing…")
-    ApolloAIBoxStateReady,      // box visible, final summary shown
-    ApolloAIBoxStateError,      // box visible, error message shown
+    ApolloAIBoxStateNone = 0,        // no box for this type (e.g. link post / no comments)
+    ApolloAIBoxStateLoading,         // box visible, generating (shows streamed text or "Summarizing…")
+    ApolloAIBoxStateReady,           // box visible, final summary shown
+    ApolloAIBoxStateError,           // box visible, error message shown
+    ApolloAIBoxStateTapToSummarize,  // box visible, idle — waiting for the user to tap to generate
 };
 
 static char kApolloAIPostSummaryKey;        // ready/streamed summary text (post)
@@ -1291,6 +1297,9 @@ static NSAttributedString *ApolloAISummaryAttributedText(NSString *title,
     if (!expanded && state == ApolloAIBoxStateLoading) {
         [result appendAttributedString:[[NSAttributedString alloc] initWithString:@"  ·  Summarizing…"
                                                                        attributes:chevronAttributes]];
+    } else if (!expanded && state == ApolloAIBoxStateTapToSummarize) {
+        [result appendAttributedString:[[NSAttributedString alloc] initWithString:@"  ·  Tap to summarize"
+                                                                       attributes:chevronAttributes]];
     }
 
     // Trailing disclosure chevron.
@@ -1310,7 +1319,9 @@ static NSAttributedString *ApolloAISummaryAttributedText(NSString *title,
     // placeholder; ready shows the summary + a trust caption; error shows the
     // message in the warning color.
     NSString *body = bodyText;
-    if (state == ApolloAIBoxStateLoading && body.length == 0) {
+    if (state == ApolloAIBoxStateTapToSummarize) {
+        body = isPost ? @"Tap to summarize this post." : @"Tap to summarize the discussion.";
+    } else if (state == ApolloAIBoxStateLoading && body.length == 0) {
         body = isPost ? @"Summarizing…" : @"Summarizing discussion…";
     } else if (state == ApolloAIBoxStateError && body.length == 0) {
         body = @"Couldn't generate this summary.";
@@ -2101,9 +2112,18 @@ static void ApolloAIGenerateForController(UIViewController *vc) {
     NSInteger desiredMode = ApolloAIDesiredPostMode(fullName);
     BOOL cacheValid = sPostSummaryCache[fullName].length > 0 &&
         [sPostSummaryMode[fullName] integerValue] == desiredMode;
+    NSString *postTapKey = [@"post|" stringByAppendingString:fullName];
     if (cacheValid) {
         ApolloAISetBoxStateOnMatchingHeaders(fullName, YES, ApolloAIBoxStateReady, sPostSummaryCache[fullName]);
+    } else if (sEnableTapToSummarize && (haveBody || haveArticle) &&
+               ![sTapRequested containsObject:postTapKey] &&
+               ![sPostInFlight containsObject:fullName] && ![sPostFailed containsObject:fullName]) {
+        // Tap-to-Summarize is on and the user hasn't tapped this card yet: show the
+        // idle "Tap to summarize" prompt instead of generating automatically.
+        ApolloAISetBoxStateOnMatchingHeaders(fullName, YES, ApolloAIBoxStateTapToSummarize, nil);
+        ApolloAIForceHeaderRemeasure(fullName);
     } else if (![sPostInFlight containsObject:fullName] && ![sPostFailed containsObject:fullName]) {
+        [sTapRequested removeObject:postTapKey];   // consume a tap request, if any
         // Drop a stale cache entry generated under a different mode (e.g. a
         // post-only summary cached before this post was detected as link/both).
         if (sPostSummaryCache[fullName].length > 0) {
@@ -2215,6 +2235,14 @@ static void ApolloAIGenerateForController(UIViewController *vc) {
         BOOL hasEnoughDiscussion = commentCount >= kApolloAIMinComments &&
             commentText.length >= kApolloAIMinCommentChars;
         if (hasEnoughDiscussion) {
+            NSString *commentTapKey = [@"comment|" stringByAppendingString:fullName];
+            if (sEnableTapToSummarize && ![sTapRequested containsObject:commentTapKey]) {
+            // Tap-to-Summarize is on and the user hasn't tapped: show the idle
+            // "Tap to summarize" prompt instead of generating automatically.
+            ApolloAISetBoxStateOnMatchingHeaders(fullName, NO, ApolloAIBoxStateTapToSummarize, nil);
+            ApolloAIForceHeaderRemeasure(fullName);
+            } else {
+            [sTapRequested removeObject:commentTapKey];   // consume a tap request, if any
             ApolloAIShowLoadingIfIdle(fullName, NO);
             ApolloAIForceHeaderRemeasure(fullName);
             [sCommentInFlight addObject:fullName];
@@ -2284,6 +2312,7 @@ static void ApolloAIGenerateForController(UIViewController *vc) {
                         [sCapturedCommentKeys removeObjectForKey:fullName];
                         ApolloLog(@"[AISummary] COMMENT summary DONE for %@:\n%@", fullName, final);
                     }];
+            }   // end Tap-to-Summarize else (generate)
         } else {
             // Small or low-content threads are faster to read directly. Never
             // leave a misleading loading card behind for them.
@@ -2473,22 +2502,41 @@ static void ApolloAILogTableStructure(UIViewController *vc) {
 
 %new
 - (void)apollo_togglePostSummary {
+    NSString *fullName = objc_getAssociatedObject((id)self, &kApolloAIHeaderFullNameKey);
+    // Tap-to-Summarize: an idle card generates on tap instead of expanding.
+    if (ApolloAIGetBoxState((id)self, YES) == ApolloAIBoxStateTapToSummarize) {
+        if (fullName.length > 0) [sTapRequested addObject:[@"post|" stringByAppendingString:fullName]];
+        ApolloAISetBoxStateOnMatchingHeaders(fullName, YES, ApolloAIBoxStateLoading, nil);
+        ApolloAIForceHeaderRemeasure(fullName);
+        UIViewController *vc = [sControllerByFullName objectForKey:fullName];
+        if (vc) ApolloAIGenerateForController(vc);
+        return;
+    }
     BOOL expanded = [objc_getAssociatedObject((id)self, &kApolloAIPostExpandedKey) boolValue];
     objc_setAssociatedObject((id)self, &kApolloAIPostExpandedKey, @(!expanded), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     ApolloAIRenderSummaryNode((id)self, YES);
     [(ASDisplayNode *)(id)self invalidateCalculatedLayout];
     [(ASDisplayNode *)(id)self setNeedsLayout];
-    ApolloAIForceHeaderRemeasure(objc_getAssociatedObject((id)self, &kApolloAIHeaderFullNameKey));
+    ApolloAIForceHeaderRemeasure(fullName);
 }
 
 %new
 - (void)apollo_toggleDiscussionSummary {
+    NSString *fullName = objc_getAssociatedObject((id)self, &kApolloAIHeaderFullNameKey);
+    if (ApolloAIGetBoxState((id)self, NO) == ApolloAIBoxStateTapToSummarize) {
+        if (fullName.length > 0) [sTapRequested addObject:[@"comment|" stringByAppendingString:fullName]];
+        ApolloAISetBoxStateOnMatchingHeaders(fullName, NO, ApolloAIBoxStateLoading, nil);
+        ApolloAIForceHeaderRemeasure(fullName);
+        UIViewController *vc = [sControllerByFullName objectForKey:fullName];
+        if (vc) ApolloAIGenerateForController(vc);
+        return;
+    }
     BOOL expanded = [objc_getAssociatedObject((id)self, &kApolloAICommentExpandedKey) boolValue];
     objc_setAssociatedObject((id)self, &kApolloAICommentExpandedKey, @(!expanded), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     ApolloAIRenderSummaryNode((id)self, NO);
     [(ASDisplayNode *)(id)self invalidateCalculatedLayout];
     [(ASDisplayNode *)(id)self setNeedsLayout];
-    ApolloAIForceHeaderRemeasure(objc_getAssociatedObject((id)self, &kApolloAIHeaderFullNameKey));
+    ApolloAIForceHeaderRemeasure(fullName);
 }
 
 - (id)layoutSpecThatFits:(struct ApolloAISizeRange)constrainedSize {
