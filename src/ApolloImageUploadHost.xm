@@ -17,10 +17,13 @@
 
 // Defined (extern "C") in ApolloChatComposer.xm: YES while a chat photo upload is in flight, so we
 // route it to ImgChest regardless of the global Media Upload Host (Reddit can't host PM images).
+// ApolloChatClearImageUpload() closes that window the moment we consume it here, so the routing can't
+// leak onto a later non-chat upload.
 #ifdef __cplusplus
 extern "C" {
 #endif
 BOOL ApolloChatImageUploadPending(void);
+void ApolloChatClearImageUpload(void);
 #ifdef __cplusplus
 }
 #endif
@@ -2842,6 +2845,7 @@ static void ApolloCompleteRedditNativeMediaUpload(NSData *mediaData, NSURL *medi
     // the keyless Web JSON fallback below and always returns when it applies.
     if ((sImageUploadProvider == ImageUploadProviderImgChest || ApolloChatImageUploadPending()) && completionHandler && ApolloIsImgurImageUploadRequest(request)) {
         BOOL chestForChat = ApolloChatImageUploadPending();   // capture now; the upload completes asynchronously
+        if (chestForChat) ApolloChatClearImageUpload();        // window consumed: don't let it leak to a later non-chat upload
         NSString *chestMIMEType = ApolloMediaMIMETypeForFilename(nil, [request valueForHTTPHeaderField:@"Content-Type"]);
         if (!ApolloImgChestUploadAvailable() || ApolloMediaMIMETypeIsVideo(chestMIMEType)) {
             ApolloLog(@"[ImgChestUpload] %@ — falling back to Imgur (fromData)",
@@ -2967,6 +2971,7 @@ static void ApolloCompleteRedditNativeMediaUpload(NSData *mediaData, NSURL *medi
     // ImgChest is the selected provider for an Imgur upload request.
     if ((sImageUploadProvider == ImageUploadProviderImgChest || ApolloChatImageUploadPending()) && completionHandler && ApolloIsImgurImageUploadRequest(request)) {
         BOOL chestForChat = ApolloChatImageUploadPending();   // capture now; the upload completes asynchronously
+        if (chestForChat) ApolloChatClearImageUpload();        // window consumed: don't let it leak to a later non-chat upload
         NSString *chestFilename = fileURL.lastPathComponent.length > 0 ? fileURL.lastPathComponent : @"apollo-upload.jpg";
         NSString *chestMIMEType = ApolloMediaMIMETypeForFilename(chestFilename, [request valueForHTTPHeaderField:@"Content-Type"]);
         NSData *chestData = [NSData dataWithContentsOfURL:fileURL];

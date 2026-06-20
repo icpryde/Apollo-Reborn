@@ -112,14 +112,19 @@ static void ApolloComposerApplyHeaderAvatar(id vc, NSString *title) {
 // The thread title ("[direct chat room]" / a PM subject) loads after the network fetch, so
 // poll briefly for it, then stamp the header avatar.
 static void ApolloComposerResolveTitle(id vc, NSInteger attempt) {
-    if (attempt > 80) return;
+    if (!vc || attempt > 80) return;   // VC already gone: stop polling
     UIButton *titleBtn = ApolloComposerIvar(vc, "titleViewButton");
     NSString *title = titleBtn.currentAttributedTitle.string ?: titleBtn.titleLabel.text ?: titleBtn.currentTitle;
     if (title.length) { ApolloComposerApplyHeaderAvatar(vc, title); return; }
     // Poll quickly so we collapse the title to a single avatar line the instant Apollo sets it —
     // otherwise Apollo's default two-line "username / [direct chat room]" header flashes first.
+    // Capture vc WEAKLY across the delay so a quickly-dismissed chat VC isn't kept alive by this
+    // ~4s poll chain, and we never stamp a header avatar onto a VC that's already gone. (Reported
+    // by @nickclyde in review.)
+    __weak id weakVC = vc;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        ApolloComposerResolveTitle(vc, attempt + 1);
+        id strongVC = weakVC;
+        if (strongVC) ApolloComposerResolveTitle(strongVC, attempt + 1);
     });
 }
 
@@ -140,6 +145,13 @@ void ApolloChatMarkImageUpload(void) {
 }
 BOOL ApolloChatImageUploadPending(void) {
     return sEnableChatMedia && ([NSDate timeIntervalSinceReferenceDate] < sApolloChatUploadUntil);
+}
+// Close the chat-upload window the instant ApolloImageUploadHost consumes it for an actual upload, so
+// the ImgChest routing (and the short imgchest.com/p/<id> rewrite) can't leak onto a later, unrelated
+// upload — e.g. attaching an image to a comment soon after sending a chat image. (Reported by
+// @nickclyde in review.)
+void ApolloChatClearImageUpload(void) {
+    sApolloChatUploadUntil = 0.0;
 }
 #ifdef __cplusplus
 }

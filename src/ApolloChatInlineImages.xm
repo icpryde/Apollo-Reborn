@@ -286,8 +286,16 @@ static void ApolloChatLoadMedia(NSURL *url, void (^completion)(id media)) {
             }
             if (!media) media = [UIImage imageWithData:data];   // png/jpg/webp, or gif fallback
         }
-        if (media) ApolloChatMediaCache()[key] = media;
-        dispatch_async(dispatch_get_main_queue(), ^{ if (completion) completion(media); });
+        // The expensive decode above runs on NSURLSession's background queue, but the cache WRITE is
+        // hopped onto the main queue: ApolloChatMediaCache is a plain NSMutableDictionary read (and
+        // written for emoji stickers) from cellForItem on the main thread, and several image loads can
+        // complete concurrently on different background queues. Mutating it off-main races those reads
+        // and can corrupt the dictionary / crash during a rehash, so every cache mutation happens on
+        // the one (main) thread. (Reported by @nickclyde in review.)
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (media) ApolloChatMediaCache()[key] = media;
+            if (completion) completion(media);
+        });
     }];
     [t resume];
 }
@@ -822,45 +830,58 @@ static NSString *ApolloChatPureEmojiBody(UILabel *label) {
 // stickers (the overlay path), so we only need the URLs here — the bytes are fetched + decoded
 // (and gif-animated) on demand by ApolloChatLoadMedia, exactly like inbound chat images.
 static void ApolloChatLoadSnoomoji(id collectionView) {
-    static dispatch_once_t once;
+    // Called only from ApolloChatProcessCell (cellForItem / the main-queue re-run) — i.e. always on the
+    // main thread — so these guards need no lock. We deliberately do NOT use dispatch_once: a single
+    // failed or empty first fetch (launched offline, or before the Reddit bearer token is captured)
+    // must not permanently disable snoomoji for the session. `sLoaded` latches only once the map is
+    // actually populated; `sInFlight` coalesces duplicate fetches but is cleared on a transient
+    // failure so the next chat open retries. (Reported by @nickclyde in review.)
+    static BOOL sLoaded = NO;     // YES only after the map has been populated with entries
+    static BOOL sInFlight = NO;   // a fetch is currently running (avoid duplicate concurrent fetches)
+    if (sLoaded || sInFlight) return;
+    sInFlight = YES;
     __weak id wcv = collectionView;
-    dispatch_once(&once, ^{
-        NSString *bearer = sLatestRedditBearerToken;
-        NSString *sub = @"nintendo";   // any emoji-enabled sub returns the platform "snoomojis" section
-        NSString *urlStr = bearer.length
-            ? [NSString stringWithFormat:@"https://oauth.reddit.com/api/v1/%@/emojis/all?raw_json=1", sub]
-            : [NSString stringWithFormat:@"https://www.reddit.com/api/v1/%@/emojis/all.json?raw_json=1", sub];
-        NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlStr]];
-        if (bearer.length) [req setValue:[@"Bearer " stringByAppendingString:bearer] forHTTPHeaderField:@"Authorization"];
-        [req setValue:@"Apollo iOS" forHTTPHeaderField:@"User-Agent"];
-        [[NSURLSession.sharedSession dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
-            NSDictionary *json = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
-            NSDictionary *snoo = [json isKindOfClass:[NSDictionary class]] ? json[@"snoomojis"] : nil;
-            NSMutableDictionary *map = ApolloChatSnoomojiMap();
-            if ([snoo isKindOfClass:[NSDictionary class]]) {
-                for (NSString *name in snoo) {
-                    NSDictionary *e = snoo[name];
-                    NSString *u = [e isKindOfClass:[NSDictionary class]] ? e[@"url"] : nil;
-                    NSURL *url = [u isKindOfClass:[NSString class]] ? [NSURL URLWithString:u] : nil;
-                    if (name.length && url) map[name.lowercaseString] = url;
-                }
+    NSString *bearer = sLatestRedditBearerToken;
+    NSString *sub = @"nintendo";   // any emoji-enabled sub returns the platform "snoomojis" section
+    NSString *urlStr = bearer.length
+        ? [NSString stringWithFormat:@"https://oauth.reddit.com/api/v1/%@/emojis/all?raw_json=1", sub]
+        : [NSString stringWithFormat:@"https://www.reddit.com/api/v1/%@/emojis/all.json?raw_json=1", sub];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlStr]];
+    if (bearer.length) [req setValue:[@"Bearer " stringByAppendingString:bearer] forHTTPHeaderField:@"Authorization"];
+    [req setValue:@"Apollo iOS" forHTTPHeaderField:@"User-Agent"];
+    [[NSURLSession.sharedSession dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        // Parse off-main into a LOCAL dictionary (no shared state touched on the background queue)...
+        NSDictionary *json = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+        NSDictionary *snoo = [json isKindOfClass:[NSDictionary class]] ? json[@"snoomojis"] : nil;
+        NSMutableDictionary<NSString *, NSURL *> *parsed = [NSMutableDictionary dictionary];
+        if ([snoo isKindOfClass:[NSDictionary class]]) {
+            for (NSString *name in snoo) {
+                NSDictionary *e = snoo[name];
+                NSString *u = [e isKindOfClass:[NSDictionary class]] ? e[@"url"] : nil;
+                NSURL *url = [u isKindOfClass:[NSString class]] ? [NSURL URLWithString:u] : nil;
+                if (name.length && url) parsed[name.lowercaseString] = url;
             }
-            ChatImgLog(@"snoomoji map: %lu entries loaded (sample orly=%@)",
-                       (unsigned long)map.count, map[@"orly"] ? @"y" : @"-");
-            if (map.count == 0) return;
+        }
+        // ...then merge into the shared map + flip the guards on the MAIN thread, so the snoomoji map
+        // is only ever mutated on the same thread ApolloChatSnoomojiStickerURL reads it on.
+        dispatch_async(dispatch_get_main_queue(), ^{
+            sInFlight = NO;
+            ChatImgLog(@"snoomoji fetch: %lu entries (sample orly=%@)",
+                       (unsigned long)parsed.count, parsed[@"orly"] ? @"y" : @"-");
+            if (parsed.count == 0) return;   // transient failure: leave sLoaded NO so the next open retries
+            [ApolloChatSnoomojiMap() addEntriesFromDictionary:parsed];
+            sLoaded = YES;
             // Re-run the cell pipeline for what's already on screen: any single-snoomoji bubble
             // that rendered as bare text before the table arrived now resolves to a sticker.
-            dispatch_async(dispatch_get_main_queue(), ^{
-                id cv = wcv;
-                if (!cv || ![cv respondsToSelector:@selector(visibleCells)]) return;
-                id dvc = [cv respondsToSelector:@selector(delegate)] ? [(UICollectionView *)cv delegate] : nil;
-                for (id cell in [(UICollectionView *)cv visibleCells]) {
-                    NSIndexPath *ip = [(UICollectionView *)cv indexPathForCell:cell];
-                    if (dvc && ip) ApolloChatProcessCell(dvc, cv, cell, ip);
-                }
-            });
-        }] resume];
-    });
+            id cv = wcv;
+            if (!cv || ![cv respondsToSelector:@selector(visibleCells)]) return;
+            id dvc = [cv respondsToSelector:@selector(delegate)] ? [(UICollectionView *)cv delegate] : nil;
+            for (id cell in [(UICollectionView *)cv visibleCells]) {
+                NSIndexPath *ip = [(UICollectionView *)cv indexPathForCell:cell];
+                if (dvc && ip) ApolloChatProcessCell(dvc, cv, cell, ip);
+            }
+        });
+    }] resume];
 }
 
 // Is the whole string a pure emoji (no regular letters/digits)? Used to spot a single-emoji

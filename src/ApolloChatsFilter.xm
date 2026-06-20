@@ -71,9 +71,51 @@ static void ApolloRestyleAsDirectChat(UITableViewCell *cell) {
 
 #pragma mark - Boxes list: add the Direct Chat row
 
+// Which index-path delegate methods must be remapped for the inserted Direct Chat row? Two layers:
+//   * _TtC6Apollo23InboxListViewController's OWN methods (otool class metadata): initWithCoder:,
+//     viewDidLoad, numberOfSectionsInTableView:, tableView:numberOfRowsInSection:,
+//     tableView:cellForRowAtIndexPath:, tableView:heightForHeaderInSection:,
+//     tableView:didSelectRowAtIndexPath:, redditAccountChangedWithNotification:. Of these the only
+//     row/index-path ones are cellForRowAtIndexPath:/didSelectRowAtIndexPath: (remapped), numberOfRows
+//     is overridden, and heightForHeaderInSection: is section-based.
+//   * INHERITED methods matter too — respondsToSelector: (what UITableView dispatches on) sees the
+//     whole chain. The runtime canary below caught that the base class _TtC6Apollo25ApolloTableViewController
+//     implements tableView:heightForRowAtIndexPath:, which InboxListViewController inherits — so
+//     UITableView calls it for every row with our *displayed* index paths. It returns a uniform
+//     (self-sizing) height today, so the off-by-one was harmless in practice, but we remap it anyway
+//     for correctness + safety (a future per-row height would otherwise mis-size). (Raised by @nickclyde.)
+// The canary still watches the OTHER row selectors so a future Apollo build that adds one is caught.
+static void ApolloWarnIfUnhandledRowDelegates(id vc) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        // Row-based selectors we do NOT remap; if Apollo (or a base class) starts implementing any, it
+        // would receive our shifted *displayed* index paths unremapped. cellFor/didSelect/heightForRow
+        // are handled below, so they're intentionally absent here.
+        NSArray<NSString *> *risky = @[
+            @"tableView:estimatedHeightForRowAtIndexPath:",
+            @"tableView:willDisplayCell:forRowAtIndexPath:",
+            @"tableView:didEndDisplayingCell:forRowAtIndexPath:",
+            @"tableView:canEditRowAtIndexPath:",
+            @"tableView:editActionsForRowAtIndexPath:",
+            @"tableView:leadingSwipeActionsConfigurationForRowAtIndexPath:",
+            @"tableView:trailingSwipeActionsConfigurationForRowAtIndexPath:",
+            @"tableView:commitEditingStyle:forRowAtIndexPath:",
+            @"tableView:contextMenuConfigurationForRowAtIndexPath:point:",
+            @"tableView:accessoryButtonTappedForRowWithIndexPath:",
+            @"tableView:canMoveRowAtIndexPath:",
+            @"tableView:moveRowAtIndexPath:toIndexPath:",
+        ];
+        for (NSString *sel in risky) {
+            if ([vc respondsToSelector:NSSelectorFromString(sel)])
+                ChatsFilterLog(@"WARNING: InboxListViewController now implements %@ — the Direct Chat row shift may mis-index it; remap it too.", sel);
+        }
+    });
+}
+
 %hook _TtC6Apollo23InboxListViewController
 
 - (long long)tableView:(UITableView *)tableView numberOfRowsInSection:(long long)section {
+    if (sDirectChatRowEnabled) ApolloWarnIfUnhandledRowDelegates(self);   // one-shot future-proofing canary
     long long n = %orig;
     if (sDirectChatRowEnabled && sMessagesSection >= 0 && section == sMessagesSection) {
         n += 1;   // + our Direct Chat row
@@ -149,6 +191,20 @@ static NSInteger ApolloRealMessagesRow(NSInteger displayedRow) {
     %orig;
 }
 
+// Inherited from _TtC6Apollo25ApolloTableViewController (caught by the canary above) and therefore
+// called by UITableView for every row — so it must be remapped like cellFor/didSelect, or rows
+// at/after Messages get the height of the wrong real row and the Direct Chat row gets an arbitrary
+// one. Map our displayed index path back to Apollo's real row; the Direct Chat row borrows the
+// Messages row's height. (Raised by @nickclyde in review.)
+- (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (sDirectChatRowEnabled && sMessagesSection >= 0 && indexPath.section == sMessagesSection) {
+        NSInteger realRow = ApolloRealMessagesRow(indexPath.row);
+        if (realRow < 0) realRow = sMessagesRow;   // Direct Chat row -> same height as the Messages row
+        return %orig(tableView, [NSIndexPath indexPathForRow:realRow inSection:sMessagesSection]);
+    }
+    return %orig;
+}
+
 %end
 
 #pragma mark - messages list: filter to chats
@@ -208,16 +264,75 @@ static BOOL sChatFilterActive = NO;
 }
 %end
 
+// Re-entrancy guard for the accumulate-paging below: a nested page-pull does a single filtered page
+// and passes the real pagination token straight through (it must NOT re-accumulate). The flag is only
+// ever toggled synchronously on the main thread around the nested call (the call just kicks off an
+// async task and returns), so a plain BOOL needs no lock.
+static BOOL sChatPagingInProgress = NO;
+static const NSInteger kMaxChatFilterPages = 8;   // cap so a chat-sparse account can't page forever
+
 %hook RDKClient
 // NOTE: `category` is an enum (NSInteger), NOT an object — declaring it `id` makes ARC retain
 // the integer value as a pointer (EXC_BAD_ACCESS at 0x2). It MUST be a scalar type.
 - (id)messagesInCategory:(long long)category pagination:(id)pagination markRead:(BOOL)markRead completion:(id)completion {
-    ChatsFilterLog(@"messagesInCategory cat=%lld active=%d", category, sChatFilterActive);
+    ChatsFilterLog(@"messagesInCategory cat=%lld active=%d nested=%d", category, sChatFilterActive, sChatPagingInProgress);
     if (!completion || !sChatFilterActive) return %orig;
-    id wrapped = ^(NSArray *messages, id page, NSError *error) {
-        ((void (^)(NSArray *, id, NSError *))completion)(ApolloChatFilterToChats(messages), page, error);
+
+    // A nested page-pull kicked off by the accumulator below: filter this one page and pass the real
+    // pagination token straight through so the accumulator can decide whether to keep going.
+    if (sChatPagingInProgress) {
+        id wrapped = ^(NSArray *messages, id page, NSError *error) {
+            ((void (^)(NSArray *, id, NSError *))completion)(ApolloChatFilterToChats(messages), page, error);
+        };
+        return %orig(category, pagination, NO, wrapped);
+    }
+
+    // Top-level chat-filtered load. Filtering one page to chats can leave it EMPTY when that page holds
+    // only non-chat PMs — and Apollo's list (IGListKit) only requests the next page when its bottom
+    // LoadNextPage cell appears, which an empty list never shows, so older chats further back would
+    // never load. So accumulate across pages until we have at least one chat (or Reddit runs out of
+    // pages, or we hit the cap), then deliver a non-empty page carrying the LAST page's pagination
+    // token so Apollo's own load-more continues from where we stopped. (Reported by @nickclyde in
+    // review.) RDKPagination.after is an NSString (verified in the binary); nil/empty == no more pages.
+    NSMutableArray *acc = [NSMutableArray array];
+    __block NSInteger pages = 0;
+    __weak id weakSelf = self;   // RDKClient is only forward-declared here; message it dynamically
+    void (^deliver)(id, NSError *) = ^(id page, NSError *error) {
+        ((void (^)(NSArray *, id, NSError *))completion)(acc, page, error);
     };
-    return %orig(category, pagination, NO, wrapped);   // markRead:NO so the filtered view doesn't mark PMs read
+    // The page-puller references itself (via the __block `step`) to recurse, then nils itself when it
+    // stops, so the self-reference is deliberately broken — silence the (correct-in-general) retain
+    // cycle warning for just this block. The block is strongly held by the in-flight fetch's completion
+    // until we nil it on delivery, so liveness is guaranteed and there's no actual leak.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-retain-cycles"
+    __block void (^step)(NSArray *, id, NSError *) = nil;
+    step = ^(NSArray *chats, id page, NSError *error) {
+        [acc addObjectsFromArray:(chats ?: @[])];
+        pages++;
+        // RDKPagination.after is an NSString (verified in the binary) but RDKPagination isn't imported,
+        // so read it dynamically; nil/empty == no more pages.
+        NSString *after = [page respondsToSelector:@selector(after)]
+            ? ((NSString *(*)(id, SEL))objc_msgSend)(page, @selector(after)) : nil;
+        BOOL morePages = ([after isKindOfClass:[NSString class]] && after.length > 0);
+        id ss = weakSelf;
+        if (acc.count == 0 && morePages && !error && ss && pages < kMaxChatFilterPages) {
+            ChatsFilterLog(@"page %ld had 0 chats; pulling next (after=%@)", (long)pages, after);
+            sChatPagingInProgress = YES;
+            ((id (*)(id, SEL, long long, id, BOOL, id))objc_msgSend)(
+                ss, @selector(messagesInCategory:pagination:markRead:completion:), category, page, (BOOL)NO, step);
+            sChatPagingInProgress = NO;
+        } else {
+            ChatsFilterLog(@"delivering %lu chat(s) after %ld page(s)", (unsigned long)acc.count, (long)pages);
+            deliver(page, error);
+            step = nil;   // break the recursive block's self-reference so it deallocs
+        }
+    };
+#pragma clang diagnostic pop
+    id firstWrapped = ^(NSArray *messages, id page, NSError *error) {
+        step(ApolloChatFilterToChats(messages), page, error);
+    };
+    return %orig(category, pagination, NO, firstWrapped);   // markRead:NO so the filtered view doesn't mark PMs read
 }
 %end
 
