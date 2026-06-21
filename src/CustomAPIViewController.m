@@ -2,6 +2,7 @@
 #import "ApolloCommon.h"
 #import "ApolloNotificationBackend.h"
 #import "ApolloWebSessionLoginViewController.h"
+#import "ApolloAISettingsViewController.h"
 #import "ApolloState.h"
 #import "ApolloUserProfileCache.h"
 #import "ApolloLinkPreviewCache.h"
@@ -616,6 +617,12 @@ typedef NS_ENUM(NSInteger, Tag) {
         [self.tableView reloadRowsAtIndexPaths:@[[NSIndexPath indexPathForRow:kAPIKeyRowWebSessionLogin inSection:SectionAPIKeys]]
                               withRowAnimation:UITableViewRowAnimationNone];
     }
+    // Refresh the Apollo AI status subtitle after returning from its subview.
+    NSInteger apolloAIRow = sShowDeletedComments ? 12 : 11;
+    if ([self.tableView numberOfRowsInSection:SectionGeneral] > apolloAIRow) {
+        [self.tableView reloadRowsAtIndexPaths:@[[NSIndexPath indexPathForRow:apolloAIRow inSection:SectionGeneral]]
+                              withRowAnimation:UITableViewRowAnimationNone];
+    }
 }
 
 - (void)viewWillDisappear:(BOOL)animated {
@@ -662,11 +669,10 @@ typedef NS_ENUM(NSInteger, Tag) {
         // row, so the count is its index + 1, minus the Web Session Login row when
         // the mode is off.
         case SectionAPIKeys: return kAPIKeyRowWidgetSetupCode + (sWebJSONEnabled ? 1 : 0);
-        // General base rows + the search-in-place toggle (effectiveRow 11) and the
-        // AI Summaries toggle (effectiveRow 12), minus the "Tap to Show Deleted
-        // Comments" row when Show Deleted Comments is off. When AI Summaries is on,
-        // three sub-toggles (effectiveRows 13-15) appear directly beneath it.
-        case SectionGeneral: return (sShowDeletedComments ? 13 : 12) + (sEnableAISummaries ? 3 : 0);
+        // General base rows + the search-in-place toggle (effectiveRow 11) and
+        // Apollo AI disclosure row (effectiveRow 12), minus the conditional
+        // "Tap to Show Deleted Comments" row.
+        case SectionGeneral: return sShowDeletedComments ? 13 : 12;
         case SectionMedia: return 14 + (sEnableInlineImages ? 0 : -kApolloMediaInlineDependentRows);
         case SectionSubreddits: return sSubredditListEnhancements ? 8 : 7;
         case SectionNotificationBackend: return 3; // URL + Registration Token + Test Connection
@@ -1117,31 +1123,21 @@ typedef NS_ENUM(NSInteger, Tag) {
             cell.detailTextLabel.enabled = lgSupported;
             return cell;
         }
-        case 12:
-            return [self switchCellWithIdentifier:@"Cell_Gen_AISummaries"
-                                            label:@"AI Summaries"
-                                           detail:@"On-device summaries of posts and discussions. Requires Apple Intelligence (iOS 26+)."
-                                               on:[defaults boolForKey:UDKeyEnableAISummaries]
-                                           action:@selector(aiSummariesSwitchToggled:)];
-        // Sub-toggles, present only while AI Summaries is on (see numberOfRows).
-        case 13:
-            return [self switchCellWithIdentifier:@"Cell_Gen_AIPostSummaries"
-                                            label:@"Post & Link Summaries"
-                                           detail:@"Summarize a post's text, or the article a link points to."
-                                               on:[defaults boolForKey:UDKeyEnableAIPostSummaries]
-                                           action:@selector(aiPostSummariesSwitchToggled:)];
-        case 14:
-            return [self switchCellWithIdentifier:@"Cell_Gen_AICommentSummaries"
-                                            label:@"Comment Summaries"
-                                           detail:@"Summarize the discussion on larger comment threads."
-                                               on:[defaults boolForKey:UDKeyEnableAICommentSummaries]
-                                           action:@selector(aiCommentSummariesSwitchToggled:)];
-        case 15:
-            return [self switchCellWithIdentifier:@"Cell_Gen_AITapToSummarize"
-                                            label:@"Tap to Summarize"
-                                           detail:@"Summarize only when you tap a card, instead of automatically. Saves battery."
-                                               on:[defaults boolForKey:UDKeyEnableTapToSummarize]
-                                           action:@selector(aiTapToSummarizeSwitchToggled:)];
+        case 12: {
+            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_Gen_ApolloAI"];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle
+                                              reuseIdentifier:@"Cell_Gen_ApolloAI"];
+                cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+                cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+            }
+            cell.textLabel.text = @"Apollo AI";
+            cell.detailTextLabel.text = sEnableAISummaries
+                ? @"On-device summaries enabled"
+                : @"On-device summaries and generation settings";
+            cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+            return cell;
+        }
         default: return [[UITableViewCell alloc] init];
     }
 }
@@ -1659,6 +1655,12 @@ typedef NS_ENUM(NSInteger, Tag) {
         } else if (row == kAPIKeyRowWidgetSetupCode) {
             [self copyWidgetSetupCode];
         }
+    } else if (indexPath.section == SectionGeneral) {
+        NSInteger effectiveRow = (!sShowDeletedComments && indexPath.row >= 4) ? indexPath.row + 1 : indexPath.row;
+        if (effectiveRow == 12) {
+            ApolloAISettingsViewController *vc = [[ApolloAISettingsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+            [self.navigationController pushViewController:vc animated:YES];
+        }
     } else if (indexPath.section == SectionAbout) {
         if (indexPath.row == 0) {
             [self presentURLInApolloBrowser:[NSURL URLWithString:@"https://github.com/Apollo-Reborn/Apollo-Reborn"]];
@@ -2103,42 +2105,6 @@ typedef NS_ENUM(NSInteger, Tag) {
 
 - (void)randNsfwSwitchToggled:(UISwitch *)sender {
     [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyShowRandNsfw];
-}
-
-- (void)aiSummariesSwitchToggled:(UISwitch *)sender {
-    BOOL wasOn = sEnableAISummaries;
-    sEnableAISummaries = sender.isOn;
-    [[NSUserDefaults standardUserDefaults] setBool:sEnableAISummaries forKey:UDKeyEnableAISummaries];
-    if (sEnableAISummaries == wasOn) return;
-
-    // Reveal/hide the three sub-toggles directly beneath this row. They are the
-    // last three rows of the section (AI Summaries is the last base row).
-    NSInteger base = sShowDeletedComments ? 13 : 12;
-    NSArray<NSIndexPath *> *paths = @[
-        [NSIndexPath indexPathForRow:base inSection:SectionGeneral],
-        [NSIndexPath indexPathForRow:base + 1 inSection:SectionGeneral],
-        [NSIndexPath indexPathForRow:base + 2 inSection:SectionGeneral],
-    ];
-    if (sEnableAISummaries) {
-        [self.tableView insertRowsAtIndexPaths:paths withRowAnimation:UITableViewRowAnimationFade];
-    } else {
-        [self.tableView deleteRowsAtIndexPaths:paths withRowAnimation:UITableViewRowAnimationFade];
-    }
-}
-
-- (void)aiPostSummariesSwitchToggled:(UISwitch *)sender {
-    sEnableAIPostSummaries = sender.isOn;
-    [[NSUserDefaults standardUserDefaults] setBool:sEnableAIPostSummaries forKey:UDKeyEnableAIPostSummaries];
-}
-
-- (void)aiCommentSummariesSwitchToggled:(UISwitch *)sender {
-    sEnableAICommentSummaries = sender.isOn;
-    [[NSUserDefaults standardUserDefaults] setBool:sEnableAICommentSummaries forKey:UDKeyEnableAICommentSummaries];
-}
-
-- (void)aiTapToSummarizeSwitchToggled:(UISwitch *)sender {
-    sEnableTapToSummarize = sender.isOn;
-    [[NSUserDefaults standardUserDefaults] setBool:sEnableTapToSummarize forKey:UDKeyEnableTapToSummarize];
 }
 
 - (void)customOAuthSignInSwitchToggled:(UISwitch *)sender {
