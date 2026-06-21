@@ -2704,8 +2704,10 @@ static void ApolloReplayValetKeychainItems(NSArray<NSDictionary *> *items) {
         sTranslationProvider = @"libre";
     } else if ([provider isEqualToString:@"google"]) {
         sTranslationProvider = @"google";
+    } else if ([provider isEqualToString:@"apple"] && IsAppleTranslationSupported()) {
+        sTranslationProvider = @"apple";
     } else {
-        // Unset, unrecognized, or legacy "apple" — default to Google.
+        // Unset, unrecognized, or "apple" on an unsupported OS — default to Google.
         sTranslationProvider = @"google";
         [defaults setObject:sTranslationProvider forKey:UDKeyTranslationProvider];
         [defaults setBool:NO forKey:UDKeyTranslationProviderUserSelected];
