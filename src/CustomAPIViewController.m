@@ -1128,14 +1128,29 @@ typedef NS_ENUM(NSInteger, Tag) {
             if (!cell) {
                 cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle
                                               reuseIdentifier:@"Cell_Gen_ApolloAI"];
-                cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
                 cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+
+                // Keep the whole row selectable and provide an explicit
+                // disclosure-button target, so either tap path opens the screen.
+                UIButton *disclosure = [UIButton buttonWithType:UIButtonTypeSystem];
+                UIImageSymbolConfiguration *config =
+                    [UIImageSymbolConfiguration configurationWithPointSize:14 weight:UIImageSymbolWeightSemibold];
+                [disclosure setImage:[UIImage systemImageNamed:@"chevron.forward" withConfiguration:config]
+                            forState:UIControlStateNormal];
+                disclosure.frame = CGRectMake(0, 0, 32, 44);
+                disclosure.accessibilityLabel = @"Open Apollo AI Settings";
+                [disclosure addTarget:self
+                               action:@selector(apolloAISettingsTapped:)
+                     forControlEvents:UIControlEventTouchUpInside];
+                cell.accessoryView = disclosure;
             }
             cell.textLabel.text = @"Apollo AI";
             cell.detailTextLabel.text = sEnableAISummaries
-                ? @"On-device summaries enabled"
-                : @"On-device summaries and generation settings";
+                ? @"On-device AI enabled"
+                : @"On-device AI settings";
             cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+            cell.detailTextLabel.numberOfLines = 0;
+            cell.detailTextLabel.lineBreakMode = NSLineBreakByWordWrapping;
             return cell;
         }
         default: return [[UITableViewCell alloc] init];
@@ -1626,8 +1641,35 @@ typedef NS_ENUM(NSInteger, Tag) {
 
 #pragma mark - UITableViewDelegate
 
+- (void)openApolloAISettings {
+    ApolloLog(@"[ApolloAISettings] opening settings screen navigationController=%@",
+              self.navigationController ? @"yes" : @"no");
+    ApolloAISettingsViewController *vc =
+        [[ApolloAISettingsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+    if (self.navigationController) {
+        [self.navigationController pushViewController:vc animated:YES];
+    } else {
+        UINavigationController *navigation =
+            [[UINavigationController alloc] initWithRootViewController:vc];
+        [self presentViewController:navigation animated:YES completion:nil];
+    }
+}
+
+- (void)apolloAISettingsTapped:(UIButton *)__unused sender {
+    [self openApolloAISettings];
+}
+
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
+
+    // Identify this disclosure by its stable cell identifier rather than
+    // reconstructing the effective row around the optional deleted-comments
+    // setting. This remains correct if General rows are reordered later.
+    UITableViewCell *selectedCell = [tableView cellForRowAtIndexPath:indexPath];
+    if ([selectedCell.reuseIdentifier isEqualToString:@"Cell_Gen_ApolloAI"]) {
+        [self openApolloAISettings];
+        return;
+    }
 
     if (indexPath.section == SectionBackupRestore) {
         UITableViewCell *cell = [tableView cellForRowAtIndexPath:indexPath];
@@ -1654,12 +1696,6 @@ typedef NS_ENUM(NSInteger, Tag) {
             }
         } else if (row == kAPIKeyRowWidgetSetupCode) {
             [self copyWidgetSetupCode];
-        }
-    } else if (indexPath.section == SectionGeneral) {
-        NSInteger effectiveRow = (!sShowDeletedComments && indexPath.row >= 4) ? indexPath.row + 1 : indexPath.row;
-        if (effectiveRow == 12) {
-            ApolloAISettingsViewController *vc = [[ApolloAISettingsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
-            [self.navigationController pushViewController:vc animated:YES];
         }
     } else if (indexPath.section == SectionAbout) {
         if (indexPath.row == 0) {
