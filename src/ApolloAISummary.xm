@@ -24,6 +24,7 @@
 #import <objc/message.h>
 
 #import "ApolloCommon.h"
+#import "ApolloAISummary.h"
 #import "ApolloState.h"
 #import "Tweak.h"
 
@@ -346,6 +347,50 @@ static void ApolloAIEnsureState(void) {
         sTapRequested = [NSMutableSet set];
         ApolloAILoadPersistedSummaries();
     });
+}
+
+NSUInteger ApolloAIClearSummaryCache(void) {
+    ApolloAIEnsureState();
+
+    NSUInteger removed = sPostSummaryCache.count + sCommentSummaryCache.count;
+    ApolloFoundationModels *bridge = ApolloAIBridge();
+    for (NSString *requestID in sPostRequestIDs.allValues) {
+        [bridge cancelRequest:requestID];
+    }
+    for (NSString *requestID in sCommentRequestIDs.allValues) {
+        [bridge cancelRequest:requestID];
+    }
+
+    [sPostSummaryCache removeAllObjects];
+    [sCommentSummaryCache removeAllObjects];
+    [sPostSummaryMode removeAllObjects];
+    [sArticleTextCache removeAllObjects];
+    [sCommentSummarySourceCounts removeAllObjects];
+    [sCommentSummarySignatures removeAllObjects];
+    [sCapturedComments removeAllObjects];
+    [sCapturedCommentKeys removeAllObjects];
+    [sPostInFlight removeAllObjects];
+    [sCommentInFlight removeAllObjects];
+    [sPostRequestIDs removeAllObjects];
+    [sCommentRequestIDs removeAllObjects];
+    [sLastPartialUIUpdate removeAllObjects];
+    [sCommentGenerationScheduled removeAllObjects];
+    [sPostFailed removeAllObjects];
+    [sCommentFailed removeAllObjects];
+    [sTimedOutRequests removeAllObjects];
+    [sTapRequested removeAllObjects];
+    [sLinkSummaryPosts removeAllObjects];
+    [sBothSummaryPosts removeAllObjects];
+
+    // Serialize behind any pending cache write, then remove the final file so
+    // an older queued snapshot cannot recreate it after this action returns.
+    dispatch_sync(ApolloAIPersistQueue(), ^{
+        [[NSFileManager defaultManager] removeItemAtPath:ApolloAISummariesCachePath() error:nil];
+    });
+
+    ApolloLog(@"[AISummary] cache cleared by user (%lu summaries removed)",
+              (unsigned long)removed);
+    return removed;
 }
 
 // The post box's current mode for this post, derived from the classification
@@ -1957,7 +2002,10 @@ maximumResponseTokens:responseTokens
                     ApolloAIForceHeaderRemeasure(fullName);
                 }
                 ApolloAIPersistSummaries();
-                ApolloLog(@"[AISummary] LINK summary DONE for %@:\n%@", fullName, final);
+                // Never log generated text: exported diagnostics may be shared
+                // publicly and summaries can contain private or sensitive content.
+                ApolloLog(@"[AISummary] LINK summary DONE for %@ (%lu chars)",
+                          fullName, (unsigned long)final.length);
             }];
 }
 
@@ -2196,7 +2244,10 @@ static void ApolloAIGenerateForController(UIViewController *vc) {
                             ApolloAIForceHeaderRemeasure(fullName);
                         }
                         ApolloAIPersistSummaries();
-                        ApolloLog(@"[AISummary] POST summary DONE for %@:\n%@", fullName, final);
+                        // Keep completion diagnostics without including generated
+                        // Reddit content in the unified log or exported AI logs.
+                        ApolloLog(@"[AISummary] POST summary DONE for %@ (%lu chars)",
+                                  fullName, (unsigned long)final.length);
                     }];
         } else {
             // Neither summarizable body nor article link (image/video/media post,
@@ -2310,7 +2361,8 @@ static void ApolloAIGenerateForController(UIViewController *vc) {
                         // The summary is cached; we no longer need the raw comments.
                         [sCapturedComments removeObjectForKey:fullName];
                         [sCapturedCommentKeys removeObjectForKey:fullName];
-                        ApolloLog(@"[AISummary] COMMENT summary DONE for %@:\n%@", fullName, final);
+                        ApolloLog(@"[AISummary] COMMENT summary DONE for %@ (%lu chars)",
+                                  fullName, (unsigned long)final.length);
                     }];
             }   // end Tap-to-Summarize else (generate)
         } else {

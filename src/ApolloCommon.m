@@ -19,7 +19,7 @@ os_log_t ApolloFixLog(void) {
     return log;
 }
 
-NSString *ApolloCollectLogs(void) {
+static NSString *ApolloCollectLogsFiltered(BOOL aiOnly) {
     if (@available(iOS 15.0, *)) {
         NSError *error = nil;
         OSLogStore *store = [OSLogStore storeWithScope:OSLogStoreCurrentProcessIdentifier error:&error];
@@ -39,22 +39,35 @@ NSString *ApolloCollectLogs(void) {
             return [NSString stringWithFormat:@"Failed to enumerate logs: %@", error.localizedDescription];
         }
 
-        if (entries.count == 0) {
-            return @"No [ApolloFix] log entries found since app launch.";
-        }
-
         NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
         formatter.dateFormat = @"HH:mm:ss.SSS";
 
+        NSMutableArray<OSLogEntryLog *> *filteredEntries = [NSMutableArray array];
+        for (OSLogEntryLog *entry in entries) {
+            if (![entry isKindOfClass:[OSLogEntryLog class]]) continue;
+            if (!aiOnly ||
+                [entry.category isEqualToString:@"AISummary"] ||
+                [entry.composedMessage containsString:@"[AISummary]"] ||
+                [entry.composedMessage containsString:@"[ApolloAISettings]"]) {
+                [filteredEntries addObject:entry];
+            }
+        }
+
+        if (filteredEntries.count == 0) {
+            return aiOnly
+                ? @"No Apollo AI log entries found since app launch."
+                : @"No [ApolloFix] log entries found since app launch.";
+        }
+
         NSMutableString *output = [NSMutableString new];
-        [output appendFormat:@"ApolloFix Logs — %@ (%lu entries)\n\n",
+        [output appendFormat:@"%@ — %@ (%lu entries)\n\n",
+            aiOnly ? @"Apollo AI Logs" : @"ApolloFix Logs",
             [NSDateFormatter localizedStringFromDate:[NSDate date]
                                            dateStyle:NSDateFormatterMediumStyle
                                            timeStyle:NSDateFormatterShortStyle],
-            (unsigned long)entries.count];
+            (unsigned long)filteredEntries.count];
 
-        for (OSLogEntryLog *entry in entries) {
-            if (![entry isKindOfClass:[OSLogEntryLog class]]) continue;
+        for (OSLogEntryLog *entry in filteredEntries) {
             [output appendFormat:@"[%@] %@\n", [formatter stringFromDate:entry.date], entry.composedMessage];
         }
 
@@ -62,6 +75,14 @@ NSString *ApolloCollectLogs(void) {
     }
 
     return @"Log export requires iOS 15+.";
+}
+
+NSString *ApolloCollectLogs(void) {
+    return ApolloCollectLogsFiltered(NO);
+}
+
+NSString *ApolloCollectAILogs(void) {
+    return ApolloCollectLogsFiltered(YES);
 }
 
 // Get the SDK version from the main binary's LC_BUILD_VERSION load command

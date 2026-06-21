@@ -1,5 +1,7 @@
 #import "ApolloAISettingsViewController.h"
 
+#import "ApolloAISummary.h"
+#import "ApolloCommon.h"
 #import "ApolloState.h"
 #import "UserDefaultConstants.h"
 
@@ -7,6 +9,7 @@ typedef NS_ENUM(NSInteger, ApolloAISettingsSection) {
     ApolloAISettingsSectionGeneral = 0,
     ApolloAISettingsSectionSummaries,
     ApolloAISettingsSectionAvailability,
+    ApolloAISettingsSectionMaintenance,
     ApolloAISettingsSectionCount,
 };
 
@@ -85,6 +88,7 @@ typedef NS_ENUM(NSInteger, ApolloAISettingsSection) {
         case ApolloAISettingsSectionGeneral: return 1;
         case ApolloAISettingsSectionSummaries: return 3;
         case ApolloAISettingsSectionAvailability: return 1;
+        case ApolloAISettingsSectionMaintenance: return 2;
         default: return 0;
     }
 }
@@ -94,6 +98,7 @@ typedef NS_ENUM(NSInteger, ApolloAISettingsSection) {
         case ApolloAISettingsSectionGeneral: return @"General";
         case ApolloAISettingsSectionSummaries: return @"Summaries";
         case ApolloAISettingsSectionAvailability: return @"Availability";
+        case ApolloAISettingsSectionMaintenance: return @"Maintenance";
         default: return nil;
     }
 }
@@ -107,6 +112,9 @@ typedef NS_ENUM(NSInteger, ApolloAISettingsSection) {
     }
     if (section == ApolloAISettingsSectionAvailability) {
         return @"Availability is diagnostic. On some iOS versions, sideloaded apps may report Apple Intelligence as disabled even when generation still works.";
+    }
+    if (section == ApolloAISettingsSectionMaintenance) {
+        return @"Clearing the cache removes saved summaries and extracted article text. Apollo AI logs contain only AI-specific Reborn diagnostics from the current app session.";
     }
     return nil;
 }
@@ -153,7 +161,59 @@ typedef NS_ENUM(NSInteger, ApolloAISettingsSection) {
         return cell;
     }
 
+    if (indexPath.section == ApolloAISettingsSectionMaintenance) {
+        UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+        if (indexPath.row == 0) {
+            cell.textLabel.text = @"Clear AI Cache";
+            cell.textLabel.textColor = [UIColor systemRedColor];
+        } else {
+            cell.textLabel.text = @"Export Apollo AI Logs";
+            cell.textLabel.textColor = self.view.tintColor;
+        }
+        return cell;
+    }
+
     return [[UITableViewCell alloc] init];
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    if (indexPath.section != ApolloAISettingsSectionMaintenance) return;
+
+    UITableViewCell *cell = [tableView cellForRowAtIndexPath:indexPath];
+    if (indexPath.row == 0) {
+        UIAlertController *alert =
+            [UIAlertController alertControllerWithTitle:@"Clear AI Cache?"
+                                                message:@"Saved post and comment summaries will be removed and generated again when needed."
+                                         preferredStyle:UIAlertControllerStyleActionSheet];
+        [alert addAction:[UIAlertAction actionWithTitle:@"Clear AI Cache"
+                                                 style:UIAlertActionStyleDestructive
+                                               handler:^(__unused UIAlertAction *action) {
+            NSUInteger removed = ApolloAIClearSummaryCache();
+            NSString *message = removed == 1
+                ? @"Removed 1 cached summary."
+                : [NSString stringWithFormat:@"Removed %lu cached summaries.", (unsigned long)removed];
+            UIAlertController *done =
+                [UIAlertController alertControllerWithTitle:@"AI Cache Cleared"
+                                                    message:message
+                                             preferredStyle:UIAlertControllerStyleAlert];
+            [done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+            [self presentViewController:done animated:YES completion:nil];
+        }]];
+        [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+        alert.popoverPresentationController.sourceView = cell ?: self.view;
+        alert.popoverPresentationController.sourceRect = cell ? cell.bounds : CGRectZero;
+        [self presentViewController:alert animated:YES completion:nil];
+        return;
+    }
+
+    NSString *logs = ApolloCollectAILogs();
+    UIActivityViewController *activity =
+        [[UIActivityViewController alloc] initWithActivityItems:@[logs] applicationActivities:nil];
+    activity.popoverPresentationController.sourceView = cell ?: self.view;
+    activity.popoverPresentationController.sourceRect = cell ? cell.bounds : CGRectZero;
+    [self presentViewController:activity animated:YES completion:nil];
 }
 
 #pragma mark - Actions

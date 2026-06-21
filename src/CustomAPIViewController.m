@@ -25,6 +25,7 @@ typedef NS_ENUM(NSInteger, SectionIndex) {
     SectionBackupRestore = 0,
     SectionAPIKeys,
     SectionGeneral,
+    SectionApolloAI,
     SectionMedia,
     SectionSubreddits,
     SectionNotificationBackend,
@@ -618,11 +619,8 @@ typedef NS_ENUM(NSInteger, Tag) {
                               withRowAnimation:UITableViewRowAnimationNone];
     }
     // Refresh the Apollo AI status subtitle after returning from its subview.
-    NSInteger apolloAIRow = sShowDeletedComments ? 12 : 11;
-    if ([self.tableView numberOfRowsInSection:SectionGeneral] > apolloAIRow) {
-        [self.tableView reloadRowsAtIndexPaths:@[[NSIndexPath indexPathForRow:apolloAIRow inSection:SectionGeneral]]
-                              withRowAnimation:UITableViewRowAnimationNone];
-    }
+    [self.tableView reloadSections:[NSIndexSet indexSetWithIndex:SectionApolloAI]
+                  withRowAnimation:UITableViewRowAnimationNone];
 }
 
 - (void)viewWillDisappear:(BOOL)animated {
@@ -669,10 +667,10 @@ typedef NS_ENUM(NSInteger, Tag) {
         // row, so the count is its index + 1, minus the Web Session Login row when
         // the mode is off.
         case SectionAPIKeys: return kAPIKeyRowWidgetSetupCode + (sWebJSONEnabled ? 1 : 0);
-        // General base rows + the search-in-place toggle (effectiveRow 11) and
-        // Apollo AI disclosure row (effectiveRow 12), minus the conditional
-        // "Tap to Show Deleted Comments" row.
-        case SectionGeneral: return sShowDeletedComments ? 13 : 12;
+        // General base rows + the search-in-place toggle (effectiveRow 11),
+        // minus the conditional "Tap to Show Deleted Comments" row.
+        case SectionGeneral: return sShowDeletedComments ? 12 : 11;
+        case SectionApolloAI: return 1;
         case SectionMedia: return 14 + (sEnableInlineImages ? 0 : -kApolloMediaInlineDependentRows);
         case SectionSubreddits: return sSubredditListEnhancements ? 8 : 7;
         case SectionNotificationBackend: return 3; // URL + Registration Token + Test Connection
@@ -686,6 +684,7 @@ typedef NS_ENUM(NSInteger, Tag) {
         case SectionBackupRestore: return @"Data";
         case SectionAPIKeys: return @"API Keys";
         case SectionGeneral: return @"General";
+        case SectionApolloAI: return @"Apollo AI";
         case SectionMedia: return @"Media";
         case SectionSubreddits: return @"Subreddits";
         case SectionNotificationBackend: return @"Notification Backend";
@@ -700,6 +699,7 @@ typedef NS_ENUM(NSInteger, Tag) {
         case SectionBackupRestore: cell = [self backupRestoreCellForRow:indexPath.row tableView:tableView]; break;
         case SectionAPIKeys: cell = [self apiKeyCellForRow:indexPath.row tableView:tableView]; break;
         case SectionGeneral: cell = [self generalCellForRow:indexPath.row tableView:tableView]; break;
+        case SectionApolloAI: cell = [self apolloAICellForTableView:tableView]; break;
         case SectionMedia: cell = [self mediaCellForRow:indexPath.row tableView:tableView]; break;
         case SectionSubreddits: cell = [self subredditCellForRow:indexPath.row tableView:tableView]; break;
         case SectionNotificationBackend: cell = [self notificationBackendCellForRow:indexPath.row tableView:tableView]; break;
@@ -1123,38 +1123,28 @@ typedef NS_ENUM(NSInteger, Tag) {
             cell.detailTextLabel.enabled = lgSupported;
             return cell;
         }
-        case 12: {
-            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_Gen_ApolloAI"];
-            if (!cell) {
-                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle
-                                              reuseIdentifier:@"Cell_Gen_ApolloAI"];
-                cell.selectionStyle = UITableViewCellSelectionStyleDefault;
-
-                // Keep the whole row selectable and provide an explicit
-                // disclosure-button target, so either tap path opens the screen.
-                UIButton *disclosure = [UIButton buttonWithType:UIButtonTypeSystem];
-                UIImageSymbolConfiguration *config =
-                    [UIImageSymbolConfiguration configurationWithPointSize:14 weight:UIImageSymbolWeightSemibold];
-                [disclosure setImage:[UIImage systemImageNamed:@"chevron.forward" withConfiguration:config]
-                            forState:UIControlStateNormal];
-                disclosure.frame = CGRectMake(0, 0, 32, 44);
-                disclosure.accessibilityLabel = @"Open Apollo AI Settings";
-                [disclosure addTarget:self
-                               action:@selector(apolloAISettingsTapped:)
-                     forControlEvents:UIControlEventTouchUpInside];
-                cell.accessoryView = disclosure;
-            }
-            cell.textLabel.text = @"Apollo AI";
-            cell.detailTextLabel.text = sEnableAISummaries
-                ? @"On-device AI enabled"
-                : @"On-device AI settings";
-            cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
-            cell.detailTextLabel.numberOfLines = 0;
-            cell.detailTextLabel.lineBreakMode = NSLineBreakByWordWrapping;
-            return cell;
-        }
         default: return [[UITableViewCell alloc] init];
     }
+}
+
+- (UITableViewCell *)apolloAICellForTableView:(UITableView *)tableView {
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_ApolloAI"];
+    if (!cell) {
+        // Match the standard disclosure-row behavior used by API setup and
+        // other navigable settings: UIKit owns the chevron and the full row.
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle
+                                      reuseIdentifier:@"Cell_ApolloAI"];
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+    }
+    cell.textLabel.text = @"Apollo AI Settings";
+    cell.detailTextLabel.text = sEnableAISummaries
+        ? @"On-device AI enabled"
+        : @"On-device summaries and generation settings";
+    cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+    cell.detailTextLabel.numberOfLines = 0;
+    cell.detailTextLabel.lineBreakMode = NSLineBreakByWordWrapping;
+    return cell;
 }
 
 - (UITableViewCell *)mediaCellForRow:(NSInteger)row tableView:(UITableView *)tableView {
@@ -1655,18 +1645,10 @@ typedef NS_ENUM(NSInteger, Tag) {
     }
 }
 
-- (void)apolloAISettingsTapped:(UIButton *)__unused sender {
-    [self openApolloAISettings];
-}
-
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
 
-    // Identify this disclosure by its stable cell identifier rather than
-    // reconstructing the effective row around the optional deleted-comments
-    // setting. This remains correct if General rows are reordered later.
-    UITableViewCell *selectedCell = [tableView cellForRowAtIndexPath:indexPath];
-    if ([selectedCell.reuseIdentifier isEqualToString:@"Cell_Gen_ApolloAI"]) {
+    if (indexPath.section == SectionApolloAI) {
         [self openApolloAISettings];
         return;
     }
@@ -1800,6 +1782,7 @@ typedef NS_ENUM(NSInteger, Tag) {
         if (row == kAPIKeyRowTroubleshooting || row == kAPIKeyRowSetupGuide ||
             row == kAPIKeyRowWebSessionLogin || row == kAPIKeyRowWidgetSetupCode) return YES;
     }
+    if (indexPath.section == SectionApolloAI) return YES;
     if (indexPath.section == SectionMedia) {
         NSInteger row = ApolloMediaLogicalRow(indexPath.row);
         return (row == 0 || row == 1 || row == 2 || row == 5 || row == 6 || row == 7 || row == 8 || row == 9);

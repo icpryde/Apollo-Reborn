@@ -12,6 +12,7 @@
 __BEGIN_DECLS
 os_log_t ApolloFixLog(void);
 NSString *ApolloCollectLogs(void);
+NSString *ApolloCollectAILogs(void);
 BOOL IsLiquidGlass(void);
 NSURL *ApolloURLByConvertingResolvedURLToApolloScheme(NSURL *url);
 BOOL ApolloRouteResolvedURLViaApolloScheme(NSURL *resolvedURL);
