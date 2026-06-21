@@ -931,6 +931,7 @@ static char kApolloSBWrappedKey;      // BOOL: layoutSpecBlock already wrapped
 static char kApolloSBTapTargetsKey;   // NSMutableArray on the VC (retains tap targets)
 static char kApolloSBInstalledKey;    // BOOL on the VC
 static char kApolloSBRevealedKey;     // BOOL on the VC: content already faded in (hide-until-built, anti-flash)
+static char kApolloSBCoverKey;        // strong UIView: opaque anti-flash cover faded out on reveal
 static char kApolloSBCollapseHeaderKey; // BOOL on the header node
 static char kApolloSBWidgetTitlesKey;   // NSSet<NSString*> (normalized) on the sidebar markdown node, for bio dedup
 static char kApolloSBMarkdownBlocksKey; // NSMutableArray<@[node, attrText]> on a markdown node — blocks that rendered before titles were ready
@@ -1043,17 +1044,24 @@ static void ApolloSBAddSection(UIViewController *vc, ASDisplayNode *scrollNode, 
 
 #pragma mark - Sidebar VC hook
 
-// Anti-flash: viewDidLoad hides the sidebar content (alpha 0) so Apollo's native
-// layout never paints; once our sections are installed (or a safety timeout
-// fires) we fade the composed layout in. Idempotent — only the first call reveals.
+// Anti-flash: viewDidLoad lays an OPAQUE cover (themed sidebar background) over the
+// content so Apollo's native layout never paints AND the view itself stays opaque —
+// so the navigation push slides in a solid sidebar panel rather than a see-through
+// one (which read as a glitchy transition). Once our sections are installed (or a
+// safety timeout fires) we fade the cover out, revealing the composed layout.
+// Idempotent — only the first call reveals.
 static void ApolloSBRevealSidebar(UIViewController *vc) {
     if (!vc) return;
     if ([objc_getAssociatedObject(vc, &kApolloSBRevealedKey) boolValue]) return;
     objc_setAssociatedObject(vc, &kApolloSBRevealedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     UIView *v = vc.viewIfLoaded;
-    if (!v || v.alpha >= 1.0) return; // never hidden (e.g. early-return path)
+    if (v && v.alpha < 1.0) v.alpha = 1.0; // safety: undo any legacy whole-view hide
+    UIView *cover = (UIView *)objc_getAssociatedObject(vc, &kApolloSBCoverKey);
+    objc_setAssociatedObject(vc, &kApolloSBCoverKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (![cover isKindOfClass:[UIView class]] || !cover.superview) return; // never covered (e.g. early-return path)
     [UIView animateWithDuration:0.22 delay:0 options:UIViewAnimationOptionCurveEaseOut
-                     animations:^{ v.alpha = 1.0; } completion:nil];
+                     animations:^{ cover.alpha = 0.0; }
+                     completion:^(__unused BOOL finished) { [cover removeFromSuperview]; }];
 }
 
 // Swaps the already-installed stats section's node in place (used when the async
@@ -1305,10 +1313,21 @@ static void ApolloSBTryBuild(UIViewController *vc, NSDictionary *root, NSString 
     NSMutableArray *tapTargets = [NSMutableArray array];
     objc_setAssociatedObject(self, &kApolloSBTapTargetsKey, tapTargets, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-    // Anti-flash: hide the content until our sections are built, so Apollo's native
-    // sidebar never paints under it. Reveal happens at the end of the build; a safety
-    // timeout guarantees we always fade in even if the build is delayed or fails.
-    ((UIViewController *)self).view.alpha = 0.0;
+    // Anti-flash: lay an OPAQUE cover over the content until our sections are built, so
+    // Apollo's native sidebar never paints under it. Unlike hiding the whole view
+    // (alpha 0), the view itself stays opaque, so the navigation push slides in a solid
+    // themed sidebar panel instead of a see-through one — then we fade the cover out at
+    // the end of the build (a safety timeout guarantees the reveal even if it stalls).
+    UIView *vcView = ((UIViewController *)self).view;
+    UIColor *coverBG = vcView.backgroundColor;
+    if (!coverBG || CGColorGetAlpha(coverBG.CGColor) < 0.99) coverBG = UIColor.systemBackgroundColor;
+    UIView *cover = [[UIView alloc] initWithFrame:vcView.bounds];
+    cover.backgroundColor = coverBG;
+    cover.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    cover.userInteractionEnabled = NO;
+    [vcView addSubview:cover];
+    objc_setAssociatedObject(self, &kApolloSBCoverKey, cover, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
     __weak UIViewController *weakSelf = (UIViewController *)self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         ApolloSBRevealSidebar(weakSelf);
@@ -1317,6 +1336,22 @@ static void ApolloSBTryBuild(UIViewController *vc, NSDictionary *root, NSString 
     ApolloSBFetchWidgets(subredditName, ^(NSDictionary *root) {
         ApolloSBTryBuild(weakSelf, root, subredditName, tapTargets, 0);
     });
+}
+
+- (void)viewDidLayoutSubviews {
+    %orig;
+    // Keep the anti-flash cover full-bounds and on TOP of any content nodes Apollo
+    // adds after viewDidLoad (so the native sidebar can't peek out before reveal).
+    // Cheap, no layout feedback: bringSubviewToFront/frame don't re-trigger layout.
+    if ([objc_getAssociatedObject(self, &kApolloSBRevealedKey) boolValue]) return;
+    UIView *cover = (UIView *)objc_getAssociatedObject(self, &kApolloSBCoverKey);
+    if (![cover isKindOfClass:[UIView class]] || !cover.superview) return;
+    UIView *vcView = ((UIViewController *)self).view;
+    cover.frame = vcView.bounds;
+    [vcView bringSubviewToFront:cover];
+    // If Apollo set the themed background after viewDidLoad, match it (opaque only).
+    UIColor *bg = vcView.backgroundColor;
+    if (bg && CGColorGetAlpha(bg.CGColor) > 0.99) cover.backgroundColor = bg;
 }
 
 %end
