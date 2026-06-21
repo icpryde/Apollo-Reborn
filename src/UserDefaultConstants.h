@@ -76,6 +76,13 @@ static NSString *const UDKeyTranslationSkipLanguages = @"TranslationSkipLanguage
 
 // On-device AI summaries (Apple FoundationModels, iOS 26+). Off by default.
 static NSString *const UDKeyEnableAISummaries = @"EnableAISummaries";
+// Sub-toggles, only meaningful while EnableAISummaries is on. Both default ON, so
+// turning the master on keeps the original behaviour (post + comment summaries).
+static NSString *const UDKeyEnableAIPostSummaries = @"EnableAIPostSummaries";       // post / link / both
+static NSString *const UDKeyEnableAICommentSummaries = @"EnableAICommentSummaries"; // discussion
+// When on, summaries are generated only when the user taps the card (rather than
+// automatically on open). Off by default. Cached summaries still show instantly.
+static NSString *const UDKeyEnableTapToSummarize = @"EnableTapToSummarize";
 
 // Tag filters (NSFW / Spoiler) — hide or blur posts in the feed based on
 // Reddit's built-in tags. Brand Affiliate is intentionally absent because

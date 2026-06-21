@@ -131,14 +131,36 @@ static ApolloFoundationModels *ApolloAIBridge(void) {
 
 // Keep prompts well within the on-device model's context window.
 static const NSUInteger kApolloAIMaxPostChars = 1400;
+// Below this many words a post body isn't worth summarizing: the 2-sentence
+// summary would be nearly as long as the post itself. Gates the post summary so
+// one- or two-sentence posts get no card at all.
+static const NSUInteger kApolloAIMinPostWords = 50;
 static const NSUInteger kApolloAIMinComments = 5;
 static const NSUInteger kApolloAIMinCommentChars = 500;
-static const NSUInteger kApolloAIMaxCommentChars = 1200;
-static const NSUInteger kApolloAIMaxComments = 8;
-static const NSUInteger kApolloAIMaxSingleCommentChars = 280;
+// The discussion summary is generated ONCE per page open, so we can afford to
+// feed it a richer representative set for a better consensus on large threads.
+// These caps stay well inside the on-device model's context window (~4k tokens);
+// the comments are ranked first (score / OP / controversiality / depth) and the
+// top ones up to these caps are used, so big threads still distil to a consensus.
+static const NSUInteger kApolloAIMaxCommentChars = 3000;
+static const NSUInteger kApolloAIMaxComments = 16;
+static const NSUInteger kApolloAIMaxSingleCommentChars = 300;
 static const NSInteger kApolloAIPostResponseTokens = 80;
-static const NSInteger kApolloAICommentResponseTokens = 80;
-static const NSTimeInterval kApolloAIGenerationTimeout = 20.0;
+// A touch more room than the post summary: the discussion has more ground to
+// cover (consensus + a dissent), and 80 tokens was clipping the last sentence.
+static const NSInteger kApolloAICommentResponseTokens = 110;
+// The iOS Simulator runs FoundationModels on the CPU/GPU *without* the Neural
+// Engine, so on-device generation is several times slower than real hardware —
+// a busy thread (big post body + a dozen comments, post and discussion racing
+// for the same model) can take 30s+ and would spuriously "time out" in the sim
+// even though the identical request finishes in a few seconds on a device. Give
+// the sim generous headroom; keep the device timeout tight, since a request that
+// genuinely takes 30s on hardware is stuck, not slow.
+#if APOLLO_SIM_BUILD
+static const NSTimeInterval kApolloAIGenerationTimeout = 90.0;
+#else
+static const NSTimeInterval kApolloAIGenerationTimeout = 30.0;
+#endif
 static NSString *const kApolloAICacheVersion = @"2";
 
 static NSString *const kApolloAIPostInstructions =
@@ -150,11 +172,49 @@ static NSString *const kApolloAICommentInstructions =
     @"consensus, useful details, and one notable disagreement if present. "
     @"Summarize commenters, not the post. No heading, Markdown, or added facts.";
 
+// Link/article summaries: for an external-article link post we fetch the linked
+// page, extract its readable prose, and summarize it in the post box (titled
+// "Link summary"). Article prose is larger than a Reddit post, so it gets its own
+// input cap and a touch more output room; still well inside the model's window.
+static const NSUInteger kApolloAIMaxArticleChars = 3000;
+static const NSInteger kApolloAIArticleResponseTokens = 110;
+static const NSUInteger kApolloAIArticleFetchMaxBytes = 3 * 1024 * 1024;  // ignore huge pages
+static const NSTimeInterval kApolloAIArticleFetchTimeout = 15.0;
+
+static NSString *const kApolloAIArticleInstructions =
+    @"Summarize this linked news article in 2-3 short plain sentences. State the "
+    @"main topic and the key facts or points it reports. Summarize the article "
+    @"itself, not website navigation or ads. No heading, Markdown, or added facts.";
+
+// When a post has BOTH body text AND a linked article, summarize them together.
+static const NSInteger kApolloAIBothResponseTokens = 150;
+static NSString *const kApolloAIBothInstructions =
+    @"You are given a Reddit post and the article it links to. Summarize BOTH "
+    @"together in 3-4 short plain sentences: the post's point and the article's "
+    @"key facts. No heading, Markdown, or added facts.";
+
 #pragma mark - Per-session caches / in-flight guard
 
 // fullName -> generated summary text. Survives re-opening the same thread.
 static NSMutableDictionary<NSString *, NSString *> *sPostSummaryCache;
 static NSMutableDictionary<NSString *, NSString *> *sCommentSummaryCache;
+// Link/article summaries reuse the post box. sLinkSummaryPosts marks which posts
+// are currently showing a LINK summary (vs a self-text post summary) so the title
+// and layout position differ. sArticleTextCache memoises fetched+extracted
+// article text per post for the session, so a concurrency retry doesn't re-fetch.
+static NSMutableSet<NSString *> *sLinkSummaryPosts;
+static NSMutableSet<NSString *> *sBothSummaryPosts;   // post box shows a combined post+article summary
+// fullName -> the mode the CACHED post summary was generated under. Persisted so a
+// cached summary is never reused under a different mode — e.g. a post-only summary
+// must not be shown once the post is later detected as "both". Old caches lacking
+// this default to Post(0); a Link/Both post then mismatches and regenerates.
+typedef NS_ENUM(NSInteger, ApolloAIPostMode) {
+    ApolloAIPostModePost = 0,   // self-text post summary
+    ApolloAIPostModeLink = 1,   // external article only
+    ApolloAIPostModeBoth = 2,   // post body + article
+};
+static NSMutableDictionary<NSString *, NSNumber *> *sPostSummaryMode;
+static NSMutableDictionary<NSString *, NSString *> *sArticleTextCache;
 static NSMutableDictionary<NSString *, NSNumber *> *sCommentSummarySourceCounts;
 static NSMutableDictionary<NSString *, NSString *> *sCommentSummarySignatures;
 // fullNames whose post / comment generation is currently running, so we don't
@@ -181,6 +241,10 @@ static NSMutableSet<NSString *> *sCommentGenerationScheduled;
 static NSMutableSet<NSString *> *sPostFailed;
 static NSMutableSet<NSString *> *sCommentFailed;
 static NSMutableSet<NSString *> *sTimedOutRequests;
+// "post|fullName" / "comment|fullName" keys for boxes the user TAPPED to generate
+// while Tap-to-Summarize is on. The generation pass consumes the marker and
+// proceeds instead of showing the idle "Tap to summarize" prompt.
+static NSMutableSet<NSString *> *sTapRequested;
 
 #pragma mark - Disk persistence (summaries survive app relaunches)
 
@@ -219,8 +283,10 @@ static void ApolloAILoadPersistedSummaries(void) {
     NSDictionary *comment = root[@"comment"];
     NSDictionary *sourceCounts = root[@"commentSourceCounts"];
     NSDictionary *signatures = root[@"commentSignatures"];
+    NSDictionary *postModes = root[@"postModes"];
     if ([post isKindOfClass:[NSDictionary class]]) [sPostSummaryCache addEntriesFromDictionary:post];
     if ([comment isKindOfClass:[NSDictionary class]]) [sCommentSummaryCache addEntriesFromDictionary:comment];
+    if ([postModes isKindOfClass:[NSDictionary class]]) [sPostSummaryMode addEntriesFromDictionary:postModes];
     if ([sourceCounts isKindOfClass:[NSDictionary class]]) [sCommentSummarySourceCounts addEntriesFromDictionary:sourceCounts];
     if ([signatures isKindOfClass:[NSDictionary class]]) [sCommentSummarySignatures addEntriesFromDictionary:signatures];
     ApolloLog(@"[AISummary] loaded %lu post / %lu comment summaries from disk",
@@ -234,6 +300,7 @@ static void ApolloAIPersistSummaries(void) {
     NSDictionary *commentSnapshot = [sCommentSummaryCache copy];
     NSDictionary *sourceCountSnapshot = [sCommentSummarySourceCounts copy];
     NSDictionary *signatureSnapshot = [sCommentSummarySignatures copy];
+    NSDictionary *postModeSnapshot = [sPostSummaryMode copy];
     dispatch_async(ApolloAIPersistQueue(), ^{
         NSMutableDictionary *post = [postSnapshot mutableCopy];
         NSMutableDictionary *comment = [commentSnapshot mutableCopy];
@@ -246,6 +313,7 @@ static void ApolloAIPersistSummaries(void) {
             @"comment": comment,
             @"commentSourceCounts": sourceCountSnapshot,
             @"commentSignatures": signatureSnapshot,
+            @"postModes": postModeSnapshot ?: @{},
         };
         [root writeToFile:ApolloAISummariesCachePath() atomically:YES];
     });
@@ -256,6 +324,10 @@ static void ApolloAIEnsureState(void) {
     dispatch_once(&once, ^{
         sPostSummaryCache = [NSMutableDictionary dictionary];
         sCommentSummaryCache = [NSMutableDictionary dictionary];
+        sLinkSummaryPosts = [NSMutableSet set];
+        sBothSummaryPosts = [NSMutableSet set];
+        sPostSummaryMode = [NSMutableDictionary dictionary];
+        sArticleTextCache = [NSMutableDictionary dictionary];
         sCommentSummarySourceCounts = [NSMutableDictionary dictionary];
         sCommentSummarySignatures = [NSMutableDictionary dictionary];
         sPostInFlight = [NSMutableSet set];
@@ -271,8 +343,19 @@ static void ApolloAIEnsureState(void) {
         sPostFailed = [NSMutableSet set];
         sCommentFailed = [NSMutableSet set];
         sTimedOutRequests = [NSMutableSet set];
+        sTapRequested = [NSMutableSet set];
         ApolloAILoadPersistedSummaries();
     });
+}
+
+// The post box's current mode for this post, derived from the classification
+// flags set in ApolloAIGenerateForController. Used to validate the cache: a cached
+// summary is only reused if it was generated under the same mode.
+static NSInteger ApolloAIDesiredPostMode(NSString *fullName) {
+    if (fullName.length == 0) return ApolloAIPostModePost;
+    if ([sBothSummaryPosts containsObject:fullName]) return ApolloAIPostModeBoth;
+    if ([sLinkSummaryPosts containsObject:fullName]) return ApolloAIPostModeLink;
+    return ApolloAIPostModePost;
 }
 
 #pragma mark - Runtime helpers (self-contained; mirror ApolloTranslation patterns)
@@ -583,7 +666,8 @@ static void ApolloAICaptureCommentForController(id comment, UIViewController *vc
     [comments addObject:comment];
     // Do not show a discussion card until there is enough material to synthesize.
     // Below this threshold, reading the comments directly is faster and clearer.
-    if (comments.count >= kApolloAIMinComments &&
+    if (sEnableAICommentSummaries && !sEnableTapToSummarize &&
+        comments.count >= kApolloAIMinComments &&
         sCommentSummaryCache[fullName].length == 0 &&
         ![sCommentFailed containsObject:fullName]) {
         ApolloAIShowLoadingIfIdle(fullName, NO);
@@ -761,7 +845,19 @@ static NSString *ApolloAIGatherCommentText(UIViewController *vc,
     return joined;
 }
 
-// Title + selftext for the post, or nil for non-self (link/image) posts.
+// Number of whitespace-delimited words in (already-cleaned) text.
+static NSUInteger ApolloAIWordCount(NSString *text) {
+    if (text.length == 0) return 0;
+    NSUInteger words = 0;
+    for (NSString *piece in [text componentsSeparatedByCharactersInSet:
+                             [NSCharacterSet whitespaceAndNewlineCharacterSet]]) {
+        if (piece.length > 0) words++;
+    }
+    return words;
+}
+
+// Title + selftext for the post, or nil for non-self (link/image) posts or
+// bodies too short to be worth summarizing.
 static NSString *ApolloAIPostText(id link) {
     if (!link) return nil;
     BOOL isSelf = [link respondsToSelector:@selector(isSelfPostWithSelfText)] &&
@@ -774,6 +870,13 @@ static NSString *ApolloAIPostText(id link) {
     selfText = ApolloAICleanInputText(selfText, kApolloAIMaxPostChars) ?: @"";
 
     if (selfText.length == 0) return nil;  // nothing meaningful to summarize
+
+    // Skip trivially short bodies. Summarizing one or two sentences yields a
+    // "summary" about as long as the post — pointless, and (per user feedback)
+    // it cluttered short posts with a redundant card. Gate on the body's word
+    // count, not the title's: a long title shouldn't license summarizing a
+    // one-line body.
+    if (ApolloAIWordCount(selfText) < kApolloAIMinPostWords) return nil;
 
     if (title.length > 0) return [NSString stringWithFormat:@"Title: %@\nBody: %@", title, selfText];
     return selfText;
@@ -802,16 +905,282 @@ static NSString *ApolloAIPostContextForComments(id link) {
     return context;
 }
 
+#pragma mark - Link/article summaries: detection, fetch, extraction
+
+// URL-level article test: http(s), not a direct media file, not a blocklisted
+// reddit/media/social host. Shared by pure-link detection and the selftext scan.
+static BOOL ApolloAIURLIsArticleCandidate(NSURL *url) {
+    if (![url isKindOfClass:[NSURL class]]) return NO;
+    NSString *scheme = url.scheme.lowercaseString ?: @"";
+    if (![scheme isEqualToString:@"http"] && ![scheme isEqualToString:@"https"]) return NO;
+
+    // Direct media/file URLs.
+    NSString *ext = url.pathExtension.lowercaseString ?: @"";
+    static NSSet *mediaExts;
+    static dispatch_once_t extOnce;
+    dispatch_once(&extOnce, ^{
+        mediaExts = [NSSet setWithObjects:@"jpg", @"jpeg", @"png", @"gif", @"gifv", @"webp",
+                     @"bmp", @"mp4", @"webm", @"mov", @"m4v", @"mp3", @"pdf", nil];
+    });
+    if ([mediaExts containsObject:ext]) return NO;
+
+    // Host blocklist: reddit-internal, media hosts, and platforms whose pages are
+    // JS-rendered / login-gated and yield no useful article prose.
+    NSString *host = url.host.lowercaseString ?: @"";
+    if ([host hasPrefix:@"www."]) host = [host substringFromIndex:4];
+    if ([host hasPrefix:@"m."]) host = [host substringFromIndex:2];
+    static NSArray *blocked;
+    static dispatch_once_t hostOnce;
+    dispatch_once(&hostOnce, ^{
+        // Registrable domains only — the matcher below also catches any subdomain
+        // (e.g. "twitch.tv" covers clips.twitch.tv; "redd.it" covers v.redd.it).
+        // The runtime "no prose -> hide" fallback covers anything not listed here
+        // (these clip hosts rotate domains/TLDs faster than a list can track).
+        blocked = @[
+            // Reddit-internal + Reddit media (Apollo renders these natively)
+            @"reddit.com", @"redd.it", @"redditmedia.com",
+            // Image / GIF / screenshot hosts — no article prose
+            @"imgur.com", @"giphy.com", @"tenor.com", @"redgifs.com", @"gfycat.com",
+            @"imgchest.com", @"flickr.com", @"ibb.co", @"postimg.cc", @"postimages.org",
+            @"imgbb.com", @"prnt.sc", @"gyazo.com", @"imgflip.com",
+            // Video / short-clip hosts (r/soccer goal clips etc.) — player-only pages
+            @"youtube.com", @"youtu.be", @"twitch.tv", @"streamable.com", @"streamja.com",
+            @"streamff.com", @"streamff.pro", @"streamff.live", @"streamff.io", @"streamff.net",
+            @"streamff.co", @"streamin.one", @"streamin.me", @"streamin.link", @"streamye.com",
+            @"streamwo.com", @"streamgg.com", @"streamvi.com", @"dubz.co", @"dubz.link",
+            @"dubz.cc", @"dubz.one", @"dropr.co", @"sendvid.com", @"clippituser.tv",
+            @"imgtc.com", @"streamtape.com", @"doodstream.com", @"vidoza.net", @"qu.ax",
+            @"juststream.live", @"vidlii.com", @"fb.watch",
+            // Social / micro-post platforms — content is self-contained + already
+            // shown inline, and the pages are JS-rendered SPAs with no article body
+            @"twitter.com", @"x.com", @"t.co", @"twimg.com", @"fixupx.com", @"fxtwitter.com",
+            @"vxtwitter.com", @"nitter.net", @"bsky.app", @"bsky.social", @"threads.com",
+            @"threads.net", @"instagram.com", @"tiktok.com", @"facebook.com", @"fb.com",
+            @"tumblr.com", @"weibo.com", @"weibo.cn", @"vk.com", @"truthsocial.com",
+            @"mastodon.social", @"mastodon.online", @"discordapp.com",
+        ];
+    });
+    for (NSString *b in blocked) {
+        if ([host isEqualToString:b] || [host hasSuffix:[@"." stringByAppendingString:b]]) return NO;
+    }
+    return YES;
+}
+
+// YES if `link`'s RDKLink.URL is an external article — not an image/gif/video/
+// gallery, not a crosspost, not a reddit-internal or media host. RDKLink.URL is a
+// real ObjC NSURL property, safe to read directly.
+//
+// NOTE: we deliberately do NOT bail on self-posts. A "link + text" post is a
+// self-post (it has selftext) whose URL still points at an external article — that
+// should be treated as an article (→ a Both summary). A PURE self-post's URL is
+// just its own reddit.com permalink, which the host blocklist below rejects, so
+// checking the URL for self-posts too is safe.
+static BOOL ApolloAILinkIsArticle(id link) {
+    if (!link) return NO;
+
+    NSURL *url = nil;
+    if ([link respondsToSelector:@selector(URL)]) {
+        url = ((NSURL *(*)(id, SEL))objc_msgSend)(link, @selector(URL));
+    }
+    if (![url isKindOfClass:[NSURL class]]) return NO;
+
+    // Media posts → no article prose to extract.
+    if ([link respondsToSelector:@selector(mediaVideo)] &&
+        ((id (*)(id, SEL))objc_msgSend)(link, @selector(mediaVideo))) return NO;
+    if ([link respondsToSelector:@selector(galleryData)]) {
+        id gallery = ((id (*)(id, SEL))objc_msgSend)(link, @selector(galleryData));
+        if ([gallery isKindOfClass:[NSArray class]] && [(NSArray *)gallery count] > 0) return NO;
+    }
+    if ([link respondsToSelector:@selector(crosspostParent)] &&
+        ((id (*)(id, SEL))objc_msgSend)(link, @selector(crosspostParent))) return NO;
+
+    // post_hint that marks non-article content.
+    NSString *hint = ApolloAIStringSel(link, @selector(hint)).lowercaseString;
+    if (hint.length > 0 &&
+        ([hint isEqualToString:@"image"] || [hint isEqualToString:@"hosted:video"] ||
+         [hint isEqualToString:@"rich:video"] || [hint isEqualToString:@"gallery"] ||
+         [hint isEqualToString:@"animated_gif"])) return NO;
+
+    return ApolloAIURLIsArticleCandidate(url);
+}
+
+// First external-article URL inside a SELF post's body, or nil. Lets a thin
+// self-post that's really "just sharing a link" get a Link summary of the article
+// instead of a near-empty post summary.
+static NSString *ApolloAIFirstArticleURLInSelfText(id link) {
+    BOOL isSelf = [link respondsToSelector:@selector(isSelfPostWithSelfText)] &&
+        ((BOOL (*)(id, SEL))objc_msgSend)(link, @selector(isSelfPostWithSelfText));
+    if (!isSelf) return nil;
+    NSString *selfText = ApolloAIStringSel(link, @selector(selfText));
+    if (selfText.length == 0) return nil;
+
+    NSMutableArray<NSString *> *candidates = [NSMutableArray array];
+    // Markdown links [text](url) first — the explicit "here's the article" shares.
+    NSRegularExpression *md = [NSRegularExpression regularExpressionWithPattern:@"\\]\\((https?://[^)\\s]+)\\)" options:0 error:nil];
+    for (NSTextCheckingResult *m in [md matchesInString:selfText options:0 range:NSMakeRange(0, selfText.length)]) {
+        [candidates addObject:[selfText substringWithRange:[m rangeAtIndex:1]]];
+    }
+    // Then any bare URLs.
+    NSRegularExpression *bare = [NSRegularExpression regularExpressionWithPattern:@"https?://[^\\s)\\]]+" options:0 error:nil];
+    for (NSTextCheckingResult *m in [bare matchesInString:selfText options:0 range:NSMakeRange(0, selfText.length)]) {
+        [candidates addObject:[selfText substringWithRange:m.range]];
+    }
+    NSCharacterSet *trail = [NSCharacterSet characterSetWithCharactersInString:@".,;:)]\"'"];
+    for (NSString *cand in candidates) {
+        NSString *trimmed = [cand stringByTrimmingCharactersInSet:trail];
+        if (ApolloAIURLIsArticleCandidate([NSURL URLWithString:trimmed])) return trimmed;
+    }
+    return nil;
+}
+
+// The external article URL associated with this post, or nil. A pure link post
+// uses its own URL; a self-post uses the first article link found in its body.
+// Returned regardless of how much body text there is — the caller decides the
+// mode: no body -> Link summary; body present -> Both (post + article) summary.
+static NSString *ApolloAIArticleURLForPost(id link) {
+    if (ApolloAILinkIsArticle(link)) {
+        NSURL *url = ((NSURL *(*)(id, SEL))objc_msgSend)(link, @selector(URL));
+        if ([url isKindOfClass:[NSURL class]]) return url.absoluteString;
+    }
+    return ApolloAIFirstArticleURLInSelfText(link);
+}
+
+// Decode the HTML entities that show up in article prose. Self-contained (the
+// link-preview fetcher's decoders are file-static and not linkable from here).
+static NSString *ApolloAIDecodeHTMLEntities(NSString *s) {
+    if (s.length == 0 || [s rangeOfString:@"&"].location == NSNotFound) return s;
+    NSDictionary *named = @{
+        @"&nbsp;": @" ", @"&lt;": @"<", @"&gt;": @">", @"&quot;": @"\"",
+        @"&#39;": @"'", @"&apos;": @"'", @"&lsquo;": @"‘", @"&rsquo;": @"’",
+        @"&ldquo;": @"“", @"&rdquo;": @"”", @"&ndash;": @"–",
+        @"&mdash;": @"—", @"&hellip;": @"…",
+    };
+    for (NSString *k in named) s = [s stringByReplacingOccurrencesOfString:k withString:named[k]];
+    // Numeric decimal entities (&#160; etc.).
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"&#(\\d{2,7});" options:0 error:nil];
+    NSArray<NSTextCheckingResult *> *matches = [re matchesInString:s options:0 range:NSMakeRange(0, s.length)];
+    if (matches.count > 0) {
+        NSMutableString *out = [s mutableCopy];
+        for (NSTextCheckingResult *m in matches.reverseObjectEnumerator) {
+            NSInteger code = [[s substringWithRange:[m rangeAtIndex:1]] integerValue];
+            if (code > 31 && code <= 0x10FFFF) {
+                UTF32Char cp = (UTF32Char)code;
+                NSString *rep = [[NSString alloc] initWithBytes:&cp length:sizeof(cp)
+                                                       encoding:NSUTF32LittleEndianStringEncoding];
+                if (rep) [out replaceCharactersInRange:m.range withString:rep];
+            }
+        }
+        s = out;
+    }
+    return [s stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"];
+}
+
+// A small readability pass: drop non-content regions, prefer the <article>/<main>
+// region, pull paragraph prose, decode entities, collapse whitespace, cap length.
+static NSString *ApolloAIExtractArticleText(NSString *html) {
+    if (html.length == 0) return nil;
+    // Bound regex cost; an article's content sits near the top of the document.
+    if (html.length > 600000) html = [html substringToIndex:600000];
+
+    NSRegularExpressionOptions dotAll =
+        NSRegularExpressionCaseInsensitive | NSRegularExpressionDotMatchesLineSeparators;
+
+    NSRegularExpression *noise = [NSRegularExpression regularExpressionWithPattern:
+        @"<(script|style|noscript|template|svg|head|nav|header|footer|aside|form|figure)\\b[^>]*>.*?</\\1>"
+        options:dotAll error:nil];
+    NSString *s = [noise stringByReplacingMatchesInString:html options:0
+                                                    range:NSMakeRange(0, html.length) withTemplate:@" "];
+
+    // Narrow to the main article region if the page marks one.
+    NSString *scope = s;
+    for (NSString *tag in @[@"article", @"main"]) {
+        NSRegularExpression *open = [NSRegularExpression regularExpressionWithPattern:
+            [NSString stringWithFormat:@"<%@\\b[^>]*>", tag] options:NSRegularExpressionCaseInsensitive error:nil];
+        NSTextCheckingResult *o = [open firstMatchInString:s options:0 range:NSMakeRange(0, s.length)];
+        if (!o) continue;
+        NSUInteger start = NSMaxRange(o.range);
+        NSRange close = [s rangeOfString:[NSString stringWithFormat:@"</%@>", tag]
+                                 options:(NSCaseInsensitiveSearch | NSBackwardsSearch)
+                                   range:NSMakeRange(start, s.length - start)];
+        NSUInteger end = (close.location != NSNotFound) ? close.location : s.length;
+        if (end > start) { scope = [s substringWithRange:NSMakeRange(start, end - start)]; break; }
+    }
+
+    // Articles put body text in <p> tags; menus/chrome rarely do.
+    NSMutableString *prose = [NSMutableString string];
+    NSRegularExpression *pRe = [NSRegularExpression regularExpressionWithPattern:@"<p\\b[^>]*>(.*?)</p>" options:dotAll error:nil];
+    NSRegularExpression *tagRe = [NSRegularExpression regularExpressionWithPattern:@"<[^>]+>" options:0 error:nil];
+    for (NSTextCheckingResult *m in [pRe matchesInString:scope options:0 range:NSMakeRange(0, scope.length)]) {
+        NSString *frag = [scope substringWithRange:[m rangeAtIndex:1]];
+        frag = [tagRe stringByReplacingMatchesInString:frag options:0 range:NSMakeRange(0, frag.length) withTemplate:@" "];
+        frag = [ApolloAIDecodeHTMLEntities(frag) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (frag.length >= 40) [prose appendFormat:@"%@\n", frag];
+        if (prose.length >= kApolloAIMaxArticleChars) break;
+    }
+
+    NSString *text = prose;
+    if (text.length < 200) {
+        // Fallback: strip every tag from the scope.
+        NSString *stripped = [tagRe stringByReplacingMatchesInString:scope options:0
+                                                               range:NSMakeRange(0, scope.length) withTemplate:@" "];
+        text = ApolloAIDecodeHTMLEntities(stripped);
+    }
+
+    NSRegularExpression *ws = [NSRegularExpression regularExpressionWithPattern:@"\\s+" options:0 error:nil];
+    text = [ws stringByReplacingMatchesInString:text options:0 range:NSMakeRange(0, text.length) withTemplate:@" "];
+    text = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (text.length == 0) return nil;
+    if (text.length > kApolloAIMaxArticleChars) text = [text substringToIndex:kApolloAIMaxArticleChars];
+    return text;
+}
+
+// Fetch the article URL off-thread and hand extracted prose back on the MAIN thread.
+static void ApolloAIFetchArticleText(NSString *urlString, void (^completion)(NSString *text, NSError *error)) {
+    NSURL *url = urlString.length > 0 ? [NSURL URLWithString:urlString] : nil;
+    if (!url) {
+        if (completion) dispatch_async(dispatch_get_main_queue(), ^{
+            completion(nil, [NSError errorWithDomain:@"ApolloAIArticle" code:400 userInfo:nil]);
+        });
+        return;
+    }
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url
+        cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:kApolloAIArticleFetchTimeout];
+    // A real browser UA — some publishers serve a stub to non-browser agents.
+    [req setValue:@"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+        forHTTPHeaderField:@"User-Agent"];
+    [req setValue:@"text/html,application/xhtml+xml,*/*;q=0.8" forHTTPHeaderField:@"Accept"];
+
+    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req
+        completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+            NSString *text = nil;
+            NSError *outErr = error;
+            NSHTTPURLResponse *http = [response isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)response : nil;
+            if (!error && http && http.statusCode >= 200 && http.statusCode < 300 &&
+                data.length > 0 && data.length <= kApolloAIArticleFetchMaxBytes) {
+                NSString *html = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+                if (!html) html = [[NSString alloc] initWithData:data encoding:NSISOLatin1StringEncoding];
+                if (html) text = ApolloAIExtractArticleText(html);
+            } else if (!error && http && (http.statusCode < 200 || http.statusCode >= 300)) {
+                outErr = [NSError errorWithDomain:@"ApolloAIArticle" code:http.statusCode userInfo:nil];
+            }
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (completion) completion(text, text.length > 0 ? nil : (outErr ?: [NSError errorWithDomain:@"ApolloAIArticle" code:204 userInfo:nil]));
+            });
+        }];
+    [task resume];
+}
+
 #pragma mark - Summary UI
 
 // Per-box lifecycle state. The summary cards are always visible (in their
 // loading state) the moment we know a box applies, rather than popping in when
 // the text is ready; failures show an error inside the box instead of hiding it.
 typedef NS_ENUM(NSInteger, ApolloAIBoxState) {
-    ApolloAIBoxStateNone = 0,   // no box for this type (e.g. link post / no comments)
-    ApolloAIBoxStateLoading,    // box visible, generating (shows streamed text or "Summarizing…")
-    ApolloAIBoxStateReady,      // box visible, final summary shown
-    ApolloAIBoxStateError,      // box visible, error message shown
+    ApolloAIBoxStateNone = 0,        // no box for this type (e.g. link post / no comments)
+    ApolloAIBoxStateLoading,         // box visible, generating (shows streamed text or "Summarizing…")
+    ApolloAIBoxStateReady,           // box visible, final summary shown
+    ApolloAIBoxStateError,           // box visible, error message shown
+    ApolloAIBoxStateTapToSummarize,  // box visible, idle — waiting for the user to tap to generate
 };
 
 static char kApolloAIPostSummaryKey;        // ready/streamed summary text (post)
@@ -928,6 +1297,9 @@ static NSAttributedString *ApolloAISummaryAttributedText(NSString *title,
     if (!expanded && state == ApolloAIBoxStateLoading) {
         [result appendAttributedString:[[NSAttributedString alloc] initWithString:@"  ·  Summarizing…"
                                                                        attributes:chevronAttributes]];
+    } else if (!expanded && state == ApolloAIBoxStateTapToSummarize) {
+        [result appendAttributedString:[[NSAttributedString alloc] initWithString:@"  ·  Tap to summarize"
+                                                                       attributes:chevronAttributes]];
     }
 
     // Trailing disclosure chevron.
@@ -947,7 +1319,9 @@ static NSAttributedString *ApolloAISummaryAttributedText(NSString *title,
     // placeholder; ready shows the summary + a trust caption; error shows the
     // message in the warning color.
     NSString *body = bodyText;
-    if (state == ApolloAIBoxStateLoading && body.length == 0) {
+    if (state == ApolloAIBoxStateTapToSummarize) {
+        body = isPost ? @"Tap to summarize this post." : @"Tap to summarize the discussion.";
+    } else if (state == ApolloAIBoxStateLoading && body.length == 0) {
         body = isPost ? @"Summarizing…" : @"Summarizing discussion…";
     } else if (state == ApolloAIBoxStateError && body.length == 0) {
         body = @"Couldn't generate this summary.";
@@ -1037,7 +1411,20 @@ static void ApolloAIRenderSummaryNode(id headerNode, BOOL isPost) {
     NSString *fullName = objc_getAssociatedObject(headerNode, &kApolloAIHeaderFullNameKey);
     NSUInteger sourceCount = isPost ? 0 : [sCommentSummarySourceCounts[fullName] unsignedIntegerValue];
     ASTextNode *textNode = ApolloAIEnsureSummaryNode(headerNode, isPost);
-    NSString *title = isPost ? @"Post summary" : @"Discussion so far";
+    NSString *title;
+    if (isPost) {
+        // The post box shows one of three titles depending on what was summarized:
+        // the post body, an external article, or both together.
+        if (fullName.length > 0 && [sBothSummaryPosts containsObject:fullName]) {
+            title = @"Post & link summary";
+        } else if (fullName.length > 0 && [sLinkSummaryPosts containsObject:fullName]) {
+            title = @"Link summary";
+        } else {
+            title = @"Post summary";
+        }
+    } else {
+        title = @"Discussion so far";
+    }
     textNode.attributedText = ApolloAISummaryAttributedText(
         title, state, body, expanded, isPost, sourceCount, ApolloAISummaryThemeAccent(headerNode));
 
@@ -1294,46 +1681,96 @@ static id ApolloAISummaryLayoutSpec(id textNode, id backgroundNode) {
                                            child:card];
 }
 
+// Rebuild a stack spec with new children, preserving its layout attributes.
+static ASStackLayoutSpec *ApolloAIRebuildStack(ASStackLayoutSpec *stack, NSArray *children) {
+    Class stackClass = NSClassFromString(@"ASStackLayoutSpec");
+    ASStackLayoutSpec *s = [stackClass stackLayoutSpecWithDirection:stack.direction
+                                                            spacing:stack.spacing
+                                                     justifyContent:stack.justifyContent
+                                                         alignItems:stack.alignItems
+                                                           children:children];
+    s.flexWrap = stack.flexWrap;
+    s.alignContent = stack.alignContent;
+    s.lineSpacing = stack.lineSpacing;
+    return s;
+}
+
+// Insert the post/link/both summary spec at the right spot, recursing into nested
+// stacks. Preference: directly AFTER the inline link-preview card (LinkButtonNode)
+// — for a link/both post that puts the summary between the preview and the body;
+// for a plain text post (no preview) just before the body MarkdownNode. Self-posts
+// wrap their content (preview + body) in a nested ASStackLayoutSpec, so we must
+// descend to find the anchor rather than only scanning the top level. Returns a
+// rebuilt stack, or nil if no anchor was found anywhere.
+static ASStackLayoutSpec *ApolloAIInsertPostSummary(ASStackLayoutSpec *stack, id spec, NSUInteger depth) {
+    Class stackClass = NSClassFromString(@"ASStackLayoutSpec");
+    if (![stack isKindOfClass:stackClass] || depth > 4) return nil;
+    Class linkButtonClass = NSClassFromString(@"_TtC6Apollo14LinkButtonNode");
+    Class markdownClass = NSClassFromString(@"_TtC6Apollo12MarkdownNode");
+    NSArray *children = stack.children ?: @[];
+
+    // 1) Directly below the inline link-preview card.
+    for (NSUInteger i = 0; i < children.count; i++) {
+        id c = children[i];
+        if ((linkButtonClass && [c isKindOfClass:linkButtonClass]) ||
+            [NSStringFromClass([c class]) isEqualToString:@"Apollo.LinkButtonNode"]) {
+            NSMutableArray *m = [children mutableCopy];
+            [m insertObject:spec atIndex:i + 1];
+            return ApolloAIRebuildStack(stack, m);
+        }
+    }
+    // 2) Just before the body markdown (plain text post: between title and body).
+    for (NSUInteger i = 0; i < children.count; i++) {
+        id c = children[i];
+        if ((markdownClass && [c isKindOfClass:markdownClass]) ||
+            [NSStringFromClass([c class]) isEqualToString:@"Apollo.MarkdownNode"]) {
+            NSMutableArray *m = [children mutableCopy];
+            [m insertObject:spec atIndex:i];
+            return ApolloAIRebuildStack(stack, m);
+        }
+    }
+    // 3) Descend into a nested content stack and splice the rebuilt child back in.
+    for (NSUInteger i = 0; i < children.count; i++) {
+        id c = children[i];
+        if ([c isKindOfClass:stackClass]) {
+            ASStackLayoutSpec *rebuilt = ApolloAIInsertPostSummary((ASStackLayoutSpec *)c, spec, depth + 1);
+            if (rebuilt) {
+                NSMutableArray *m = [children mutableCopy];
+                m[i] = rebuilt;
+                return ApolloAIRebuildStack(stack, m);
+            }
+        }
+    }
+    return nil;
+}
+
 static ASStackLayoutSpec *ApolloAICloneStackWithSummaries(ASStackLayoutSpec *originalStack,
                                                           id postSummarySpec,
                                                           id discussionSummarySpec) {
     if (!originalStack || (!postSummarySpec && !discussionSummarySpec)) return nil;
-    Class stackClass = NSClassFromString(@"ASStackLayoutSpec");
-    NSMutableArray *children = [NSMutableArray arrayWithArray:originalStack.children ?: @[]];
+    ASStackLayoutSpec *working = originalStack;
 
     if (postSummarySpec) {
-        // Apollo's self-post header is:
-        // PostTitleNode -> MarkdownNode -> PostInfoNode -> actions/separators.
-        // Insert directly before MarkdownNode so the summary sits between the
-        // title/flair and the original post body.
-        NSUInteger bodyIndex = NSNotFound;
-        Class markdownClass = NSClassFromString(@"_TtC6Apollo12MarkdownNode");
-        for (NSUInteger i = 0; i < children.count; i++) {
-            id child = children[i];
-            if ((markdownClass && [child isKindOfClass:markdownClass]) ||
-                [NSStringFromClass([child class]) isEqualToString:@"Apollo.MarkdownNode"]) {
-                bodyIndex = i;
-                break;
-            }
+        ASStackLayoutSpec *rebuilt = ApolloAIInsertPostSummary(working, postSummarySpec, 0);
+        if (rebuilt) {
+            working = rebuilt;
+        } else {
+            // No preview/body anchor anywhere — place near the top, after the title.
+            NSMutableArray *m = [working.children ?: @[] mutableCopy];
+            [m insertObject:postSummarySpec atIndex:MIN((NSUInteger)1, m.count)];
+            working = ApolloAIRebuildStack(working, m);
         }
-        if (bodyIndex == NSNotFound) bodyIndex = MIN((NSUInteger)1, children.count);
-        [children insertObject:postSummarySpec atIndex:bodyIndex];
     }
 
-    // Keep the discussion summary in the established bottom-of-post position,
-    // after Apollo's original content/actions and immediately before comments.
-    if (discussionSummarySpec) [children addObject:discussionSummarySpec];
+    // Discussion summary stays at the bottom of the post header, immediately
+    // before the first comment.
+    if (discussionSummarySpec) {
+        NSMutableArray *m = [working.children ?: @[] mutableCopy];
+        [m addObject:discussionSummarySpec];
+        working = ApolloAIRebuildStack(working, m);
+    }
 
-    ASStackLayoutSpec *newStack =
-        [stackClass stackLayoutSpecWithDirection:originalStack.direction
-                                        spacing:originalStack.spacing
-                                 justifyContent:originalStack.justifyContent
-                                     alignItems:originalStack.alignItems
-                                       children:children];
-    newStack.flexWrap = originalStack.flexWrap;
-    newStack.alignContent = originalStack.alignContent;
-    newStack.lineSpacing = originalStack.lineSpacing;
-    return newStack;
+    return working;
 }
 
 // Preserve Apollo's root width/inset semantics. The comments header currently
@@ -1445,10 +1882,12 @@ static void ApolloAIPrepareForController(UIViewController *vc) {
         return;
     }
 
-    BOOL needsPost = ApolloAIPostText(link).length > 0 &&
+    BOOL needsPost = sEnableAIPostSummaries &&
+        ApolloAIPostText(link).length > 0 &&
         sPostSummaryCache[fullName].length == 0 &&
         ![sPostFailed containsObject:fullName];
-    BOOL needsComments = sCommentSummaryCache[fullName].length == 0 &&
+    BOOL needsComments = sEnableAICommentSummaries &&
+        sCommentSummaryCache[fullName].length == 0 &&
         ![sCommentFailed containsObject:fullName];
     if (needsPost) {
         [bridge prepareSession:ApolloAIRequestIdentifier(fullName, YES)
@@ -1460,6 +1899,140 @@ static void ApolloAIPrepareForController(UIViewController *vc) {
                   instructions:kApolloAICommentInstructions];
         ApolloLog(@"[AISummary] prepared COMMENT session for %@", fullName);
     }
+}
+
+// Summarize text into the post box with the given instructions/token budget.
+// Used for the Link summary (article), the Both summary (post + article), and the
+// Post-summary fallback when an article can't be fetched. Factored out so a
+// transient-concurrency retry re-summarizes the cached text without re-fetching.
+static void ApolloAISummarizeArticleText(NSString *fullName, NSString *requestID, NSString *text,
+                                         NSString *instructions, NSInteger responseTokens) {
+    ApolloFoundationModels *bridge = ApolloAIBridge();
+    if (!bridge || fullName.length == 0 || text.length == 0) return;
+    ApolloLog(@"[AISummary] generating link/article summary for %@ (%lu chars)…", fullName, (unsigned long)text.length);
+    [bridge prepareSession:requestID instructions:instructions];
+    [bridge summarize:text
+           identifier:requestID
+         instructions:instructions
+maximumResponseTokens:responseTokens
+            onPartial:^(NSString *partial) {
+                ApolloAIApplyStreamingPartial(fullName, YES, partial);
+            }
+           onComplete:^(NSString *final, NSError *error) {
+                [sPostInFlight removeObject:fullName];
+                if ([sPostRequestIDs[fullName] isEqualToString:requestID]) {
+                    [sPostRequestIDs removeObjectForKey:fullName];
+                }
+                if ([sTimedOutRequests containsObject:requestID]) {
+                    [sTimedOutRequests removeObject:requestID];
+                    return;
+                }
+                if (error.code == 6) return; // navigation cancellation
+                final = ApolloAINormalizeGeneratedSummary(final);
+                if (error || final.length == 0) {
+                    if (ApolloAIErrorIsTransientConcurrency(error)) {
+                        ApolloLog(@"[AISummary] link request deferred by model concurrency for %@", fullName);
+                        UIViewController *controller = [sControllerByFullName objectForKey:fullName];
+                        if (controller) {
+                            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.75 * NSEC_PER_SEC)),
+                                           dispatch_get_main_queue(), ^{
+                                ApolloAIGenerateForController(controller);
+                            });
+                        }
+                        return;
+                    }
+                    [sPostFailed addObject:fullName];
+                    NSString *msg = error ? ApolloAIFriendlyError(error) : @"The model returned an empty summary.";
+                    ApolloLog(@"[AISummary] link summary error: %@", error ? error.localizedDescription : @"(empty)");
+                    ApolloAISetBoxStateOnMatchingHeaders(fullName, YES, ApolloAIBoxStateError, msg);
+                    if (ApolloAIAnyHeaderExpanded(fullName, YES)) {
+                        ApolloAIForceHeaderRemeasure(fullName);
+                    }
+                    return;
+                }
+                sPostSummaryCache[fullName] = final;
+                sPostSummaryMode[fullName] = @(ApolloAIDesiredPostMode(fullName));
+                ApolloAISetBoxStateOnMatchingHeaders(fullName, YES, ApolloAIBoxStateReady, final);
+                if (ApolloAIAnyHeaderExpanded(fullName, YES)) {
+                    ApolloAIForceHeaderRemeasure(fullName);
+                }
+                ApolloAIPersistSummaries();
+                ApolloLog(@"[AISummary] LINK summary DONE for %@:\n%@", fullName, final);
+            }];
+}
+
+// External-article link post: show the post box as a "Link summary", fetch the
+// article (or reuse cached text), then summarize it. Shares the post box, cache,
+// in-flight guard, timeout and request id with the self-text post summary, since a
+// given post is one or the other — never both.
+static void ApolloAIGenerateLinkSummaryForController(NSString *articleURL, NSString *fullName, NSString *postText) {
+    ApolloFoundationModels *bridge = ApolloAIBridge();
+    if (!bridge || fullName.length == 0 || articleURL.length == 0) return;
+
+    [sPostInFlight addObject:fullName];
+    ApolloAIShowLoadingIfIdle(fullName, YES);   // box visible immediately ("Link"/"Post & link summary")
+    ApolloAIForceHeaderRemeasure(fullName);
+
+    NSString *requestID = ApolloAIRequestIdentifier(fullName, YES);
+    sPostRequestIDs[fullName] = requestID;
+    ApolloAIScheduleGenerationTimeout(fullName, YES, requestID);   // covers fetch + generation
+
+    // Summarize the fetched article — combined with the post body when there is
+    // one ("Post & link" summary), otherwise the article alone ("Link" summary).
+    void (^summarize)(NSString *) = ^(NSString *articleText) {
+        if (postText.length > 0) {
+            NSString *article = articleText.length > 2000 ? [articleText substringToIndex:2000] : articleText;
+            NSString *combined = [NSString stringWithFormat:@"Post:\n%@\n\nLinked article:\n%@", postText, article];
+            ApolloAISummarizeArticleText(fullName, requestID, combined,
+                                         kApolloAIBothInstructions, kApolloAIBothResponseTokens);
+        } else {
+            ApolloAISummarizeArticleText(fullName, requestID, articleText,
+                                         kApolloAIArticleInstructions, kApolloAIArticleResponseTokens);
+        }
+    };
+
+    NSString *cachedText = sArticleTextCache[fullName];
+    if (cachedText.length > 0) { summarize(cachedText); return; }
+
+    ApolloLog(@"[AISummary] fetching article for %@ summary %@ (%@)…",
+              postText.length > 0 ? @"POST+LINK" : @"LINK", fullName, articleURL);
+    ApolloAIFetchArticleText(articleURL, ^(NSString *articleText, NSError *fetchError) {
+        // Back on the main thread. Bail if this request was superseded (timed out
+        // or the user navigated and a newer request took over).
+        if (![sPostInFlight containsObject:fullName] ||
+            ![sPostRequestIDs[fullName] isEqualToString:requestID]) {
+            return;
+        }
+        if (fetchError || articleText.length < 200) {
+            if (postText.length > 0) {
+                // Couldn't read the article (clip page / SPA / paywall), but we DO
+                // have the post body — fall back to a plain Post summary of it
+                // rather than failing or hiding.
+                [sBothSummaryPosts removeObject:fullName];
+                [sLinkSummaryPosts removeObject:fullName];
+                ApolloLog(@"[AISummary] article fetch failed for %@ — falling back to post summary (%@)", fullName,
+                          fetchError ? fetchError.localizedDescription : @"too little text");
+                ApolloAISummarizeArticleText(fullName, requestID, postText,
+                                             kApolloAIPostInstructions, kApolloAIPostResponseTokens);
+                return;
+            }
+            // No body either — a video-clip page (streamff/streamin/etc.), a
+            // JS-rendered SPA (Bluesky/Twitter), a paywall, and so on. Don't show
+            // an error card: just HIDE the box, as if the post weren't a
+            // summarizable article. Marked failed so we don't re-fetch every scroll.
+            [sPostInFlight removeObject:fullName];
+            [sPostRequestIDs removeObjectForKey:fullName];
+            [sPostFailed addObject:fullName];
+            [sLinkSummaryPosts removeObject:fullName];
+            ApolloLog(@"[AISummary] no article prose for %@ — hiding link summary (%@)", fullName,
+                      fetchError ? fetchError.localizedDescription : @"too little text");
+            ApolloAISetBoxStateOnMatchingHeaders(fullName, YES, ApolloAIBoxStateNone, nil);
+            ApolloAIForceHeaderRemeasure(fullName);   // drop the loading card from layout
+            return;
+        }
+        sArticleTextCache[fullName] = articleText;
+        summarize(articleText);
+    });
 }
 
 static void ApolloAIGenerateForController(UIViewController *vc) {
@@ -1512,12 +2085,61 @@ static void ApolloAIGenerateForController(UIViewController *vc) {
         objc_setAssociatedObject(vc, &kApolloAIProvisionalCommentRequestKey, nil, OBJC_ASSOCIATION_ASSIGN);
     }
 
-    // ----- Post summary -----
-    if (sPostSummaryCache[fullName].length > 0) {
+    // ----- Post / Link / Both summary (shared post box) -----
+    // The post box shows ONE of three things, decided by what the post contains:
+    //   • body text only             -> "Post summary"        (summarize the body)
+    //   • external article link only -> "Link summary"        (fetch + summarize article)
+    //   • body AND an article link   -> "Post & link summary" (summarize both together)
+    // A link post's article URL is its own URL; a self-post's is the first article
+    // link in its body. One box + one cache serves all three.
+    // Gated by the "Post & Link Summaries" sub-toggle.
+    if (sEnableAIPostSummaries) {
+    NSString *postText = ApolloAIPostText(link);            // substantial self-text body, or nil
+    NSString *articleURL = ApolloAIArticleURLForPost(link); // pure-link URL or a link in the body
+    BOOL haveBody = postText.length > 0;
+    BOOL haveArticle = articleURL.length > 0;
+    if (haveBody && haveArticle) {
+        [sBothSummaryPosts addObject:fullName];
+        [sLinkSummaryPosts removeObject:fullName];
+    } else if (!haveBody && haveArticle) {
+        [sLinkSummaryPosts addObject:fullName];
+        [sBothSummaryPosts removeObject:fullName];
+    } else {
+        [sLinkSummaryPosts removeObject:fullName];
+        [sBothSummaryPosts removeObject:fullName];
+    }
+
+    NSInteger desiredMode = ApolloAIDesiredPostMode(fullName);
+    BOOL cacheValid = sPostSummaryCache[fullName].length > 0 &&
+        [sPostSummaryMode[fullName] integerValue] == desiredMode;
+    NSString *postTapKey = [@"post|" stringByAppendingString:fullName];
+    if (cacheValid) {
         ApolloAISetBoxStateOnMatchingHeaders(fullName, YES, ApolloAIBoxStateReady, sPostSummaryCache[fullName]);
+    } else if (sEnableTapToSummarize && (haveBody || haveArticle) &&
+               ![sTapRequested containsObject:postTapKey] &&
+               ![sPostInFlight containsObject:fullName] && ![sPostFailed containsObject:fullName]) {
+        // Tap-to-Summarize is on and the user hasn't tapped this card yet: show the
+        // idle "Tap to summarize" prompt instead of generating automatically.
+        ApolloAISetBoxStateOnMatchingHeaders(fullName, YES, ApolloAIBoxStateTapToSummarize, nil);
+        ApolloAIForceHeaderRemeasure(fullName);
     } else if (![sPostInFlight containsObject:fullName] && ![sPostFailed containsObject:fullName]) {
-        NSString *postText = ApolloAIPostText(link);
-        if (postText.length > 0) {
+        [sTapRequested removeObject:postTapKey];   // consume a tap request, if any
+        // Drop a stale cache entry generated under a different mode (e.g. a
+        // post-only summary cached before this post was detected as link/both).
+        if (sPostSummaryCache[fullName].length > 0) {
+            [sPostSummaryCache removeObjectForKey:fullName];
+            [sPostSummaryMode removeObjectForKey:fullName];
+        }
+        if (haveArticle) {
+            // Link-only or Both — both fetch the article (Both also folds in the
+            // post body). Discard any provisional post session first.
+            NSString *provisionalID = objc_getAssociatedObject(vc, &kApolloAIProvisionalPostRequestKey);
+            if (provisionalID.length > 0) {
+                [bridge discardPreparedSession:provisionalID];
+                objc_setAssociatedObject(vc, &kApolloAIProvisionalPostRequestKey, nil, OBJC_ASSOCIATION_ASSIGN);
+            }
+            ApolloAIGenerateLinkSummaryForController(articleURL, fullName, haveBody ? postText : nil);
+        } else if (haveBody) {
             [sPostInFlight addObject:fullName];
             ApolloAIShowLoadingIfIdle(fullName, YES);   // box visible immediately
             ApolloAIForceHeaderRemeasure(fullName);
@@ -1568,6 +2190,7 @@ static void ApolloAIGenerateForController(UIViewController *vc) {
                             return;
                         }
                         sPostSummaryCache[fullName] = final;
+                        sPostSummaryMode[fullName] = @(ApolloAIDesiredPostMode(fullName));
                         ApolloAISetBoxStateOnMatchingHeaders(fullName, YES, ApolloAIBoxStateReady, final);
                         if (ApolloAIAnyHeaderExpanded(fullName, YES)) {
                             ApolloAIForceHeaderRemeasure(fullName);
@@ -1576,46 +2199,52 @@ static void ApolloAIGenerateForController(UIViewController *vc) {
                         ApolloLog(@"[AISummary] POST summary DONE for %@:\n%@", fullName, final);
                     }];
         } else {
+            // Neither summarizable body nor article link (image/video/media post,
+            // or a too-short body with no link). Discard any provisional session.
             NSString *provisionalID = objc_getAssociatedObject(vc, &kApolloAIProvisionalPostRequestKey);
             if (provisionalID.length > 0) {
                 [bridge discardPreparedSession:provisionalID];
                 objc_setAssociatedObject(vc, &kApolloAIProvisionalPostRequestKey, nil, OBJC_ASSOCIATION_ASSIGN);
             }
-            ApolloLog(@"[AISummary] no self-text to summarize for %@", fullName);
+            ApolloLog(@"[AISummary] nothing to summarize for %@", fullName);
         }
     }
+    }   // end "Post & Link Summaries" sub-toggle gate
 
-    // ----- Comment summary -----
-    NSUInteger commentCount = 0;
-    NSString *commentSignature = nil;
-    NSString *commentText = ApolloAIGatherCommentText(vc, &commentCount, &commentSignature);
+    // ----- Comment summary (LOCKED once generated) -----
+    // A cached discussion summary ALWAYS wins: once it exists for this post we
+    // show it and never re-harvest or regenerate. Previously the summary was
+    // keyed on a "signature" of the representative comment set, which grew as
+    // more comments scrolled into view — so scrolling silently changed the
+    // summary text and the card height, shoving the scroll position up/down (the
+    // "jitter"). Now the representative set is captured ONCE, from the full
+    // loaded comment tree, summarized, and frozen for the session; only a fresh
+    // page open (a new controller) restarts it.
+    // Gated by the "Comment Summaries" sub-toggle.
+    if (sEnableAICommentSummaries) {
     NSString *cachedCommentSummary = sCommentSummaryCache[fullName];
-    NSString *cachedCommentSignature = sCommentSummarySignatures[fullName];
-    BOOL cacheMatches = cachedCommentSummary.length > 0 &&
-        (commentSignature.length == 0 || [cachedCommentSignature isEqualToString:commentSignature]);
-    if (cacheMatches) {
+    if (cachedCommentSummary.length > 0) {
         ApolloAISetBoxStateOnMatchingHeaders(fullName, NO, ApolloAIBoxStateReady, cachedCommentSummary);
     } else if (![sCommentInFlight containsObject:fullName] &&
                ![sCommentFailed containsObject:fullName]) {
-        if (cachedCommentSummary.length > 0 && commentSignature.length > 0) {
-            [sCommentSummaryCache removeObjectForKey:fullName];
-            [sCommentSummarySourceCounts removeObjectForKey:fullName];
-            [sCommentSummarySignatures removeObjectForKey:fullName];
-            ApolloLog(@"[AISummary] representative comments changed; regenerating %@", fullName);
-        }
+        NSUInteger commentCount = 0;
+        NSString *commentSignature = nil;
+        NSString *commentText = ApolloAIGatherCommentText(vc, &commentCount, &commentSignature);
         ApolloLog(@"[AISummary] gathered %lu comments (%lu chars) for %@", (unsigned long)commentCount,
                   (unsigned long)commentText.length, fullName);
         BOOL hasEnoughDiscussion = commentCount >= kApolloAIMinComments &&
             commentText.length >= kApolloAIMinCommentChars;
         if (hasEnoughDiscussion) {
+            NSString *commentTapKey = [@"comment|" stringByAppendingString:fullName];
+            if (sEnableTapToSummarize && ![sTapRequested containsObject:commentTapKey]) {
+            // Tap-to-Summarize is on and the user hasn't tapped: show the idle
+            // "Tap to summarize" prompt instead of generating automatically.
+            ApolloAISetBoxStateOnMatchingHeaders(fullName, NO, ApolloAIBoxStateTapToSummarize, nil);
+            ApolloAIForceHeaderRemeasure(fullName);
+            } else {
+            [sTapRequested removeObject:commentTapKey];   // consume a tap request, if any
             ApolloAIShowLoadingIfIdle(fullName, NO);
             ApolloAIForceHeaderRemeasure(fullName);
-        } else {
-            // Small or low-content threads are faster to read directly. Never
-            // leave a misleading loading card behind for them.
-            ApolloAISetBoxStateOnMatchingHeaders(fullName, NO, ApolloAIBoxStateNone, nil);
-        }
-        if (hasEnoughDiscussion) {
             [sCommentInFlight addObject:fullName];
             // Ground the discussion summary in the post it is replying to.
             NSString *context = ApolloAIPostContextForComments(link);
@@ -1683,8 +2312,14 @@ static void ApolloAIGenerateForController(UIViewController *vc) {
                         [sCapturedCommentKeys removeObjectForKey:fullName];
                         ApolloLog(@"[AISummary] COMMENT summary DONE for %@:\n%@", fullName, final);
                     }];
+            }   // end Tap-to-Summarize else (generate)
+        } else {
+            // Small or low-content threads are faster to read directly. Never
+            // leave a misleading loading card behind for them.
+            ApolloAISetBoxStateOnMatchingHeaders(fullName, NO, ApolloAIBoxStateNone, nil);
         }
     }
+    }   // end "Comment Summaries" sub-toggle gate
 }
 
 #pragma mark - Diagnostics: comments table structure (informs UI placement)
@@ -1867,22 +2502,41 @@ static void ApolloAILogTableStructure(UIViewController *vc) {
 
 %new
 - (void)apollo_togglePostSummary {
+    NSString *fullName = objc_getAssociatedObject((id)self, &kApolloAIHeaderFullNameKey);
+    // Tap-to-Summarize: an idle card generates on tap instead of expanding.
+    if (ApolloAIGetBoxState((id)self, YES) == ApolloAIBoxStateTapToSummarize) {
+        if (fullName.length > 0) [sTapRequested addObject:[@"post|" stringByAppendingString:fullName]];
+        ApolloAISetBoxStateOnMatchingHeaders(fullName, YES, ApolloAIBoxStateLoading, nil);
+        ApolloAIForceHeaderRemeasure(fullName);
+        UIViewController *vc = [sControllerByFullName objectForKey:fullName];
+        if (vc) ApolloAIGenerateForController(vc);
+        return;
+    }
     BOOL expanded = [objc_getAssociatedObject((id)self, &kApolloAIPostExpandedKey) boolValue];
     objc_setAssociatedObject((id)self, &kApolloAIPostExpandedKey, @(!expanded), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     ApolloAIRenderSummaryNode((id)self, YES);
     [(ASDisplayNode *)(id)self invalidateCalculatedLayout];
     [(ASDisplayNode *)(id)self setNeedsLayout];
-    ApolloAIForceHeaderRemeasure(objc_getAssociatedObject((id)self, &kApolloAIHeaderFullNameKey));
+    ApolloAIForceHeaderRemeasure(fullName);
 }
 
 %new
 - (void)apollo_toggleDiscussionSummary {
+    NSString *fullName = objc_getAssociatedObject((id)self, &kApolloAIHeaderFullNameKey);
+    if (ApolloAIGetBoxState((id)self, NO) == ApolloAIBoxStateTapToSummarize) {
+        if (fullName.length > 0) [sTapRequested addObject:[@"comment|" stringByAppendingString:fullName]];
+        ApolloAISetBoxStateOnMatchingHeaders(fullName, NO, ApolloAIBoxStateLoading, nil);
+        ApolloAIForceHeaderRemeasure(fullName);
+        UIViewController *vc = [sControllerByFullName objectForKey:fullName];
+        if (vc) ApolloAIGenerateForController(vc);
+        return;
+    }
     BOOL expanded = [objc_getAssociatedObject((id)self, &kApolloAICommentExpandedKey) boolValue];
     objc_setAssociatedObject((id)self, &kApolloAICommentExpandedKey, @(!expanded), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     ApolloAIRenderSummaryNode((id)self, NO);
     [(ASDisplayNode *)(id)self invalidateCalculatedLayout];
     [(ASDisplayNode *)(id)self setNeedsLayout];
-    ApolloAIForceHeaderRemeasure(objc_getAssociatedObject((id)self, &kApolloAIHeaderFullNameKey));
+    ApolloAIForceHeaderRemeasure(fullName);
 }
 
 - (id)layoutSpecThatFits:(struct ApolloAISizeRange)constrainedSize {
@@ -1890,8 +2544,10 @@ static void ApolloAILogTableStructure(UIViewController *vc) {
     if (!sEnableAISummaries) return originalSpec;
     ApolloAILogLayoutChildrenOnce((id)self, originalSpec);
 
-    ApolloAIBoxState postState = ApolloAIGetBoxState((id)self, YES);
-    ApolloAIBoxState commentState = ApolloAIGetBoxState((id)self, NO);
+    // Respect the sub-toggles at DISPLAY time too, so flipping one off hides an
+    // already-generated/cached card (not just future ones) on the next layout pass.
+    ApolloAIBoxState postState = sEnableAIPostSummaries ? ApolloAIGetBoxState((id)self, YES) : ApolloAIBoxStateNone;
+    ApolloAIBoxState commentState = sEnableAICommentSummaries ? ApolloAIGetBoxState((id)self, NO) : ApolloAIBoxStateNone;
     if (postState == ApolloAIBoxStateNone && commentState == ApolloAIBoxStateNone) return originalSpec;
     ApolloLog(@"[AISummary][UI] composing header layout postState=%ld commentState=%ld",
               (long)postState, (long)commentState);

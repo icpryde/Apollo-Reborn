@@ -664,8 +664,9 @@ typedef NS_ENUM(NSInteger, Tag) {
         case SectionAPIKeys: return kAPIKeyRowWidgetSetupCode + (sWebJSONEnabled ? 1 : 0);
         // General base rows + the search-in-place toggle (effectiveRow 11) and the
         // AI Summaries toggle (effectiveRow 12), minus the "Tap to Show Deleted
-        // Comments" row when Show Deleted Comments is off.
-        case SectionGeneral: return sShowDeletedComments ? 13 : 12;
+        // Comments" row when Show Deleted Comments is off. When AI Summaries is on,
+        // three sub-toggles (effectiveRows 13-15) appear directly beneath it.
+        case SectionGeneral: return (sShowDeletedComments ? 13 : 12) + (sEnableAISummaries ? 3 : 0);
         case SectionMedia: return 14 + (sEnableInlineImages ? 0 : -kApolloMediaInlineDependentRows);
         case SectionSubreddits: return sSubredditListEnhancements ? 8 : 7;
         case SectionNotificationBackend: return 3; // URL + Registration Token + Test Connection
@@ -1119,9 +1120,28 @@ typedef NS_ENUM(NSInteger, Tag) {
         case 12:
             return [self switchCellWithIdentifier:@"Cell_Gen_AISummaries"
                                             label:@"AI Summaries"
-                                           detail:@"On-device post summaries and discussion summaries for larger threads. Discussions require at least 5 substantive comments and ignore AutoModerator and removed comments. Requires Apple Intelligence on iOS 26 or later."
+                                           detail:@"On-device summaries of posts and discussions. Requires Apple Intelligence (iOS 26+)."
                                                on:[defaults boolForKey:UDKeyEnableAISummaries]
                                            action:@selector(aiSummariesSwitchToggled:)];
+        // Sub-toggles, present only while AI Summaries is on (see numberOfRows).
+        case 13:
+            return [self switchCellWithIdentifier:@"Cell_Gen_AIPostSummaries"
+                                            label:@"Post & Link Summaries"
+                                           detail:@"Summarize a post's text, or the article a link points to."
+                                               on:[defaults boolForKey:UDKeyEnableAIPostSummaries]
+                                           action:@selector(aiPostSummariesSwitchToggled:)];
+        case 14:
+            return [self switchCellWithIdentifier:@"Cell_Gen_AICommentSummaries"
+                                            label:@"Comment Summaries"
+                                           detail:@"Summarize the discussion on larger comment threads."
+                                               on:[defaults boolForKey:UDKeyEnableAICommentSummaries]
+                                           action:@selector(aiCommentSummariesSwitchToggled:)];
+        case 15:
+            return [self switchCellWithIdentifier:@"Cell_Gen_AITapToSummarize"
+                                            label:@"Tap to Summarize"
+                                           detail:@"Summarize only when you tap a card, instead of automatically. Saves battery."
+                                               on:[defaults boolForKey:UDKeyEnableTapToSummarize]
+                                           action:@selector(aiTapToSummarizeSwitchToggled:)];
         default: return [[UITableViewCell alloc] init];
     }
 }
@@ -2086,8 +2106,39 @@ typedef NS_ENUM(NSInteger, Tag) {
 }
 
 - (void)aiSummariesSwitchToggled:(UISwitch *)sender {
+    BOOL wasOn = sEnableAISummaries;
     sEnableAISummaries = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:sEnableAISummaries forKey:UDKeyEnableAISummaries];
+    if (sEnableAISummaries == wasOn) return;
+
+    // Reveal/hide the three sub-toggles directly beneath this row. They are the
+    // last three rows of the section (AI Summaries is the last base row).
+    NSInteger base = sShowDeletedComments ? 13 : 12;
+    NSArray<NSIndexPath *> *paths = @[
+        [NSIndexPath indexPathForRow:base inSection:SectionGeneral],
+        [NSIndexPath indexPathForRow:base + 1 inSection:SectionGeneral],
+        [NSIndexPath indexPathForRow:base + 2 inSection:SectionGeneral],
+    ];
+    if (sEnableAISummaries) {
+        [self.tableView insertRowsAtIndexPaths:paths withRowAnimation:UITableViewRowAnimationFade];
+    } else {
+        [self.tableView deleteRowsAtIndexPaths:paths withRowAnimation:UITableViewRowAnimationFade];
+    }
+}
+
+- (void)aiPostSummariesSwitchToggled:(UISwitch *)sender {
+    sEnableAIPostSummaries = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sEnableAIPostSummaries forKey:UDKeyEnableAIPostSummaries];
+}
+
+- (void)aiCommentSummariesSwitchToggled:(UISwitch *)sender {
+    sEnableAICommentSummaries = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sEnableAICommentSummaries forKey:UDKeyEnableAICommentSummaries];
+}
+
+- (void)aiTapToSummarizeSwitchToggled:(UISwitch *)sender {
+    sEnableTapToSummarize = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sEnableTapToSummarize forKey:UDKeyEnableTapToSummarize];
 }
 
 - (void)customOAuthSignInSwitchToggled:(UISwitch *)sender {
