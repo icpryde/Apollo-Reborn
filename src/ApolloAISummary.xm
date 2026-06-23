@@ -1120,12 +1120,134 @@ static NSString *ApolloAIDecodeHTMLEntities(NSString *s) {
     return [s stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"];
 }
 
-// A small readability pass: drop non-content regions, prefer the <article>/<main>
-// region, pull paragraph prose, decode entities, collapse whitespace, cap length.
+// Reader-mode source #1 (best): the schema.org JSON-LD that most publishers embed
+// for SEO. `articleBody` is clean, already-decoded prose and is frequently present
+// even when the visible DOM is paywalled or JS-rendered — so it's our most
+// reliable way past paywalls/ad junk. Returns the longest articleBody (falling
+// back to the longest description) found across all ld+json blocks, or nil.
+static NSString *ApolloAIExtractJSONLD(NSString *html) {
+    if (html.length == 0) return nil;
+    NSRegularExpressionOptions dotAll =
+        NSRegularExpressionCaseInsensitive | NSRegularExpressionDotMatchesLineSeparators;
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:
+        @"<script[^>]*type\\s*=\\s*[\"']application/ld\\+json[\"'][^>]*>(.*?)</script>"
+        options:dotAll error:nil];
+    NSString *bestBody = nil;
+    NSString *bestDesc = nil;
+    for (NSTextCheckingResult *m in [re matchesInString:html options:0 range:NSMakeRange(0, html.length)]) {
+        NSString *json = [html substringWithRange:[m rangeAtIndex:1]];
+        // Some pages wrap JSON-LD in CDATA / HTML comments — strip those markers.
+        json = [json stringByReplacingOccurrencesOfString:@"<!--" withString:@" "];
+        json = [json stringByReplacingOccurrencesOfString:@"-->" withString:@" "];
+        json = [json stringByReplacingOccurrencesOfString:@"//<![CDATA[" withString:@" "];
+        json = [json stringByReplacingOccurrencesOfString:@"<![CDATA[" withString:@" "];
+        json = [json stringByReplacingOccurrencesOfString:@"]]>" withString:@" "];
+        NSData *data = [json dataUsingEncoding:NSUTF8StringEncoding];
+        if (!data) continue;
+        id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        if (!obj) continue;
+        // Walk arrays, @graph, mainEntity, and nested dicts collecting fields.
+        NSMutableArray *stack = [NSMutableArray arrayWithObject:obj];
+        NSUInteger guard = 0;
+        while (stack.count > 0 && guard++ < 4000) {
+            id node = stack.lastObject;
+            [stack removeLastObject];
+            if ([node isKindOfClass:[NSArray class]]) {
+                [stack addObjectsFromArray:node];
+            } else if ([node isKindOfClass:[NSDictionary class]]) {
+                NSDictionary *d = node;
+                id body = d[@"articleBody"];
+                if ([body isKindOfClass:[NSString class]] && [(NSString *)body length] > bestBody.length) bestBody = body;
+                id desc = d[@"description"];
+                if ([desc isKindOfClass:[NSString class]] && [(NSString *)desc length] > bestDesc.length) bestDesc = desc;
+                id graph = d[@"@graph"]; if (graph) [stack addObject:graph];
+                id mainEntity = d[@"mainEntity"]; if (mainEntity) [stack addObject:mainEntity];
+            }
+        }
+    }
+    NSString *chosen = (bestBody.length >= 200) ? bestBody
+                     : (bestBody.length >= bestDesc.length ? bestBody : bestDesc);
+    if (chosen.length == 0) return nil;
+    // articleBody is usually plain text but can carry inline HTML; clean it.
+    NSRegularExpression *tagRe = [NSRegularExpression regularExpressionWithPattern:@"<[^>]+>" options:0 error:nil];
+    chosen = [tagRe stringByReplacingMatchesInString:chosen options:0 range:NSMakeRange(0, chosen.length) withTemplate:@" "];
+    return ApolloAIDecodeHTMLEntities(chosen);
+}
+
+// Pull the `content` of the first <meta> tag whose name/property equals `key`
+// (attribute order varies, so try both layouts). Decoded + trimmed, or nil.
+static NSString *ApolloAIMetaContent(NSString *html, NSString *key) {
+    if (html.length == 0) return nil;
+    NSString *k = [NSRegularExpression escapedPatternForString:key];
+    // Capture the opening quote (group 1) and backreference it so the value
+    // (group 2) runs to the MATCHING quote — a value containing the other quote
+    // type (e.g. an apostrophe inside a double-quoted description) isn't truncated,
+    // and a mismatched open/close pair isn't accepted.
+    NSArray<NSString *> *patterns = @[
+        [NSString stringWithFormat:@"<meta[^>]*\\b(?:property|name)\\s*=\\s*[\"']%@[\"'][^>]*\\bcontent\\s*=\\s*([\"'])(.*?)\\1", k],
+        [NSString stringWithFormat:@"<meta[^>]*\\bcontent\\s*=\\s*([\"'])(.*?)\\1[^>]*\\b(?:property|name)\\s*=\\s*[\"']%@[\"']", k],
+    ];
+    NSRange scan = NSMakeRange(0, MIN(html.length, (NSUInteger)200000));
+    for (NSString *pat in patterns) {
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:pat
+            options:NSRegularExpressionCaseInsensitive error:nil];
+        NSTextCheckingResult *m = [re firstMatchInString:html options:0 range:scan];
+        if (m) {
+            NSString *c = [ApolloAIDecodeHTMLEntities([html substringWithRange:[m rangeAtIndex:2]])
+                           stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (c.length > 0) return c;
+        }
+    }
+    return nil;
+}
+
+// Reader-mode source #3 (thin-page seed): a real og:/meta description beats
+// summarizing leftover nav/cookie junk when the body can't be extracted.
+static NSString *ApolloAIExtractMetaDescription(NSString *html) {
+    for (NSString *key in @[@"og:description", @"twitter:description", @"description"]) {
+        NSString *c = ApolloAIMetaContent(html, key);
+        if (c.length > 0) return c;
+    }
+    return nil;
+}
+
+// The AMP version of an article is a stripped-down, ad-light, frequently
+// un-paywalled page — a strong reader-mode fallback when the canonical page
+// yields no prose. Returns the absolute amphtml URL, or nil.
+static NSString *ApolloAIFindAMPURL(NSString *html, NSURL *base) {
+    if (html.length == 0) return nil;
+    // Quote (group 1) captured + backreferenced so the href (group 2) runs to
+    // the matching quote, mirroring the meta-content extractor above.
+    NSArray<NSString *> *patterns = @[
+        @"<link[^>]*\\brel\\s*=\\s*[\"']amphtml[\"'][^>]*\\bhref\\s*=\\s*([\"'])(.+?)\\1",
+        @"<link[^>]*\\bhref\\s*=\\s*([\"'])(.+?)\\1[^>]*\\brel\\s*=\\s*[\"']amphtml[\"']",
+    ];
+    NSRange scan = NSMakeRange(0, MIN(html.length, (NSUInteger)200000));
+    for (NSString *pat in patterns) {
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:pat
+            options:NSRegularExpressionCaseInsensitive error:nil];
+        NSTextCheckingResult *m = [re firstMatchInString:html options:0 range:scan];
+        if (m) {
+            NSString *href = ApolloAIDecodeHTMLEntities([html substringWithRange:[m rangeAtIndex:2]]);
+            NSURL *abs = [NSURL URLWithString:href relativeToURL:base];
+            return abs.absoluteURL.absoluteString ?: href;
+        }
+    }
+    return nil;
+}
+
+// A small readability pass. Prefers, in order: JSON-LD articleBody (cleanest,
+// paywall-resistant), then scraped <article>/<main> <p> prose, then a strip-all
+// fallback, then a meta description for thin pages. Decodes entities, collapses
+// whitespace, caps length.
 static NSString *ApolloAIExtractArticleText(NSString *html) {
     if (html.length == 0) return nil;
-    // Bound regex cost; an article's content sits near the top of the document.
-    if (html.length > 600000) html = [html substringToIndex:600000];
+
+    // Source #1: JSON-LD, computed over the FULL html (the block can sit late).
+    NSString *jsonld = ApolloAIExtractJSONLD(html);
+
+    // Bound regex cost for the DOM scrape; an article's body sits near the top.
+    NSString *capped = html.length > 600000 ? [html substringToIndex:600000] : html;
 
     NSRegularExpressionOptions dotAll =
         NSRegularExpressionCaseInsensitive | NSRegularExpressionDotMatchesLineSeparators;
@@ -1133,8 +1255,8 @@ static NSString *ApolloAIExtractArticleText(NSString *html) {
     NSRegularExpression *noise = [NSRegularExpression regularExpressionWithPattern:
         @"<(script|style|noscript|template|svg|head|nav|header|footer|aside|form|figure)\\b[^>]*>.*?</\\1>"
         options:dotAll error:nil];
-    NSString *s = [noise stringByReplacingMatchesInString:html options:0
-                                                    range:NSMakeRange(0, html.length) withTemplate:@" "];
+    NSString *s = [noise stringByReplacingMatchesInString:capped options:0
+                                                    range:NSMakeRange(0, capped.length) withTemplate:@" "];
 
     // Narrow to the main article region if the page marks one.
     NSString *scope = s;
@@ -1151,7 +1273,7 @@ static NSString *ApolloAIExtractArticleText(NSString *html) {
         if (end > start) { scope = [s substringWithRange:NSMakeRange(start, end - start)]; break; }
     }
 
-    // Articles put body text in <p> tags; menus/chrome rarely do.
+    // Source #2: articles put body text in <p> tags; menus/chrome rarely do.
     NSMutableString *prose = [NSMutableString string];
     NSRegularExpression *pRe = [NSRegularExpression regularExpressionWithPattern:@"<p\\b[^>]*>(.*?)</p>" options:dotAll error:nil];
     NSRegularExpression *tagRe = [NSRegularExpression regularExpressionWithPattern:@"<[^>]+>" options:0 error:nil];
@@ -1163,12 +1285,22 @@ static NSString *ApolloAIExtractArticleText(NSString *html) {
         if (prose.length >= kApolloAIMaxArticleChars) break;
     }
 
+    // Prefer the richest source: JSON-LD articleBody wins when it's longer.
+    NSString *source = @"prose";
     NSString *text = prose;
+    if (jsonld.length > text.length) { text = jsonld; source = @"jsonld"; }
+
+    // Still thin (SPA / clip page / paywall stub)? Try strip-all on the scope,
+    // then a meta description — anything real beats nav junk.
     if (text.length < 200) {
-        // Fallback: strip every tag from the scope.
         NSString *stripped = [tagRe stringByReplacingMatchesInString:scope options:0
                                                                range:NSMakeRange(0, scope.length) withTemplate:@" "];
-        text = ApolloAIDecodeHTMLEntities(stripped);
+        stripped = ApolloAIDecodeHTMLEntities(stripped);
+        if (stripped.length > text.length) { text = stripped; source = @"strip"; }
+    }
+    if (text.length < 200) {
+        NSString *meta = ApolloAIExtractMetaDescription(html);
+        if (meta.length > text.length) { text = meta; source = @"meta"; }
     }
 
     NSRegularExpression *ws = [NSRegularExpression regularExpressionWithPattern:@"\\s+" options:0 error:nil];
@@ -1176,10 +1308,44 @@ static NSString *ApolloAIExtractArticleText(NSString *html) {
     text = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (text.length == 0) return nil;
     if (text.length > kApolloAIMaxArticleChars) text = [text substringToIndex:kApolloAIMaxArticleChars];
+    ApolloLog(@"[AISummary] article extracted via %@ (%lu chars)", source, (unsigned long)text.length);
     return text;
 }
 
-// Fetch the article URL off-thread and hand extracted prose back on the MAIN thread.
+// Core single-URL fetch + extract. Calls back on URLSession's own queue (NOT the
+// main thread) with the extracted prose, the raw html (for AMP discovery), and
+// any error. The public wrapper below hops to main and adds the AMP fallback.
+static void ApolloAIFetchAndExtract(NSURL *url, void (^done)(NSString *text, NSString *html, NSError *error)) {
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url
+        cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:kApolloAIArticleFetchTimeout];
+    // A real browser UA — some publishers serve a stub to non-browser agents.
+    [req setValue:@"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+        forHTTPHeaderField:@"User-Agent"];
+    [req setValue:@"text/html,application/xhtml+xml,*/*;q=0.8" forHTTPHeaderField:@"Accept"];
+    [req setValue:@"en-US,en;q=0.9" forHTTPHeaderField:@"Accept-Language"];
+
+    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req
+        completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+            NSString *text = nil, *html = nil;
+            NSError *outErr = error;
+            NSHTTPURLResponse *http = [response isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)response : nil;
+            if (!error && http && http.statusCode >= 200 && http.statusCode < 300 &&
+                data.length > 0 && data.length <= kApolloAIArticleFetchMaxBytes) {
+                html = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+                if (!html) html = [[NSString alloc] initWithData:data encoding:NSISOLatin1StringEncoding];
+                if (html) text = ApolloAIExtractArticleText(html);
+            } else if (!error && http && (http.statusCode < 200 || http.statusCode >= 300)) {
+                outErr = [NSError errorWithDomain:@"ApolloAIArticle" code:http.statusCode userInfo:nil];
+            }
+            if (done) done(text, html, outErr);
+        }];
+    [task resume];
+}
+
+// Fetch the article URL off-thread and hand extracted prose back on the MAIN
+// thread. When the canonical page yields little prose (SPA / paywall stub) but
+// advertises an AMP version, refetch that once — it's usually clean, un-paywalled
+// reader content. At most two network requests; AMP pages aren't re-followed.
 static void ApolloAIFetchArticleText(NSString *urlString, void (^completion)(NSString *text, NSError *error)) {
     NSURL *url = urlString.length > 0 ? [NSURL URLWithString:urlString] : nil;
     if (!url) {
@@ -1188,31 +1354,24 @@ static void ApolloAIFetchArticleText(NSString *urlString, void (^completion)(NSS
         });
         return;
     }
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url
-        cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:kApolloAIArticleFetchTimeout];
-    // A real browser UA — some publishers serve a stub to non-browser agents.
-    [req setValue:@"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
-        forHTTPHeaderField:@"User-Agent"];
-    [req setValue:@"text/html,application/xhtml+xml,*/*;q=0.8" forHTTPHeaderField:@"Accept"];
-
-    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req
-        completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-            NSString *text = nil;
-            NSError *outErr = error;
-            NSHTTPURLResponse *http = [response isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)response : nil;
-            if (!error && http && http.statusCode >= 200 && http.statusCode < 300 &&
-                data.length > 0 && data.length <= kApolloAIArticleFetchMaxBytes) {
-                NSString *html = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-                if (!html) html = [[NSString alloc] initWithData:data encoding:NSISOLatin1StringEncoding];
-                if (html) text = ApolloAIExtractArticleText(html);
-            } else if (!error && http && (http.statusCode < 200 || http.statusCode >= 300)) {
-                outErr = [NSError errorWithDomain:@"ApolloAIArticle" code:http.statusCode userInfo:nil];
-            }
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (completion) completion(text, text.length > 0 ? nil : (outErr ?: [NSError errorWithDomain:@"ApolloAIArticle" code:204 userInfo:nil]));
-            });
-        }];
-    [task resume];
+    void (^deliver)(NSString *, NSError *) = ^(NSString *text, NSError *err) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (completion) completion(text, text.length > 0 ? nil
+                : (err ?: [NSError errorWithDomain:@"ApolloAIArticle" code:204 userInfo:nil]));
+        });
+    };
+    ApolloAIFetchAndExtract(url, ^(NSString *text, NSString *html, NSError *err) {
+        // Good enough, or nothing to fall back to → deliver as-is.
+        if (text.length >= 200 || html.length == 0) { deliver(text, err); return; }
+        NSString *amp = ApolloAIFindAMPURL(html, url);
+        NSURL *ampURL = amp.length > 0 ? [NSURL URLWithString:amp] : nil;
+        if (!ampURL || [ampURL.absoluteString isEqualToString:url.absoluteString]) { deliver(text, err); return; }
+        ApolloLog(@"[AISummary] thin extract (%lu chars) — retrying via AMP %@", (unsigned long)text.length, amp);
+        ApolloAIFetchAndExtract(ampURL, ^(NSString *ampText, NSString *ampHtml, NSError *ampErr) {
+            NSString *best = ampText.length > text.length ? ampText : text;
+            deliver(best, best.length > 0 ? nil : (err ?: ampErr));
+        });
+    });
 }
 
 #pragma mark - Summary UI
