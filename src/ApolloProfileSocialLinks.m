@@ -224,6 +224,32 @@ static NSArray<ApolloSocialLink *> *ApolloSLLinksFromJSON(NSArray *raw) {
 
 @implementation ApolloSLWebFetch
 
+// A single non-persistent (in-memory) WKWebsiteDataStore, reused for every
+// social-links scrape this app session.
+//
+// Why isolate the scrape from the app's shared cookies: Reddit serves the *old*
+// reddit layout at www.reddit.com whenever the logged-in session belongs to an
+// account whose "Use new Reddit as my default experience" preference is disabled.
+// Apollo's OAuth login runs through a www.reddit.com web view, so that account's
+// session + old-reddit preference land in the SHARED default WKWebsiteDataStore.
+// Old reddit has none of the shreddit-* markup the extraction JS targets, so the
+// fallback scrapes footer/sidebar anchors (redditblog.com, posted/commented URLs)
+// and every profile shows the same wrong links. The poison is sticky too —
+// deleting the Apollo account never clears WebKit cookies, so only deleting the
+// whole app cleared it. (Reported on PR #465.)
+//
+// A logged-out, in-memory store sidesteps all of it: with no account session
+// Reddit serves its default (new/shreddit) experience, the scrape can neither
+// poison nor be poisoned by the user's browsing session, and it resets each
+// launch. Shared (not per-scrape) so Reddit's JS bot-challenge cookie warms once
+// per session rather than cold on every profile.
++ (WKWebsiteDataStore *)apollo_scrapeDataStore {
+    static WKWebsiteDataStore *store;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ store = [WKWebsiteDataStore nonPersistentDataStore]; });
+    return store;
+}
+
 - (void)startForUsername:(NSString *)username completion:(void (^)(NSArray<ApolloSocialLink *> *))done {
     // WKWebView must be created/used on the main thread.
     if (![NSThread isMainThread]) {
@@ -238,7 +264,9 @@ static NSArray<ApolloSocialLink *> *ApolloSLLinksFromJSON(NSArray *raw) {
     }
     if (!win) win = UIApplication.sharedApplication.windows.firstObject;
     if (!win) { [self finish:nil]; return; }
-    self.web = [[WKWebView alloc] initWithFrame:win.bounds configuration:[[WKWebViewConfiguration alloc] init]];
+    WKWebViewConfiguration *config = [[WKWebViewConfiguration alloc] init];
+    config.websiteDataStore = [ApolloSLWebFetch apollo_scrapeDataStore];
+    self.web = [[WKWebView alloc] initWithFrame:win.bounds configuration:config];
     self.web.navigationDelegate = self;
     self.web.alpha = 0.011; self.web.userInteractionEnabled = NO;
     self.web.customUserAgent = @"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
