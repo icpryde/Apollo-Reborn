@@ -389,6 +389,130 @@ void ApolloThemeBuilderResetActiveCustomThemeColors(void) {
     ApolloThemeBuilderReloadOverrides();
 }
 
+// ---------------------------------------------------------------------------
+// Import / Export
+// ---------------------------------------------------------------------------
+//
+// A theme serializes to a tiny, human-readable JSON document holding only its
+// name and its role→hex color map — no account data, API keys, device ids, or
+// internal theme ids — so a shared theme file is safe to give to anyone and
+// reveals nothing about the sender. Import is deliberately strict: it accepts
+// only known "<role>.<mode>" keys with 6-digit hex values, clamps the name, and
+// the caller always mints a fresh theme id, so a hand-edited or hostile file
+// can neither overwrite an existing theme, inject arbitrary defaults keys, nor
+// blow up storage with unbounded data.
+
+static NSString * const kThemeExportMarkerKey = @"apolloThemeBuilder";
+static const NSInteger kThemeExportVersion = 1;
+static const NSUInteger kThemeImportMaxBytes = 256 * 1024; // generous; a theme is <1KB
+static const NSUInteger kThemeNameMaxLength = 60;
+
+// "RRGGBB" (uppercased) if the value is a valid 6-digit hex color, '#'/
+// whitespace tolerated, else nil.
+static NSString *ThemeBuilderNormalizeHex(id hex) {
+    if (![hex isKindOfClass:[NSString class]]) return nil;
+    NSString *clean = [[(NSString *)hex stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]
+                       stringByReplacingOccurrencesOfString:@"#" withString:@""];
+    if (clean.length != 6) return nil;
+    unsigned int v = 0;
+    NSScanner *scanner = [NSScanner scannerWithString:clean];
+    if (![scanner scanHexInt:&v] || !scanner.atEnd) return nil;
+    return clean.uppercaseString;
+}
+
+// Set of every accepted "<role>.<mode>" color key (8 roles × {light,dark}).
+static NSSet<NSString *> *ThemeBuilderValidColorKeys(void) {
+    static NSSet *keys;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSMutableSet *set = [NSMutableSet set];
+        for (NSString *role in ApolloThemeBuilderRoleKeys()) {
+            [set addObject:[role stringByAppendingString:@".light"]];
+            [set addObject:[role stringByAppendingString:@".dark"]];
+        }
+        keys = set;
+    });
+    return keys;
+}
+
+// Drop anything that isn't a valid role.mode key with a valid hex value;
+// normalizes surviving hex to uppercase.
+static NSDictionary<NSString *, NSString *> *ThemeBuilderSanitizeColors(id colors) {
+    if (![colors isKindOfClass:[NSDictionary class]]) return @{};
+    NSSet *valid = ThemeBuilderValidColorKeys();
+    NSMutableDictionary *out = [NSMutableDictionary dictionary];
+    for (id key in (NSDictionary *)colors) {
+        if (![key isKindOfClass:[NSString class]] || ![valid containsObject:key]) continue;
+        NSString *hex = ThemeBuilderNormalizeHex(((NSDictionary *)colors)[key]);
+        if (hex) out[key] = hex;
+    }
+    return out;
+}
+
+// Trim, fall back to a default, and clamp to kThemeNameMaxLength without
+// splitting a composed character (emoji) at the boundary.
+static NSString *ThemeBuilderClampName(id name, NSString *fallback) {
+    NSString *trimmed = [name isKindOfClass:[NSString class]]
+        ? [(NSString *)name stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]
+        : @"";
+    if (!trimmed.length) return fallback;
+    if (trimmed.length > kThemeNameMaxLength) {
+        NSRange r = [trimmed rangeOfComposedCharacterSequencesForRange:NSMakeRange(0, kThemeNameMaxLength)];
+        trimmed = [trimmed substringToIndex:r.length];
+    }
+    return trimmed;
+}
+
+NSData *ApolloThemeBuilderExportData(NSDictionary *theme) {
+    NSDictionary *payload = @{
+        kThemeExportMarkerKey: @(kThemeExportVersion),
+        @"name": ThemeBuilderClampName(theme[@"name"], @"Custom"),
+        @"colors": ThemeBuilderSanitizeColors(theme[@"colors"]),
+    };
+    NSError *error = nil;
+    NSData *data = [NSJSONSerialization dataWithJSONObject:payload
+                                                  options:NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys
+                                                    error:&error];
+    if (!data) ApolloLog(@"ThemeBuilder: export serialization failed: %@", error);
+    return data;
+}
+
+NSString *ApolloThemeBuilderExportFilename(NSString *themeName) {
+    NSString *name = ThemeBuilderClampName(themeName, @"Apollo Theme");
+    // Strip path-hostile characters so the file lands cleanly anywhere it's shared.
+    NSCharacterSet *illegal = [NSCharacterSet characterSetWithCharactersInString:@"/\\?%*|\"<>:"];
+    name = [[name componentsSeparatedByCharactersInSet:illegal] componentsJoinedByString:@"-"];
+    name = [name stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (!name.length || [name hasPrefix:@"."]) name = @"Apollo Theme";
+    return [name stringByAppendingPathExtension:@"json"];
+}
+
+BOOL ApolloThemeBuilderParseImport(NSData *data, NSString **outName,
+                                   NSDictionary<NSString *, NSString *> **outColors) {
+    if (outName) *outName = nil;
+    if (outColors) *outColors = nil;
+    if (![data isKindOfClass:[NSData class]] || data.length == 0 || data.length > kThemeImportMaxBytes) {
+        return NO;
+    }
+    id root = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
+    if (![root isKindOfClass:[NSDictionary class]]) return NO;
+    NSDictionary *dict = (NSDictionary *)root;
+
+    // Accept either our wrapped format ({name, colors}) or a bare "<role>.<mode>"
+    // -> hex map (forgiving of hand-authored files).
+    id colorsSource = [dict[@"colors"] isKindOfClass:[NSDictionary class]] ? dict[@"colors"] : dict;
+    NSDictionary *colors = ThemeBuilderSanitizeColors(colorsSource);
+
+    // No recognizable colors and no Theme Builder marker — not a theme file.
+    // (A marked file with empty colors is a valid "blank" theme and round-trips.)
+    BOOL hasMarker = dict[kThemeExportMarkerKey] != nil;
+    if (colors.count == 0 && !hasMarker) return NO;
+
+    if (outName) *outName = ThemeBuilderClampName(dict[@"name"], @"Imported Theme");
+    if (outColors) *outColors = colors;
+    return YES;
+}
+
 BOOL ApolloThemeBuilderIsEnabled(void) {
     return [[NSUserDefaults standardUserDefaults] boolForKey:kApolloCustomThemeEnabledKey];
 }
