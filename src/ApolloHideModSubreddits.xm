@@ -10,20 +10,54 @@
 //
 // Reddit offers no way to leave or delete some dead subreddits you moderate,
 // so they're stuck in the MODERATOR section of Apollo's Subreddits list
-// forever. This module lets the user hide them, entirely through Edit mode:
+// forever. This module lets the user hide them from that list, entirely
+// through Edit mode, WITHOUT touching the moderator powers you have on those
+// subreddits when you actually visit them.
 //
-// 1. Data layer: -[RDKClient moderatedSubredditsWithPagination:completion:]
-//    is wrapped so hidden subreddits never reach RedditListViewController —
-//    except while the list is in Edit mode, when they're kept so the user
-//    can see and unhide them. The MODERATOR section rebuilds naturally, so
-//    row counts, the A-Z fast-scroll index, and edit mode stay consistent
-//    with no index-path remapping.
-// 2. Edit-mode UI: moderator rows natively get no edit control (Apollo has
-//    no unsubscribe for moderated subs), leaving the left gutter free. We
-//    place our own control there: a blue minus circle on visible rows
-//    (tap = hide) and a green plus circle on hidden rows, which also render
-//    faded (tap = unhide). Toggling updates the row in place; the list is
-//    refetched when Edit mode ends so hidden rows disappear.
+// Why the display filter has to be this surgical
+// ----------------------------------------------
+// Apollo has a single source of truth for "which subreddits do I moderate":
+// the `RDKUser.moderatedSubreddits` array. The Subreddits list populates it —
+// `RedditListViewController.fetchSubredditData()` assigns the moderated-subs
+// fetch result straight into `currentUser.moderatedSubreddits` — and then the
+// list reads that very property back to build its MODERATOR section (row count,
+// header height, each cell, taps, the context menu all call the getter).
+//
+// Crucially, the SAME property is what gates moderator powers everywhere else:
+// PostsViewController / CommentsViewController decide whether to show the mod
+// toolbar by checking `currentUser.moderatedSubreddits`, the inbox colours mod
+// mail from it, etc. (~50 read sites across the app).
+//
+// The original version of this feature (PR #424) hid rows by filtering the
+// data layer — wrapping `-[RDKClient moderatedSubredditsWithPagination:
+// completion:]` so hidden subs never reached the list. But that fetch result
+// is exactly what gets stored into `currentUser.moderatedSubreddits`, so the
+// filter shrank the shared source of truth: hide every sub you moderate and
+// the app concludes you moderate nothing — no mod badge, no mod tools when you
+// open those subreddits. (Reported: "Hiding them all removed moderator
+// badge/access to options in subreddits you're a mod on.")
+//
+// The fix keeps `moderatedSubreddits` complete (mod powers intact) and instead
+// filters only the GETTER, and only while the Subreddits list's own table
+// methods are running:
+//
+// 1. The data layer is left untouched, so `currentUser.moderatedSubreddits`
+//    always holds the full Reddit-reported set. Every moderator-power check
+//    app-wide sees the real list.
+// 2. `-[RDKUser moderatedSubreddits]` is hooked. It returns the full array
+//    everywhere EXCEPT inside the Subreddits list's table data-source/delegate
+//    methods, where it returns the array with hidden subs removed. A
+//    thread-local depth counter, bumped only around those methods' `%orig`,
+//    scopes the filtering precisely (and keeps background mod-power checks on
+//    other threads unaffected).
+// 3. In Edit mode the filter is bypassed so hidden rows reappear (faded, with
+//    a green plus circle) and can be unhidden inline.
+//
+// Because numberOfRows, heightForHeader and cellForRow all read the same
+// filtered getter, the MODERATOR section's row count, header and cells stay
+// consistent automatically — when every moderated sub is hidden the section
+// collapses to nothing, with no index-path remapping. Toggling Edit mode just
+// reloads the table; no network refetch is needed.
 //
 // The hidden list is stored in NSUserDefaults under
 // UDKeyHiddenModeratorSubreddits as an array of display names, compared
@@ -32,14 +66,23 @@
 @interface RedditListViewController : UIViewController <UITableViewDataSource, UITableViewDelegate>
 @end
 
-// Lowercased names of every subreddit seen in the moderated-subreddits
-// fetch (captured before filtering). Used only for diagnostics/crosschecks;
-// the section header title is the actual gate for the toggle UI.
-static NSMutableSet<NSString *> *sModeratedSubredditNames = nil;
+// Minimal surface for the model class whose getter we scope. RDKUser is always
+// present in Apollo; a forward declaration is enough for the %hook.
+@interface RDKUser : NSObject
+- (NSArray *)moderatedSubreddits;
+@end
 
-// While the Subreddits list is in Edit mode, the moderated-subreddits fetch
-// keeps hidden entries so they can be shown (faded) and unhidden inline.
-static BOOL sIncludeHiddenInFetch = NO;
+// Thread-local nesting depth of "we are currently inside a Subreddits-list
+// table method that reads moderatedSubreddits for display." The getter only
+// filters when this is > 0, so every other reader (moderator-power checks,
+// inbox, jump bar, background work) sees the complete list. Thread-local so a
+// mod-power check running on another thread is never caught by the window.
+static __thread NSInteger sListFilterDepth = 0;
+
+// While the Subreddits list is in Edit mode the filter is bypassed entirely so
+// hidden rows are shown (faded) and can be unhidden. Set on the main thread in
+// setEditing:; read by the getter.
+static BOOL sShowHiddenForEditing = NO;
 
 // Tag + associated keys for the per-cell hide/unhide button.
 static const NSInteger kApolloHideModButtonTag = 0x484D53; // 'HMS'
@@ -86,52 +129,47 @@ static void ApolloHideModRemoveHidden(NSString *name) {
     }
 }
 
-// MARK: - Data-layer filtering
+// MARK: - Getter-level display filter
 
-// Filters hidden subreddits out of a moderated-subreddits listing page and
-// records every name seen (pre-filter) for diagnostics. While the list is
-// in Edit mode, hidden entries are kept so they can be unhidden inline.
-static NSArray *ApolloHideModFilterModeratedCollection(NSArray *collection) {
-    if (![collection isKindOfClass:[NSArray class]] || collection.count == 0) return collection;
-
-    NSMutableArray *filtered = [NSMutableArray arrayWithCapacity:collection.count];
-    NSUInteger removed = 0;
-    for (id subreddit in collection) {
-        NSString *name = nil;
-        if ([subreddit respondsToSelector:@selector(name)]) {
-            id value = ((id (*)(id, SEL))objc_msgSend)(subreddit, @selector(name));
-            if ([value isKindOfClass:[NSString class]]) name = value;
-        }
-        if (name.length > 0) {
-            @synchronized (sModeratedSubredditNames) {
-                [sModeratedSubredditNames addObject:name.lowercaseString];
-            }
-            if (!sIncludeHiddenInFetch && ApolloHideModNameIsHidden(name)) {
-                removed++;
-                continue;
-            }
-        }
-        [filtered addObject:subreddit];
+// The display name of one entry in moderatedSubreddits. Entries are RDKSubreddit
+// objects (they respond to -name); fall back to treating the entry as a plain
+// name string just in case the model ever changes.
+static NSString *ApolloHideModNameForEntry(id entry) {
+    if ([entry respondsToSelector:@selector(name)]) {
+        id value = ((id (*)(id, SEL))objc_msgSend)(entry, @selector(name));
+        if ([value isKindOfClass:[NSString class]]) return value;
     }
-
-    if (removed > 0) {
-        ApolloLog(@"[HideModSubs] filtered %lu hidden subreddit(s) from moderated listing (%lu -> %lu)",
-                  (unsigned long)removed, (unsigned long)collection.count, (unsigned long)filtered.count);
-        return filtered;
-    }
-    return collection;
+    if ([entry isKindOfClass:[NSString class]]) return entry;
+    return nil;
 }
 
-typedef void (^ApolloHideModListingCompletion)(NSArray *collection, id pagination, NSError *error);
+// Returns the moderated-subreddits array with hidden entries removed. Returns
+// the input unchanged when nothing is hidden, so the common case allocates
+// nothing.
+static NSArray *ApolloHideModFilteredList(NSArray *full) {
+    if (![full isKindOfClass:[NSArray class]] || full.count == 0) return full;
+    if (ApolloHideModHiddenList().count == 0) return full;
 
-%hook RDKClient
+    NSMutableArray *filtered = [NSMutableArray arrayWithCapacity:full.count];
+    for (id entry in full) {
+        NSString *name = ApolloHideModNameForEntry(entry);
+        if (name.length > 0 && ApolloHideModNameIsHidden(name)) continue;
+        [filtered addObject:entry];
+    }
+    if (filtered.count == full.count) return full;
+    return filtered;
+}
 
-- (id)moderatedSubredditsWithPagination:(id)pagination completion:(ApolloHideModListingCompletion)completion {
-    if (!completion) return %orig;
-    ApolloHideModListingCompletion wrapped = ^(NSArray *collection, id page, NSError *error) {
-        completion(ApolloHideModFilterModeratedCollection(collection), page, error);
-    };
-    return %orig(pagination, wrapped);
+%hook RDKUser
+
+// Source of truth for moderator powers app-wide. Return the full list normally;
+// return the hidden-filtered list ONLY while the Subreddits list is reading it
+// for display and we're not in Edit mode. This hides the rows without ever
+// telling the rest of the app you moderate fewer subreddits.
+- (NSArray *)moderatedSubreddits {
+    NSArray *full = %orig;
+    if (sListFilterDepth <= 0 || sShowHiddenForEditing) return full;
+    return ApolloHideModFilteredList(full);
 }
 
 %end
@@ -188,25 +226,6 @@ static id ApolloHideModObjectIvar(id object, const char *name) {
 static UITableView *ApolloHideModTableView(UIViewController *viewController) {
     UITableView *tableView = (UITableView *)ApolloHideModObjectIvar(viewController, "tableView");
     return [tableView isKindOfClass:[UITableView class]] ? tableView : nil;
-}
-
-// Triggers the list's own pull-to-refresh path so it refetches subscriptions,
-// multireddits, and moderated subreddits and rebuilds its sections — with the
-// hidden list applied (or not, while editing) by the RDKClient hook above.
-static void ApolloHideModRefreshList(UIViewController *viewController) {
-    SEL refreshSelector = NSSelectorFromString(@"refreshControlActivated:");
-    if (![viewController respondsToSelector:refreshSelector]) {
-        ApolloLog(@"[HideModSubs] refreshControlActivated: missing on %@; list will refresh on next fetch",
-                  NSStringFromClass([viewController class]));
-        return;
-    }
-
-    // Prefer the controller's real refresh control; the Swift implementation
-    // expects a non-nil sender, so fall back to a throwaway one.
-    id refreshControl = ApolloHideModObjectIvar(viewController, "refreshControl");
-    if (![refreshControl isKindOfClass:[UIRefreshControl class]]) refreshControl = [[UIRefreshControl alloc] init];
-    ApolloLog(@"[HideModSubs] triggering native list refresh (includeHidden=%d)", (int)sIncludeHiddenInFetch);
-    ((void (*)(id, SEL, id))objc_msgSend)(viewController, refreshSelector, refreshControl);
 }
 
 // MARK: - Edit-mode hide/unhide control
@@ -328,6 +347,48 @@ static void ApolloHideModDecorateCell(UIViewController *viewController, UITableV
               (unsigned long)ApolloHideModHiddenList().count);
 }
 
+// --- Display-scope window ---
+// Each of these data-source/delegate methods reads currentUser.moderatedSubreddits
+// (directly or via Apollo's inlined helpers) to size, build, navigate, or
+// configure the MODERATOR section. Bumping the thread-local depth around %orig
+// makes the getter return the hidden-filtered list for the whole of that work,
+// so row counts, header height, cells, taps and the context menu all agree.
+// Outside this window — and on any other thread — the getter returns the full
+// list, so moderator powers are never affected.
+
+- (long long)tableView:(UITableView *)tableView numberOfRowsInSection:(long long)section {
+    sListFilterDepth++;
+    long long result = %orig;
+    sListFilterDepth--;
+    return result;
+}
+
+- (CGFloat)tableView:(UITableView *)tableView heightForHeaderInSection:(long long)section {
+    sListFilterDepth++;
+    CGFloat result = %orig;
+    sListFilterDepth--;
+    return result;
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    sListFilterDepth++;
+    %orig;
+    sListFilterDepth--;
+}
+
+- (id)tableView:(UITableView *)tableView contextMenuConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath point:(CGPoint)point {
+    sListFilterDepth++;
+    id result = %orig;
+    sListFilterDepth--;
+    return result;
+}
+
+- (void)tableView:(UITableView *)tableView commitEditingStyle:(UITableViewCellEditingStyle)editingStyle forRowAtIndexPath:(NSIndexPath *)indexPath {
+    sListFilterDepth++;
+    %orig;
+    sListFilterDepth--;
+}
+
 // Moderator rows natively can't be edited (no unsubscribe for moderated
 // subs), so UIKit would not indent them in Edit mode and our gutter button
 // would overlap the subreddit icon. Marking them editable with editing
@@ -357,44 +418,37 @@ static void ApolloHideModDecorateCell(UIViewController *viewController, UITableV
 
 // Decorate every cell on the way out: moderator rows get the hide/unhide
 // control while editing, everything else gets any stale control stripped.
+// The %orig is run inside the display-scope window so the filtered getter
+// produces the right row content; decoration afterwards only reads the cell.
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    sListFilterDepth++;
     UITableViewCell *cell = %orig;
+    sListFilterDepth--;
     if (![cell isKindOfClass:[UITableViewCell class]]) return cell;
 
     NSString *sectionTitle = ApolloHideModSectionTitle(self, tableView, indexPath.section);
     BOOL isModeratorRow = [sectionTitle isEqualToString:@"MODERATOR"];
     NSString *name = isModeratorRow ? ApolloHideModLeftmostLabelText(cell.contentView ?: cell) : nil;
 
-    if (isModeratorRow && name.length > 0) {
-        @synchronized (sModeratedSubredditNames) {
-            if (sModeratedSubredditNames.count > 0 && ![sModeratedSubredditNames containsObject:name.lowercaseString]) {
-                ApolloLog(@"[HideModSubs] row '%@' is in MODERATOR section but missing from fetched moderated set", name);
-            }
-        }
-    }
-
     ApolloHideModDecorateCell((UIViewController *)self, cell, isModeratorRow, tableView.isEditing, name);
     return cell;
 }
 
-// Entering Edit mode: include hidden subs in fetches, reload so moderator
-// rows pick up their toggle buttons immediately, and refetch so hidden rows
-// reappear. Leaving Edit mode: reverse all of it.
+// Entering Edit mode: bypass the display filter so hidden rows reappear, and
+// reload so the rows (and their hide/unhide buttons) update immediately.
+// Leaving Edit mode: re-enable the filter and reload so hidden rows vanish.
+// No network refetch is needed — the rows are driven by the now-complete
+// moderatedSubreddits property through the scoped getter.
 - (void)setEditing:(BOOL)editing animated:(BOOL)animated {
     BOOL wasEditing = [(UIViewController *)self isEditing];
     %orig;
     if (wasEditing == editing) return;
 
-    sIncludeHiddenInFetch = editing;
+    sShowHiddenForEditing = editing;
     ApolloLog(@"[HideModSubs] setEditing=%d hiddenCount=%lu", (int)editing, (unsigned long)ApolloHideModHiddenList().count);
 
     UITableView *tableView = ApolloHideModTableView((UIViewController *)self);
     [tableView reloadData];
-
-    // Only hit the network when there are hidden rows to add or remove.
-    if (ApolloHideModHiddenList().count > 0) {
-        ApolloHideModRefreshList((UIViewController *)self);
-    }
 }
 
 %new
@@ -410,7 +464,7 @@ static void ApolloHideModDecorateCell(UIViewController *viewController, UITableV
     }
 
     // Re-style the tapped row in place; the row only actually disappears
-    // when Edit mode ends and the list refetches with filtering back on.
+    // when Edit mode ends and the filtered getter takes effect on reload.
     UIView *view = sender;
     while (view && ![view isKindOfClass:[UITableViewCell class]]) view = view.superview;
     if (view) {
@@ -424,8 +478,6 @@ static void ApolloHideModDecorateCell(UIViewController *viewController, UITableV
 %end // ApolloHideModList
 
 %ctor {
-    sModeratedSubredditNames = [NSMutableSet set];
-
     %init;
 
     Class listClass = objc_getClass("Apollo.RedditListViewController");
