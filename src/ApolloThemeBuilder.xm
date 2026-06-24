@@ -1017,6 +1017,33 @@ void ApolloThemeBuilderActivateDonorLive(void) {
 
 %end
 
+// The Text Size slider lives in a Eureka custom cell (TextSliderCell) that has
+// no grouped-card backgroundView — its card area is painted by its contentView.
+// Apollo colors that contentView with the primaryBG role, which on this screen
+// is the table's page color (the Appearance VC paints its tableView background
+// with primaryBG and the cell cards with secondaryBG). Standard cells hide that
+// behind their own secondaryBG card, but the slider cell shows the primaryBG
+// contentView directly, so the slider reads as sitting on the page rather than
+// inside its card. Stock themes don't notice because their primaryBG and
+// secondaryBG are nearly identical; a custom theme makes them diverge. Repaint
+// the contentView to the same card color the other cells use, after Apollo's
+// own layout has run.
+%hook _TtC6Apollo14TextSliderCell
+
+- (void)layoutSubviews {
+    %orig;
+    if (!sRemapActive) return;
+    UITableViewCell *cell = (UITableViewCell *)self;
+    NSString *mode = (cell.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) ? @"dark" : @"light";
+    // Match whatever card color the willDisplay hook gave the cell (secondaryBG),
+    // falling back to the role directly if it wasn't set.
+    UIColor *card = cell.backgroundColor
+        ?: ApolloThemeBuilderColorFromHex(ApolloThemeBuilderSavedHex(kApolloThemeRoleSecondaryBG, mode));
+    if (card) cell.contentView.backgroundColor = card;
+}
+
+%end
+
 // A small rounded swatch (background + accent split) previewing the user's
 // light-mode colors, shown next to the "Custom" row in Apollo's theme picker.
 static UIImage *ThemeBuilderPickerSwatch(void) {
