@@ -241,6 +241,16 @@ static NSMutableSet<NSString *> *sCommentGenerationScheduled;
 // loading<->error as the retry schedule and comment captures re-fire.
 static NSMutableSet<NSString *> *sPostFailed;
 static NSMutableSet<NSString *> *sCommentFailed;
+// fullNames whose link/article post box is currently HIDDEN — the page had no
+// usable prose to summarize (score-card / SPA / paywall stub), or the model
+// couldn't summarize the little there was. Distinct from sPostFailed: a
+// suppressed post shows NO box at all (not an error triangle), and we don't
+// re-fetch it while it's on screen. Keeping it separate is essential — folding
+// it into sPostFailed makes ApolloAIRestoreStateForHeader flip the hidden box
+// back to the error triangle every time a header recycles. Like sPostFailed,
+// it is cleared in viewDidDisappear, so each reopen gets a fresh attempt
+// (a content-less page just re-hides; a transient failure recovers).
+static NSMutableSet<NSString *> *sPostSuppressed;
 static NSMutableSet<NSString *> *sTimedOutRequests;
 // "post|fullName" / "comment|fullName" keys for boxes the user TAPPED to generate
 // while Tap-to-Summarize is on. The generation pass consumes the marker and
@@ -343,6 +353,7 @@ static void ApolloAIEnsureState(void) {
         sCommentGenerationScheduled = [NSMutableSet set];
         sPostFailed = [NSMutableSet set];
         sCommentFailed = [NSMutableSet set];
+        sPostSuppressed = [NSMutableSet set];
         sTimedOutRequests = [NSMutableSet set];
         sTapRequested = [NSMutableSet set];
         ApolloAILoadPersistedSummaries();
@@ -377,6 +388,7 @@ NSUInteger ApolloAIClearSummaryCache(void) {
     [sCommentGenerationScheduled removeAllObjects];
     [sPostFailed removeAllObjects];
     [sCommentFailed removeAllObjects];
+    [sPostSuppressed removeAllObjects];
     [sTimedOutRequests removeAllObjects];
     [sTapRequested removeAllObjects];
     [sLinkSummaryPosts removeAllObjects];
@@ -1709,7 +1721,12 @@ static void ApolloAIShowLoadingIfIdle(NSString *fullName, BOOL isPost) {
 // box. Mirrors the caches / in-flight / failed bookkeeping.
 static void ApolloAIRestoreStateForHeader(id headerNode, NSString *fullName) {
     if (!headerNode || fullName.length == 0) return;
-    if (sPostSummaryCache[fullName].length > 0) {
+    if ([sPostSuppressed containsObject:fullName]) {
+        // No usable article content — keep the box hidden on recycle. Must be
+        // checked BEFORE sPostFailed, or a recycled header would surface the
+        // error triangle for a post we deliberately hid.
+        ApolloAISetBoxState(headerNode, YES, ApolloAIBoxStateNone, nil);
+    } else if (sPostSummaryCache[fullName].length > 0) {
         ApolloAISetBoxState(headerNode, YES, ApolloAIBoxStateReady, sPostSummaryCache[fullName]);
     } else if ([sPostFailed containsObject:fullName]) {
         ApolloAISetBoxState(headerNode, YES, ApolloAIBoxStateError, nil);
@@ -1724,6 +1741,25 @@ static void ApolloAIRestoreStateForHeader(id headerNode, NSString *fullName) {
                [sCapturedComments[fullName] count] >= kApolloAIMinComments) {
         ApolloAISetBoxState(headerNode, NO, ApolloAIBoxStateLoading, nil);
     }
+}
+
+// Hide a post's link/article box: the linked page yielded no usable prose
+// (score-card, JS-only SPA, paywall stub), or the model couldn't make a summary
+// of what little there was. The user wants nothing rather than a scary
+// "couldn't summarize" triangle on such links, so we mark the post suppressed
+// (recycled headers stay hidden, no re-fetch while on screen) and clear the
+// in-flight / failed / link-mode bookkeeping that could resurrect a box. The
+// suppression is per-view — viewDidDisappear clears it, so a reopen re-attempts.
+static void ApolloAISuppressLinkSummary(NSString *fullName) {
+    if (fullName.length == 0) return;
+    [sPostInFlight removeObject:fullName];
+    [sPostRequestIDs removeObjectForKey:fullName];
+    [sPostFailed removeObject:fullName];        // NOT an error — don't show the triangle
+    [sLinkSummaryPosts removeObject:fullName];
+    [sBothSummaryPosts removeObject:fullName];
+    [sPostSuppressed addObject:fullName];
+    ApolloAISetBoxStateOnMatchingHeaders(fullName, YES, ApolloAIBoxStateNone, nil);
+    ApolloAIForceHeaderRemeasure(fullName);     // drop the box from the layout now
 }
 
 // Short, user-facing message for a generation error shown inside the box. The
@@ -1839,6 +1875,14 @@ static void ApolloAIScheduleGenerationTimeout(NSString *fullName, BOOL isPost, N
         [inFlight removeObject:fullName];
         [requestIDs removeObjectForKey:fullName];
         [(ApolloFoundationModels *)ApolloAIBridge() cancelRequest:requestID];
+        // A pure link/article post that times out has nothing to show but the
+        // article it couldn't fetch/summarize — hide it rather than leave a
+        // triangle, same as a no-prose result.
+        if (isPost && [sLinkSummaryPosts containsObject:fullName]) {
+            ApolloLog(@"[AISummary] link summary timed out for %@ — hiding", fullName);
+            ApolloAISuppressLinkSummary(fullName);
+            return;
+        }
         NSMutableSet *failed = isPost ? sPostFailed : sCommentFailed;
         [failed addObject:fullName];
         ApolloAISetBoxStateOnMatchingHeaders(
@@ -2145,6 +2189,17 @@ maximumResponseTokens:responseTokens
                         }
                         return;
                     }
+                    // Pure link/article post (no body to fall back on): if the
+                    // model can't summarize the little prose we scraped, the user
+                    // wants nothing rather than a "couldn't summarize" triangle.
+                    // Hide it. (Both / post-fallback summaries keep the error —
+                    // there the post body itself is the thing that failed.)
+                    if ([sLinkSummaryPosts containsObject:fullName]) {
+                        ApolloLog(@"[AISummary] link summary unusable for %@ (%@) — hiding", fullName,
+                                  error ? error.localizedDescription : @"empty");
+                        ApolloAISuppressLinkSummary(fullName);
+                        return;
+                    }
                     [sPostFailed addObject:fullName];
                     NSString *msg = error ? ApolloAIFriendlyError(error) : @"The model returned an empty summary.";
                     ApolloLog(@"[AISummary] link summary error: %@", error ? error.localizedDescription : @"(empty)");
@@ -2224,17 +2279,14 @@ static void ApolloAIGenerateLinkSummaryForController(NSString *articleURL, NSStr
                 return;
             }
             // No body either — a video-clip page (streamff/streamin/etc.), a
-            // JS-rendered SPA (Bluesky/Twitter), a paywall, and so on. Don't show
-            // an error card: just HIDE the box, as if the post weren't a
-            // summarizable article. Marked failed so we don't re-fetch every scroll.
-            [sPostInFlight removeObject:fullName];
-            [sPostRequestIDs removeObjectForKey:fullName];
-            [sPostFailed addObject:fullName];
-            [sLinkSummaryPosts removeObject:fullName];
+            // JS-rendered SPA (Bluesky/Twitter), a paywall, a bare score-card
+            // (fifa.com match centre), and so on. Don't show an error card: just
+            // HIDE the box, as if the post weren't a summarizable article, and
+            // suppress it so we don't re-fetch every scroll or flip back to an
+            // error triangle on header recycle.
             ApolloLog(@"[AISummary] no article prose for %@ — hiding link summary (%@)", fullName,
                       fetchError ? fetchError.localizedDescription : @"too little text");
-            ApolloAISetBoxStateOnMatchingHeaders(fullName, YES, ApolloAIBoxStateNone, nil);
-            ApolloAIForceHeaderRemeasure(fullName);   // drop the loading card from layout
+            ApolloAISuppressLinkSummary(fullName);
             return;
         }
         sArticleTextCache[fullName] = articleText;
@@ -2320,7 +2372,14 @@ static void ApolloAIGenerateForController(UIViewController *vc) {
     BOOL cacheValid = sPostSummaryCache[fullName].length > 0 &&
         [sPostSummaryMode[fullName] integerValue] == desiredMode;
     NSString *postTapKey = [@"post|" stringByAppendingString:fullName];
-    if (cacheValid) {
+    if ([sPostSuppressed containsObject:fullName]) {
+        // A pure-link post we already determined has no usable article content:
+        // keep it hidden and never re-fetch or re-offer a "Tap to summarize"
+        // prompt. (Self-text posts are never suppressed, so the body still
+        // summarizes normally on a different post that happens to share nothing
+        // here.)
+        ApolloAISetBoxStateOnMatchingHeaders(fullName, YES, ApolloAIBoxStateNone, nil);
+    } else if (cacheValid) {
         ApolloAISetBoxStateOnMatchingHeaders(fullName, YES, ApolloAIBoxStateReady, sPostSummaryCache[fullName]);
     } else if (sEnableTapToSummarize && (haveBody || haveArticle) &&
                ![sTapRequested containsObject:postTapKey] &&
@@ -2622,6 +2681,15 @@ static void ApolloAILogTableStructure(UIViewController *vc) {
         [sCommentRequestIDs removeObjectForKey:fullName];
         [sPostFailed removeObject:fullName];
         [sCommentFailed removeObject:fullName];
+        // Suppression is per-view, exactly like sPostFailed above: a link we hid
+        // because it had no usable prose (or failed transiently — model still
+        // downloading, a flaky network, a slow fetch that timed out) gets a fresh
+        // attempt the next time the post is opened. A genuinely content-less page
+        // (fifa.com score card) simply re-fetches, re-detects "no prose" and
+        // re-hides — cheap, and it never shows the error triangle — while a
+        // transient failure recovers on reopen instead of staying hidden for the
+        // whole session.
+        [sPostSuppressed removeObject:fullName];
         if (sPostSummaryCache[fullName].length == 0) {
             ApolloAISetBoxStateOnMatchingHeaders(fullName, YES, ApolloAIBoxStateNone, nil);
         }
