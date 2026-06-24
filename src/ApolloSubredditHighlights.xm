@@ -475,6 +475,36 @@ static NSDictionary<NSString *, ApolloHLItem *> *ApolloHLParseInfoListing(NSDict
 @property (nonatomic) int polls;
 @end
 @implementation ApolloHLWebFetch
+
+// A single non-persistent (in-memory) WKWebsiteDataStore, reused for every
+// highlights scrape this app session.
+//
+// Why isolate the scrape from the app's shared cookies: Reddit serves the *old*
+// reddit layout at www.reddit.com whenever the logged-in session belongs to an
+// account whose "Use new Reddit as my default experience" preference is disabled.
+// Apollo's OAuth login runs through a www.reddit.com web view, so that account's
+// session + old-reddit preference land in the SHARED default WKWebsiteDataStore.
+// Old reddit renders none of the "Community Highlights" carousel markup this
+// scraper looks for, so the web upgrade silently finds nothing and the carousel
+// stays stuck on just the two stickied posts the REST listing returns — exactly
+// the "only got the first 2 posts" symptom. The poison is sticky too: deleting
+// the Apollo account never clears WebKit cookies, so only deleting the whole app
+// cleared it. (Same root cause as the Social Links scrape fixed in #496; reported
+// there by @Uranosphaerite as also affecting Community Highlights / #463.)
+//
+// A logged-out, in-memory store sidesteps all of it: with no account session
+// Reddit serves its default (new/shreddit) experience — which DOES carry the
+// highlights carousel — so the scrape can neither poison nor be poisoned by the
+// user's browsing session, and it resets each launch. Shared (not per-scrape) so
+// Reddit's JS bot-challenge cookie warms once per session rather than cold on
+// every subreddit. Highlights are public, so no login is needed.
++ (WKWebsiteDataStore *)apollo_scrapeDataStore {
+    static WKWebsiteDataStore *store;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ store = [WKWebsiteDataStore nonPersistentDataStore]; });
+    return store;
+}
+
 - (void)startForSub:(NSString *)sub completion:(void (^)(NSArray<ApolloHLItem *> *))done {
     self.sub = sub; self.done = done; self.polls = 0;
     UIWindow *win = nil;
@@ -484,7 +514,9 @@ static NSDictionary<NSString *, ApolloHLItem *> *ApolloHLParseInfoListing(NSDict
     }
     if (!win) win = UIApplication.sharedApplication.windows.firstObject;
     if (!win) { [self finish:nil]; return; }
-    self.web = [[WKWebView alloc] initWithFrame:win.bounds configuration:[[WKWebViewConfiguration alloc] init]];
+    WKWebViewConfiguration *config = [[WKWebViewConfiguration alloc] init];
+    config.websiteDataStore = [ApolloHLWebFetch apollo_scrapeDataStore];
+    self.web = [[WKWebView alloc] initWithFrame:win.bounds configuration:config];
     self.web.navigationDelegate = self;
     self.web.alpha = 0.011; self.web.userInteractionEnabled = NO;
     [win insertSubview:self.web atIndex:0];
