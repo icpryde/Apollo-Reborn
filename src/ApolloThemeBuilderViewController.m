@@ -54,6 +54,9 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = self.colorEditorMode ? ApolloThemeBuilderActiveCustomThemeName() : @"Theme Builder";
+    // Give the table an opaque background before the push transition's first
+    // frame so the previous screen never shows through while sliding in.
+    [self applyThemeColors];
 }
 
 - (instancetype)initColorEditor {
@@ -91,7 +94,10 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
 
 - (void)applyThemeColors {
     if (!ApolloThemeBuilderIsEnabled()) {
-        self.tableView.backgroundColor = nil; // restore system default
+        // Use the opaque grouped-table default, NOT nil — nil leaves the table
+        // view transparent, which shows the previous screen straight through the
+        // push transition (and behind the cells anywhere the theme isn't active).
+        self.tableView.backgroundColor = UIColor.systemGroupedBackgroundColor;
         return;
     }
     NSString *mode = [self previewMode];
