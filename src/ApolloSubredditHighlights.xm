@@ -97,6 +97,7 @@ static const void *kApolloHLActiveSubKey       = &kApolloHLActiveSubKey;      //
 static const void *kApolloHLContainerKey       = &kApolloHLContainerKey;      // ApolloHLHeaderContainerView on the VC (headers-on coexistence)
 static char kApolloHLHiddenRowsKey;            // NSMutableSet<NSNumber*> of de-duped sticky rows, per ASTableNode
 static char kApolloHLStickyCountKey;           // NSNumber (REST sticky count N) per feed ASTableNode — breaker rule
+static char kApolloHLSwitchPendingKey;         // BOOL on the VC — an in-place-switch re-install is already scheduled
 
 #pragma mark - Subreddit detection (adapted from ApolloSubredditHeaders.xm)
 
@@ -1853,6 +1854,41 @@ static void ApolloHLCollapseOrphanSeparators(UIViewController *vc) {
 #pragma mark - Hooks
 
 %hook UITableView
+
+// Catch an in-place subreddit switch (the nav-title "jump bar": tap the sub name,
+// type another sub) under a REUSED PostsViewController. On that path Apollo swaps
+// the feed's contents in place — the table re-lays-out repeatedly — but the VC's
+// viewDidLayoutSubviews (which drives ApolloHLInstall) does NOT fire, so the
+// standalone carousel keeps showing the PREVIOUS sub's highlights on the new feed.
+// The feed table's own layoutSubviews DOES fire throughout the switch, so detect
+// the stale carousel here and re-run install. Only managed feed tables (those
+// currently hosting our carousel) are inspected — a single associated-object read
+// short-circuits every other UITableView in the app.
+- (void)layoutSubviews {
+    %orig;
+    if (!sCommunityHighlights || sShowSubredditHeaders) return;
+    if (![objc_getAssociatedObject(self, kApolloHLManagedTableKey) boolValue]) return;
+    UIViewController *vc = objc_getAssociatedObject(self, kApolloHLManagedVCKey);
+    if (!vc) return;
+    NSString *installed = objc_getAssociatedObject(vc, kApolloHLSubredditKey); // carousel's sub
+    if (installed.length == 0) return;
+    NSString *current = ApolloHLSubredditName(vc); // nil for special feeds (all/home/popular/…)
+    if ([installed isEqualToString:current]) return; // still the same sub → nothing to do
+    // The VC now shows a different sub (or a special feed) than the installed carousel.
+    // Re-run install on the next runloop turn — NOT inline: ApolloHLInstall sets
+    // tableHeaderView, which would re-enter layoutSubviews. Guard so a single
+    // re-install is scheduled per switch rather than one per layout pass.
+    if ([objc_getAssociatedObject(vc, &kApolloHLSwitchPendingKey) boolValue]) return;
+    objc_setAssociatedObject(vc, &kApolloHLSwitchPendingKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    __weak UIViewController *weakVC = vc;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIViewController *strongVC = weakVC;
+        if (!strongVC) return;
+        objc_setAssociatedObject(strongVC, &kApolloHLSwitchPendingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        ApolloLog(@"[Highlights] in-place subreddit switch → rebuilding carousel for %@", ApolloHLSubredditName(strongVC) ?: @"(special feed)");
+        ApolloHLInstall(strongVC);
+    });
+}
 
 - (void)setTableHeaderView:(UIView *)tableHeaderView {
     if (![objc_getAssociatedObject(self, kApolloHLManagedTableKey) boolValue]) { %orig; return; }
