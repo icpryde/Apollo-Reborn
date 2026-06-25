@@ -63,6 +63,10 @@ BOOL ApolloThemeBuilderParseImport(NSData *data, NSString **outName,
                                    NSDictionary<NSString *, NSString *> **outColors);
 // Filesystem-safe "<name>.json" for an exported theme.
 NSString *ApolloThemeBuilderExportFilename(NSString *themeName);
+// Maximum accepted size (bytes) for an imported theme file. Callers should enforce
+// this BEFORE reading a picked file into memory, so a multi-hundred-MB file can't be
+// fully loaded (spiking memory / risking jetsam) before the parser's own cap rejects it.
+NSUInteger ApolloThemeBuilderMaxImportBytes(void);
 
 BOOL ApolloThemeBuilderIsEnabled(void);
 void ApolloThemeBuilderSetEnabled(BOOL enabled);

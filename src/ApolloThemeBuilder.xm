@@ -421,6 +421,7 @@ void ApolloThemeBuilderResetActiveCustomThemeColors(void) {
 static NSString * const kThemeExportMarkerKey = @"apolloThemeBuilder";
 static const NSInteger kThemeExportVersion = 1;
 static const NSUInteger kThemeImportMaxBytes = 256 * 1024; // generous; a theme is <1KB
+NSUInteger ApolloThemeBuilderMaxImportBytes(void) { return kThemeImportMaxBytes; }
 static const NSUInteger kThemeNameMaxLength = 60;
 
 // "RRGGBB" (uppercased) if the value is a valid 6-digit hex color, '#'/
@@ -1049,18 +1050,27 @@ static void ThemeBuilderColorListCell(UITableViewCell *cell) {
     UIColor *sel = ApolloThemeBuilderSelectionColor(mode);
     if (!sel) return;
     // Eureka settings cells highlight via a selectedBackgroundView over their card.
+    // This is the idiomatic, self-restoring mechanism — UIKit shows it on press and
+    // hides it on release, so it can never get stuck — set it on every in-scope cell.
     if (![cell.selectedBackgroundView.backgroundColor isEqual:sel]) {
         UIView *bg = [[UIView alloc] init];
         bg.backgroundColor = sel;
         cell.selectedBackgroundView = bg;
     }
-    // Apollo's own cells instead swap their backgroundColor, which the remap
-    // collapses onto the card — paint the themed selection while pressed.
+    // Apollo's OWN cells ignore selectedBackgroundView and instead swap their
+    // backgroundColor, which the remap collapses onto the card (invisible) — so for
+    // those we paint the themed selection directly. This is scoped to Apollo cells AND
+    // restored to the card colour when NOT highlighted: a Eureka cell never repaints its
+    // own contentView, so painting it here would linger after release (hiding the card).
     // Appearance/Theme Builder own their cell background, so leave those alone.
-    if (cell.highlighted && ![owner containsString:@"Appearance"]
-        && ![cell.contentView.backgroundColor isEqual:sel]) {
-        cell.backgroundColor = sel;
-        cell.contentView.backgroundColor = sel;
+    BOOL isApolloCell = [NSStringFromClass([cell class]) containsString:@"Apollo"];
+    if (isApolloCell && ![owner containsString:@"Appearance"]) {
+        UIColor *want = cell.highlighted ? sel
+            : ApolloThemeBuilderColorFromHex(ApolloThemeBuilderSavedHex(kApolloThemeRolePrimaryBG, mode));
+        if (want && ![cell.contentView.backgroundColor isEqual:want]) {
+            cell.backgroundColor = want;
+            cell.contentView.backgroundColor = want;
+        }
     }
 }
 

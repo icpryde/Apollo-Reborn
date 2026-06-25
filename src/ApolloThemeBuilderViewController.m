@@ -827,9 +827,23 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
     // asCopy:YES vends an app-local copy, so this is usually a no-op; keep it as harmless
     // best-effort in case the OS ever hands back a security-scoped URL.
     BOOL scoped = [url startAccessingSecurityScopedResource];
+    // Enforce the size cap BEFORE reading: a theme is <1KB, so reject anything large up
+    // front rather than loading a multi-hundred-MB file into RAM (which could spike
+    // memory / get us jetsammed) only for the parser's own cap to bounce it afterwards.
+    NSNumber *fileSize = nil;
+    [url getResourceValue:&fileSize forKey:NSURLFileSizeKey error:NULL];
+    NSUInteger cap = ApolloThemeBuilderMaxImportBytes();
+    if (fileSize && fileSize.unsignedLongLongValue > cap) {
+        if (scoped) [url stopAccessingSecurityScopedResource];
+        ApolloLog(@"ThemeBuilder: import rejected oversize bytes=%@ cap=%lu", fileSize, (unsigned long)cap);
+        [self presentImportAlertWithTitle:@"Couldn’t Import Theme"
+                                  message:@"This file is too large to be an Apollo theme."];
+        return;
+    }
     // Read through a file coordinator so an iCloud-Drive file that is only a placeholder
     // gets materialized (downloaded) before we read it — a bare dataWithContentsOfURL:
-    // returns nil for an un-downloaded cloud file.
+    // returns nil for an un-downloaded cloud file. NSDataReadingMappedIfSafe maps rather
+    // than copies into RAM, a second guard if the size couldn't be read above.
     __block NSData *data = nil;
     __block NSError *readError = nil;
     NSError *coordError = nil;
@@ -838,7 +852,7 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
                                     options:NSFileCoordinatorReadingWithoutChanges
                                       error:&coordError
                                  byAccessor:^(NSURL *readURL) {
-        data = [NSData dataWithContentsOfURL:readURL options:0 error:&readError];
+        data = [NSData dataWithContentsOfURL:readURL options:NSDataReadingMappedIfSafe error:&readError];
     }];
     if (scoped) [url stopAccessingSecurityScopedResource];
     if (!data) {
