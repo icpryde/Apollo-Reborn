@@ -1024,17 +1024,26 @@ void ApolloThemeBuilderActivateDonorLive(void) {
 // layoutSubviews AND setHighlighted: some cells (e.g. ApolloSubtitleTableViewCell,
 // which Filters & Blocks uses) don't route their layoutSubviews through this hook,
 // so the layout-only path missed them — setHighlighted always runs.
-static void ThemeBuilderColorListCell(UITableViewCell *cell) {
-    if (!sRemapActive) return;
+// The owning view-controller class name if this cell belongs to an Apollo
+// settings/search list, else nil. Used to scope every side effect (including the
+// re-layout) to those screens only — never UIKit's own table views such as the
+// keyboard's input-switcher menu.
+static NSString *ThemeBuilderListCellOwner(UITableViewCell *cell) {
     UIView *v = cell.superview;
     while (v && ![v isKindOfClass:[UITableView class]]) v = v.superview;
-    if (![v isKindOfClass:[UITableView class]]) return;
+    if (![v isKindOfClass:[UITableView class]]) return nil;
     id delegate = ((UITableView *)v).delegate;
-    if (!delegate) return;
+    if (!delegate) return nil;
     NSString *owner = NSStringFromClass([delegate class]);
     BOOL inScope = [owner containsString:@"ViewController"]
         && ([owner containsString:@"Settings"] || [owner containsString:@"Search"]);
-    if (!inScope) return;
+    return inScope ? owner : nil;
+}
+
+static void ThemeBuilderColorListCell(UITableViewCell *cell) {
+    if (!sRemapActive) return;
+    NSString *owner = ThemeBuilderListCellOwner(cell);
+    if (!owner) return;
     NSString *mode = (cell.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) ? @"dark" : @"light";
     UIColor *sel = ApolloThemeBuilderSelectionColor(mode);
     if (!sel) return;
@@ -1064,8 +1073,10 @@ static void ThemeBuilderColorListCell(UITableViewCell *cell) {
 - (void)setHighlighted:(BOOL)highlighted animated:(BOOL)animated {
     %orig;
     // Re-run layoutSubviews so the themed highlight is applied on press and the
-    // cell's own %orig restores its normal background on release.
-    if (sRemapActive) [self setNeedsLayout];
+    // cell's own %orig restores its normal background on release — but ONLY for
+    // our settings/search cells. Calling setNeedsLayout on every UITableViewCell
+    // (the keyboard's input-switcher menu, alerts, …) is an unwanted side effect.
+    if (sRemapActive && ThemeBuilderListCellOwner(self)) [self setNeedsLayout];
 }
 
 %end
