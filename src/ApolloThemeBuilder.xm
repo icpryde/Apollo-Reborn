@@ -840,17 +840,25 @@ static void ThemeBuilderApplyHighlight(UITableViewCell *cell) {
 // release the node's %orig restores its normal colour and we leave it.
 static void ThemeBuilderApplyNodeHighlight(id node, BOOL highlighted) {
     if (!sRemapActive) return;
-    id bgNode = ThemeBuilderObjectIvar(node, "backgroundNode");
-    if (![bgNode respondsToSelector:@selector(setBackgroundColor:)]) return;
     UIUserInterfaceStyle style = UITraitCollection.currentTraitCollection.userInterfaceStyle;
     NSString *mode = (style == UIUserInterfaceStyleDark) ? @"dark" : @"light";
-    // Pressed → the visible themed highlight; released → restore the card colour
-    // ourselves (the node's own setHighlighted:NO leaves the pressed colour in
-    // place until the next layout pass, so a tap-cancel could otherwise linger).
-    UIColor *color = highlighted
-        ? ApolloThemeBuilderSelectionColor(mode)
-        : ApolloThemeBuilderColorFromHex(ApolloThemeBuilderSavedHex(kApolloThemeRolePrimaryBG, mode));
-    if (color) ((void (*)(id, SEL, UIColor *))objc_msgSend)(bgNode, @selector(setBackgroundColor:), color);
+    UIColor *sel = ApolloThemeBuilderSelectionColor(mode);
+    if (!sel) return;
+    id bgNode = ThemeBuilderObjectIvar(node, "backgroundNode");
+    if ([bgNode respondsToSelector:@selector(setBackgroundColor:)]) {
+        // Profile-style cells (ProfileFeatureCellNode) recolour a child
+        // backgroundNode and DON'T restore it on release, so we drive both
+        // directions ourselves (card colour when not pressed).
+        UIColor *color = highlighted ? sel
+            : ApolloThemeBuilderColorFromHex(ApolloThemeBuilderSavedHex(kApolloThemeRolePrimaryBG, mode));
+        if (color) ((void (*)(id, SEL, UIColor *))objc_msgSend)(bgNode, @selector(setBackgroundColor:), color);
+    } else if (highlighted && [node respondsToSelector:@selector(setBackgroundColor:)]) {
+        // Post-style cells (LargePostCellNode / CompactPostCellNode) recolour the
+        // node's own background to a darker shade on press — invisible on a dark
+        // theme. Override to the visible highlight; the node's own
+        // setHighlighted:NO restores the normal colour, so we only touch press.
+        ((void (*)(id, SEL, UIColor *))objc_msgSend)(node, @selector(setBackgroundColor:), sel);
+    }
 }
 
 static void ThemeBuilderApplyAccentImageView(id cell) {
@@ -1128,6 +1136,27 @@ void ApolloThemeBuilderActivateDonorLive(void) {
 // cell nodes, not table cells, so the table-cell highlight hooks don't reach
 // them. Repaint their backgroundNode to the themed selection while pressed.
 %hook _TtC6Apollo22ProfileFeatureCellNode
+
+- (void)setHighlighted:(BOOL)highlighted {
+    %orig;
+    ThemeBuilderApplyNodeHighlight(self, highlighted);
+}
+
+%end
+
+// Feed post cells are Texture nodes too, but recolour the node's own background
+// (not a child backgroundNode) to a darker shade on press — invisible on a dark
+// custom theme. Repaint to the visible themed selection while pressed.
+%hook _TtC6Apollo17LargePostCellNode
+
+- (void)setHighlighted:(BOOL)highlighted {
+    %orig;
+    ThemeBuilderApplyNodeHighlight(self, highlighted);
+}
+
+%end
+
+%hook _TtC6Apollo19CompactPostCellNode
 
 - (void)setHighlighted:(BOOL)highlighted {
     %orig;
