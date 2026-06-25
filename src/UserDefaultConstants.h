@@ -120,5 +120,11 @@ static NSString *const UDKeyFeedTextPostThumbnails = @"FeedTextPostThumbnails";
 // Rich link preview cards: 0 = Off, 1 = Compact, 2 = Full.
 static NSString *const UDKeyLinkPreviewBodyMode = @"LinkPreviewBodyMode";
 static NSString *const UDKeyLinkPreviewCommentsMode = @"LinkPreviewCommentsMode";
+// Legacy preset color (ApolloLinkPreviewCardColor enum). Superseded by the
+// free-form hex below; still read once at launch to migrate an old selection.
 static NSString *const UDKeyLinkPreviewCardColor = @"LinkPreviewCardColor";
+// Free-form preview card color as a 6-digit "RRGGBB" hex string. Empty string
+// means "Default" (no custom fill — the standard neutral card). A non-empty
+// hex paints the whole card that exact color, with auto-contrasted text.
+static NSString *const UDKeyLinkPreviewCardColorHex = @"LinkPreviewCardColorHex";
 static NSString *const ApolloLinkPreviewModeDidChangeNotification = @"ApolloLinkPreviewModeDidChangeNotification";

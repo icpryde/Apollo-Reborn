@@ -113,7 +113,20 @@ typedef NS_ENUM(NSInteger, ApolloLinkPreviewCardColor) {
 // Rich link previews (Open Graph / oEmbed) for link cards in body/feed and comments.
 extern NSInteger sLinkPreviewBodyMode;
 extern NSInteger sLinkPreviewCommentsMode;
+// Legacy preset enum, retained only for one-time migration to the hex below.
 extern NSInteger sLinkPreviewCardColor;
+// Free-form preview card color, 6-digit "RRGGBB" hex. nil/empty = Default (no
+// custom fill). When set, the whole card is painted this exact color.
+// MAIN-THREAD ONLY: read/written by the settings UI and persistence. The card
+// renderer runs on Texture background layout threads and must NOT touch this
+// NSString* (racing a strong-pointer reassign risks a use-after-free); it reads
+// the packed snapshot below instead. Both are updated together via
+// ApolloSetLinkPreviewCardColorHex().
+extern NSString *sLinkPreviewCardColorHex;
+// Render-safe snapshot of the card color, readable from any thread (an aligned
+// 32-bit volatile load is atomic on arm64). 0 = Default; otherwise
+// (1<<24) | (R<<16) | (G<<8) | B.
+extern volatile uint32_t sLinkPreviewCardColorPacked;
 
 // Media upload host selection. Imgur is the default; Reddit uses Apollo's signed-in
 // session to upload directly to Reddit's media storage; ImgChest uploads to

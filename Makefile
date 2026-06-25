@@ -92,6 +92,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloWebSessionLoginViewController.m \
     $(SRC_DIR)/ApolloManualSignInViewController.m \
     $(SRC_DIR)/CustomAPIViewController.m \
+    $(SRC_DIR)/ApolloLinkPreviewSettingsViewController.m \
     $(SRC_DIR)/TranslationSettingsViewController.m \
     $(SRC_DIR)/SavedCategoriesViewController.m \
     $(SRC_DIR)/TagFiltersViewController.m \
