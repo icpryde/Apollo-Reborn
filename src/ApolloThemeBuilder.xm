@@ -1036,7 +1036,8 @@ static NSString *ThemeBuilderListCellOwner(UITableViewCell *cell) {
     if (!delegate) return nil;
     NSString *owner = NSStringFromClass([delegate class]);
     BOOL inScope = [owner containsString:@"ViewController"]
-        && ([owner containsString:@"Settings"] || [owner containsString:@"Search"]);
+        && ([owner containsString:@"Settings"] || [owner containsString:@"Search"]
+            || [owner containsString:@"Friends"]);
     return inScope ? owner : nil;
 }
 
@@ -1185,6 +1186,17 @@ static void ThemeBuilderColorListCell(UITableViewCell *cell) {
 %end
 
 %hook _TtC6Apollo19CompactPostCellNode
+
+- (void)setHighlighted:(BOOL)highlighted {
+    %orig;
+    ThemeBuilderApplyNodeHighlight(self, highlighted);
+}
+
+%end
+
+// Comment cells (profile Comments/Saved/Overview, thread comments) are Texture
+// nodes too — same node-highlight path as the feed posts.
+%hook _TtC6Apollo15CommentCellNode
 
 - (void)setHighlighted:(BOOL)highlighted {
     %orig;
