@@ -38,6 +38,11 @@
 // Number of Reborn sections appended after the native ones.
 static const NSInteger kApolloPFExtraSections = 2;
 
+// Reuse identifier for the Blocked Users toggle row. It has its OWN identifier so
+// it never enters Apollo's cell-reuse pool — otherwise its chevron / accessoryType
+// would leak onto recycled username / "Add User" cells.
+static NSString *const kApolloPFBlockedToggleReuse = @"ApolloPFBlockedUsersToggle";
+
 // Collapsible native Blocked Users section (the last native section): collapsed by
 // default to a single tappable header so a long block list doesn't bloat the page.
 // Expanding restores Apollo's own rows (Add User + swipe-delete) unchanged — we only
@@ -126,19 +131,25 @@ static UIView *ApolloPFSectionFooterView(NSString *text) {
                 BOOL expanded = [objc_getAssociatedObject(self, kApolloPFBlockedExpandedKey) boolValue];
                 NSInteger n = [objc_getAssociatedObject(self, kApolloPFBlockedNativeCountKey) integerValue];
                 NSInteger count = MAX((NSInteger)0, n - 1); // exclude the "Add User" row
-                NSInteger nativeRows0 = [self tableView:tableView numberOfRowsInSection:0];
-                UITableViewCell *cell = %orig(tableView, [NSIndexPath indexPathForRow:MAX((NSInteger)0, nativeRows0 - 1) inSection:0]);
-                cell.imageView.image = nil;
-                cell.textLabel.textColor = [UIColor labelColor];
+                // Our OWN cell (separate reuse pool) so nothing leaks onto Apollo's rows.
+                UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:kApolloPFBlockedToggleReuse];
+                if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:kApolloPFBlockedToggleReuse];
+                // Match Apollo's themed cell background by sampling a native cell.
+                @try {
+                    UITableViewCell *probe = %orig(tableView, [NSIndexPath indexPathForRow:0 inSection:0]);
+                    UIColor *bg = probe.backgroundColor ?: probe.contentView.backgroundColor;
+                    if (bg && CGColorGetAlpha(bg.CGColor) > 0.01) cell.backgroundColor = bg;
+                } @catch (__unused id e) {}
                 cell.textLabel.text = [NSString stringWithFormat:@"Blocked Users (%ld)", (long)count];
+                cell.textLabel.textColor = [UIColor labelColor];
                 cell.selectionStyle = UITableViewCellSelectionStyleDefault;
-                cell.accessoryType = UITableViewCellAccessoryNone;
                 UIImageView *chevron = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:(expanded ? @"chevron.down" : @"chevron.right")]];
                 chevron.tintColor = [UIColor tertiaryLabelColor];
                 [chevron sizeToFit];
                 cell.accessoryView = chevron;
                 return cell;
             }
+            // Apollo's own rows — returned untouched (their native disclosures etc. intact).
             return %orig(tableView, [NSIndexPath indexPathForRow:indexPath.row - 1 inSection:indexPath.section]);
         }
         return %orig;
