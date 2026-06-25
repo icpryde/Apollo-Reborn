@@ -32,8 +32,6 @@
 - (void)apollo_pfOpenDetailForSubreddit:(NSString *)sub fromTable:(UITableView *)tableView;
 - (void)apollo_pfPromptAddSubredditFromTable:(UITableView *)tableView;
 - (void)apollo_pfPromptAddNameFromTable:(UITableView *)tableView;
-- (UIView *)apollo_pfBlockedToggleHeaderForTable:(UITableView *)tableView;
-- (void)apollo_pfToggleBlocked:(UITapGestureRecognizer *)gesture;
 - (void)apollo_pfSetBlockedExpanded:(BOOL)expanded table:(UITableView *)tableView;
 @end
 
@@ -46,7 +44,6 @@ static const NSInteger kApolloPFExtraSections = 2;
 // vary the row COUNT (0 vs %orig), never re-map indices, so native editing is intact.
 static const void *kApolloPFBlockedExpandedKey   = &kApolloPFBlockedExpandedKey;   // NSNumber BOOL on the VC
 static const void *kApolloPFBlockedNativeCountKey = &kApolloPFBlockedNativeCountKey; // NSNumber on the VC (rows incl. Add)
-static const void *kApolloPFBlockedHeaderTableKey = &kApolloPFBlockedHeaderTableKey; // UITableView on the header view
 
 #pragma mark - Section header / footer views (self-sizing)
 
@@ -105,12 +102,13 @@ static UIView *ApolloPFSectionFooterView(NSString *text) {
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     NSInteger native = [self apollo_pfNativeSectionCount:tableView];
     if (section < native) {
-        // Blocked Users = last native section: collapse to a single summary row
-        // unless expanded (then show Apollo's own rows, unchanged).
+        // Blocked Users = last native section. Row 0 is always our "Blocked Users (N)"
+        // toggle; when expanded, Apollo's own rows follow (offset by 1) in the SAME
+        // group, so it reads as one continuous list rather than a floating header.
         if (native > 0 && section == native - 1) {
             NSInteger n = %orig; // native row count (blocked users + "Add User")
             objc_setAssociatedObject(self, kApolloPFBlockedNativeCountKey, @(n), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            return [objc_getAssociatedObject(self, kApolloPFBlockedExpandedKey) boolValue] ? n : 1;
+            return [objc_getAssociatedObject(self, kApolloPFBlockedExpandedKey) boolValue] ? (n + 1) : 1;
         }
         return %orig;
     }
@@ -121,20 +119,27 @@ static UIView *ApolloPFSectionFooterView(NSString *text) {
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     NSInteger native = [self apollo_pfNativeSectionCount:tableView];
     if (indexPath.section < native) {
-        // Collapsed Blocked Users: a single themed "Blocked Users (N)" disclosure row.
-        if (native > 0 && indexPath.section == native - 1 &&
-            ![objc_getAssociatedObject(self, kApolloPFBlockedExpandedKey) boolValue]) {
-            NSInteger n = [objc_getAssociatedObject(self, kApolloPFBlockedNativeCountKey) integerValue];
-            NSInteger count = MAX((NSInteger)0, n - 1); // exclude the "Add User" row
-            NSInteger nativeRows0 = [self tableView:tableView numberOfRowsInSection:0];
-            UITableViewCell *cell = %orig(tableView, [NSIndexPath indexPathForRow:MAX((NSInteger)0, nativeRows0 - 1) inSection:0]);
-            cell.imageView.image = nil;
-            cell.accessoryView = nil;
-            cell.textLabel.textColor = [UIColor labelColor];
-            cell.textLabel.text = [NSString stringWithFormat:@"Blocked Users (%ld)", (long)count];
-            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-            cell.selectionStyle = UITableViewCellSelectionStyleDefault;
-            return cell;
+        if (native > 0 && indexPath.section == native - 1) {
+            // Row 0 = the "Blocked Users (N)" toggle (chevron points right collapsed,
+            // down expanded). Rows >0 are Apollo's own rows, offset by 1.
+            if (indexPath.row == 0) {
+                BOOL expanded = [objc_getAssociatedObject(self, kApolloPFBlockedExpandedKey) boolValue];
+                NSInteger n = [objc_getAssociatedObject(self, kApolloPFBlockedNativeCountKey) integerValue];
+                NSInteger count = MAX((NSInteger)0, n - 1); // exclude the "Add User" row
+                NSInteger nativeRows0 = [self tableView:tableView numberOfRowsInSection:0];
+                UITableViewCell *cell = %orig(tableView, [NSIndexPath indexPathForRow:MAX((NSInteger)0, nativeRows0 - 1) inSection:0]);
+                cell.imageView.image = nil;
+                cell.textLabel.textColor = [UIColor labelColor];
+                cell.textLabel.text = [NSString stringWithFormat:@"Blocked Users (%ld)", (long)count];
+                cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+                cell.accessoryType = UITableViewCellAccessoryNone;
+                UIImageView *chevron = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:(expanded ? @"chevron.down" : @"chevron.right")]];
+                chevron.tintColor = [UIColor tertiaryLabelColor];
+                [chevron sizeToFit];
+                cell.accessoryView = chevron;
+                return cell;
+            }
+            return %orig(tableView, [NSIndexPath indexPathForRow:indexPath.row - 1 inSection:indexPath.section]);
         }
         return %orig;
     }
@@ -176,12 +181,8 @@ static UIView *ApolloPFSectionFooterView(NSString *text) {
 - (UIView *)tableView:(UITableView *)tableView viewForHeaderInSection:(NSInteger)section {
     NSInteger native = [self apollo_pfNativeSectionCount:tableView];
     if (section < native) {
-        if (native > 0 && section == native - 1) {
-            // Collapsed: no header (the summary row stands alone). Expanded: a tappable
-            // "BLOCKED USERS ▾" header to collapse again.
-            if (![objc_getAssociatedObject(self, kApolloPFBlockedExpandedKey) boolValue]) return [[UIView alloc] init];
-            return [self apollo_pfBlockedToggleHeaderForTable:tableView];
-        }
+        // No header for Blocked Users — the toggle row leads the group in both states.
+        if (native > 0 && section == native - 1) return [[UIView alloc] init];
         return %orig;
     }
     NSString *title = (section == native) ? @"Subreddit-Specific Filters" : @"Filter Subreddits by Name";
@@ -206,11 +207,15 @@ static UIView *ApolloPFSectionFooterView(NSString *text) {
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     NSInteger native = [self apollo_pfNativeSectionCount:tableView];
     if (indexPath.section < native) {
-        // Tapping the collapsed Blocked Users summary row expands the section.
-        if (native > 0 && indexPath.section == native - 1 &&
-            ![objc_getAssociatedObject(self, kApolloPFBlockedExpandedKey) boolValue]) {
-            [tableView deselectRowAtIndexPath:indexPath animated:YES];
-            [self apollo_pfSetBlockedExpanded:YES table:tableView];
+        if (native > 0 && indexPath.section == native - 1) {
+            // Row 0 toggles; deeper rows are Apollo's own (offset by 1).
+            if (indexPath.row == 0) {
+                [tableView deselectRowAtIndexPath:indexPath animated:YES];
+                BOOL expanded = [objc_getAssociatedObject(self, kApolloPFBlockedExpandedKey) boolValue];
+                [self apollo_pfSetBlockedExpanded:!expanded table:tableView];
+                return;
+            }
+            %orig(tableView, [NSIndexPath indexPathForRow:indexPath.row - 1 inSection:indexPath.section]);
             return;
         }
         %orig; return;
@@ -236,9 +241,13 @@ static UIView *ApolloPFSectionFooterView(NSString *text) {
 - (BOOL)tableView:(UITableView *)tableView canEditRowAtIndexPath:(NSIndexPath *)indexPath {
     NSInteger native = [self apollo_pfNativeSectionCount:tableView];
     if (indexPath.section < native) {
-        // Collapsed Blocked Users summary row isn't swipe-deletable (expand to manage).
-        if (native > 0 && indexPath.section == native - 1 &&
-            ![objc_getAssociatedObject(self, kApolloPFBlockedExpandedKey) boolValue]) return NO;
+        if (native > 0 && indexPath.section == native - 1) {
+            // Row 0 = toggle, last row = Apollo's "Add User" — neither is swipe-deletable;
+            // the blocked-user rows in between map to Apollo's rows (offset by 1).
+            NSInteger nativeCount = [objc_getAssociatedObject(self, kApolloPFBlockedNativeCountKey) integerValue];
+            if (indexPath.row == 0 || (nativeCount > 0 && indexPath.row >= nativeCount)) return NO;
+            return %orig(tableView, [NSIndexPath indexPathForRow:indexPath.row - 1 inSection:indexPath.section]);
+        }
         return %orig;
     }
     NSArray<NSString *> *items = (indexPath.section == native) ? [ApolloPostFilterStore allSubreddits]
@@ -248,13 +257,30 @@ static UIView *ApolloPFSectionFooterView(NSString *text) {
 
 - (BOOL)tableView:(UITableView *)tableView canMoveRowAtIndexPath:(NSIndexPath *)indexPath {
     NSInteger native = [self apollo_pfNativeSectionCount:tableView];
-    if (indexPath.section < native) return %orig;
+    if (indexPath.section < native) {
+        if (native > 0 && indexPath.section == native - 1) {
+            if (indexPath.row == 0) return NO;
+            return %orig(tableView, [NSIndexPath indexPathForRow:indexPath.row - 1 inSection:indexPath.section]);
+        }
+        return %orig;
+    }
     return NO;
 }
 
 - (void)tableView:(UITableView *)tableView commitEditingStyle:(UITableViewCellEditingStyle)editingStyle forRowAtIndexPath:(NSIndexPath *)indexPath {
     NSInteger native = [self apollo_pfNativeSectionCount:tableView];
-    if (indexPath.section < native) { %orig; return; }
+    if (indexPath.section < native) {
+        // Expanded Blocked Users: deletions act on Apollo's own row (offset by 1).
+        // Re-render afterward so the row list AND the "(N)" count in the toggle row
+        // stay correct no matter how Apollo animates its own deletion.
+        if (native > 0 && indexPath.section == native - 1 && indexPath.row >= 1) {
+            %orig(tableView, editingStyle, [NSIndexPath indexPathForRow:indexPath.row - 1 inSection:indexPath.section]);
+            __weak UITableView *weakTable = tableView;
+            dispatch_async(dispatch_get_main_queue(), ^{ [weakTable reloadData]; });
+            return;
+        }
+        %orig; return;
+    }
     if (editingStyle != UITableViewCellEditingStyleDelete) return;
     BOOL isSubSection = (indexPath.section == native);
     NSArray<NSString *> *items = isSubSection ? [ApolloPostFilterStore allSubreddits]
@@ -268,7 +294,12 @@ static UIView *ApolloPFSectionFooterView(NSString *text) {
 
 - (NSString *)tableView:(UITableView *)tableView titleForDeleteConfirmationButtonForRowAtIndexPath:(NSIndexPath *)indexPath {
     NSInteger native = [self apollo_pfNativeSectionCount:tableView];
-    if (indexPath.section < native) return %orig;
+    if (indexPath.section < native) {
+        if (native > 0 && indexPath.section == native - 1 && indexPath.row >= 1) {
+            return %orig(tableView, [NSIndexPath indexPathForRow:indexPath.row - 1 inSection:indexPath.section]);
+        }
+        return %orig;
+    }
     return @"Delete";
 }
 
@@ -330,68 +361,7 @@ static UIView *ApolloPFSectionFooterView(NSString *text) {
     [(UIViewController *)self presentViewController:alert animated:YES completion:nil];
 }
 
-#pragma mark - Collapsible Blocked Users header
-
-// Tappable header shown ONLY while the section is expanded — styled to mirror the
-// collapsed "Blocked Users (N)" row (same themed rounded bar + chevron) so it's
-// obviously the same control, now pointing down to collapse. Tapping it collapses.
-%new
-- (UIView *)apollo_pfBlockedToggleHeaderForTable:(UITableView *)tableView {
-    NSInteger nativeRows = [objc_getAssociatedObject(self, kApolloPFBlockedNativeCountKey) integerValue];
-    NSInteger count = MAX((NSInteger)0, nativeRows - 1); // exclude the "Add User" row
-
-    // Sample the themed cell background from a real native cell so the bar matches
-    // Apollo's current theme (synthwave, etc.), falling back to the system colour.
-    UIColor *cellBG = [UIColor secondarySystemGroupedBackgroundColor];
-    @try {
-        UITableViewCell *probe = [self tableView:tableView cellForRowAtIndexPath:[NSIndexPath indexPathForRow:0 inSection:0]];
-        UIColor *c = probe.backgroundColor ?: probe.contentView.backgroundColor;
-        if (c && CGColorGetAlpha(c.CGColor) > 0.01) cellBG = c;
-    } @catch (__unused id e) {}
-
-    UIView *container = [[UIView alloc] init];
-    container.userInteractionEnabled = YES;
-
-    UIView *bar = [[UIView alloc] init];
-    bar.translatesAutoresizingMaskIntoConstraints = NO;
-    bar.backgroundColor = cellBG;
-    bar.layer.cornerRadius = 10.0;
-    bar.layer.cornerCurve = kCACornerCurveContinuous;
-    [container addSubview:bar];
-
-    UILabel *label = [[UILabel alloc] init];
-    label.translatesAutoresizingMaskIntoConstraints = NO;
-    label.text = [NSString stringWithFormat:@"Blocked Users (%ld)", (long)count];
-    label.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
-    label.textColor = [UIColor labelColor];
-    [bar addSubview:label];
-
-    UIImageView *chevron = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"chevron.down"]];
-    chevron.translatesAutoresizingMaskIntoConstraints = NO;
-    chevron.tintColor = [UIColor tertiaryLabelColor];
-    chevron.contentMode = UIViewContentModeScaleAspectFit;
-    [bar addSubview:chevron];
-
-    [NSLayoutConstraint activateConstraints:@[
-        [bar.leadingAnchor constraintEqualToAnchor:container.leadingAnchor constant:16.0],
-        [bar.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-16.0],
-        [bar.topAnchor constraintEqualToAnchor:container.topAnchor constant:6.0],
-        [bar.bottomAnchor constraintEqualToAnchor:container.bottomAnchor constant:-6.0],
-        [label.leadingAnchor constraintEqualToAnchor:bar.leadingAnchor constant:16.0],
-        [label.topAnchor constraintEqualToAnchor:bar.topAnchor constant:11.0],
-        [label.bottomAnchor constraintEqualToAnchor:bar.bottomAnchor constant:-11.0],
-        [chevron.centerYAnchor constraintEqualToAnchor:label.centerYAnchor],
-        [chevron.trailingAnchor constraintEqualToAnchor:bar.trailingAnchor constant:-16.0],
-        [chevron.leadingAnchor constraintGreaterThanOrEqualToAnchor:label.trailingAnchor constant:8.0],
-        [chevron.widthAnchor constraintEqualToConstant:13.0],
-        [chevron.heightAnchor constraintEqualToConstant:13.0],
-    ]];
-
-    // Weakly remember the table so the tap handler can reload just this section.
-    objc_setAssociatedObject(container, kApolloPFBlockedHeaderTableKey, tableView, OBJC_ASSOCIATION_ASSIGN);
-    [container addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(apollo_pfToggleBlocked:)]];
-    return container;
-}
+#pragma mark - Collapsible Blocked Users toggle
 
 %new
 - (void)apollo_pfSetBlockedExpanded:(BOOL)expanded table:(UITableView *)tableView {
@@ -400,14 +370,6 @@ static UIView *ApolloPFSectionFooterView(NSString *text) {
     NSInteger native = [self apollo_pfNativeSectionCount:tableView];
     if (native <= 0) return;
     [tableView reloadSections:[NSIndexSet indexSetWithIndex:native - 1] withRowAnimation:UITableViewRowAnimationAutomatic];
-}
-
-// Tapping the expanded "BLOCKED USERS" header collapses the section again.
-%new
-- (void)apollo_pfToggleBlocked:(UITapGestureRecognizer *)gesture {
-    UITableView *tableView = objc_getAssociatedObject(gesture.view, kApolloPFBlockedHeaderTableKey);
-    BOOL expanded = ![objc_getAssociatedObject(self, kApolloPFBlockedExpandedKey) boolValue];
-    [self apollo_pfSetBlockedExpanded:expanded table:tableView];
 }
 
 %end
