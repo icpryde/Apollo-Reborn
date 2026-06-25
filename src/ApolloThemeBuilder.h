@@ -52,6 +52,22 @@ void ApolloThemeBuilderRenameActiveCustomTheme(NSString *name);
 BOOL ApolloThemeBuilderDeleteActiveCustomTheme(void);
 void ApolloThemeBuilderResetActiveCustomThemeColors(void);
 
+// Import / Export. Export serializes only a theme's name + colors (no account
+// data, API keys, ids, or timestamps) to portable JSON, so a shared theme file
+// is safe to hand to anyone. Import is strict: it accepts only known role.mode
+// keys with valid 6-digit hex, clamps the name, and the caller mints a fresh
+// theme — a hand-edited or hostile file can neither overwrite an existing theme
+// nor inject arbitrary defaults keys. See the note in ApolloThemeBuilder.xm.
+NSData *ApolloThemeBuilderExportData(NSDictionary *theme);
+BOOL ApolloThemeBuilderParseImport(NSData *data, NSString **outName,
+                                   NSDictionary<NSString *, NSString *> **outColors);
+// Filesystem-safe "<name>.json" for an exported theme.
+NSString *ApolloThemeBuilderExportFilename(NSString *themeName);
+// Maximum accepted size (bytes) for an imported theme file. Callers should enforce
+// this BEFORE reading a picked file into memory, so a multi-hundred-MB file can't be
+// fully loaded (spiking memory / risking jetsam) before the parser's own cap rejects it.
+NSUInteger ApolloThemeBuilderMaxImportBytes(void);
+
 BOOL ApolloThemeBuilderIsEnabled(void);
 void ApolloThemeBuilderSetEnabled(BOOL enabled);
 
@@ -69,5 +85,10 @@ void ApolloThemeBuilderForceRepaint(void);
 
 UIColor *ApolloThemeBuilderColorFromHex(NSString *hex);
 NSString *ApolloThemeBuilderHexFromColor(UIColor *color);
+
+// A visible cell-selection highlight for the given mode ("light"/"dark"),
+// derived from the card (primaryBG) colour so a tap reads clearly against the
+// theme. Returns nil if no primaryBG is set.
+UIColor *ApolloThemeBuilderSelectionColor(NSString *mode);
 
 __END_DECLS

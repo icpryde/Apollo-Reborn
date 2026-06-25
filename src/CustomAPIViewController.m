@@ -232,8 +232,14 @@ typedef NS_ENUM(NSInteger, Tag) {
     if (!cell) return;
 
     UIColor *cellColor = [self apollo_themeCellBackgroundColor];
+    // Fill via the cell's own layer, NOT contentView: UIKit layers the
+    // selectedBackgroundView between the background and the contentView, so an
+    // opaque contentView would hide the tap highlight everywhere except the
+    // accessory gutter (the ">" arrow sits outside contentView). Keeping
+    // contentView clear lets the highlight show across the whole row while the
+    // layer fill keeps the unselected colour identical.
     cell.backgroundColor = cellColor;
-    cell.contentView.backgroundColor = cellColor;
+    cell.contentView.backgroundColor = [UIColor clearColor];
 
     UIView *selectedBackground = [[UIView alloc] init];
     selectedBackground.backgroundColor = [UIColor colorWithWhite:0.5 alpha:0.18];

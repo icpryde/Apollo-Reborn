@@ -199,6 +199,22 @@ NSString *ApolloThemeBuilderHexFromColor(UIColor *color) {
             (int)lround(r * 255.0), (int)lround(g * 255.0), (int)lround(b * 255.0)];
 }
 
+UIColor *ApolloThemeBuilderSelectionColor(NSString *mode) {
+    UIColor *card = ApolloThemeBuilderColorFromHex(ApolloThemeBuilderSavedHex(kApolloThemeRolePrimaryBG, mode));
+    if (!card) return nil;
+    CGFloat r = 0, g = 0, b = 0, a = 0;
+    if (![card getRed:&r green:&g blue:&b alpha:&a]) return nil;
+    // Tap highlight = the card colour nudged toward white (dark mode) or black
+    // (light mode), mirroring iOS's pressed-row shade so it's clearly visible
+    // against any custom background while keeping the theme's hue.
+    BOOL dark = [mode isEqualToString:@"dark"];
+    CGFloat target = dark ? 1.0 : 0.0, k = 0.16;
+    return [UIColor colorWithRed:r + (target - r) * k
+                           green:g + (target - g) * k
+                            blue:b + (target - b) * k
+                           alpha:1.0];
+}
+
 NSString *ApolloThemeBuilderSavedHex(NSString *roleKey, NSString *mode) {
     NSDictionary *colors = ApolloThemeBuilderActiveCustomTheme()[@"colors"];
     NSString *saved = colors[[NSString stringWithFormat:@"%@.%@", roleKey, mode]];
@@ -387,6 +403,131 @@ void ApolloThemeBuilderResetActiveCustomThemeColors(void) {
     [ud setObject:themes forKey:kApolloCustomThemesKey];
     [ud setObject:@{} forKey:kApolloCustomThemeColorsKey];
     ApolloThemeBuilderReloadOverrides();
+}
+
+// ---------------------------------------------------------------------------
+// Import / Export
+// ---------------------------------------------------------------------------
+//
+// A theme serializes to a tiny, human-readable JSON document holding only its
+// name and its role→hex color map — no account data, API keys, device ids, or
+// internal theme ids — so a shared theme file is safe to give to anyone and
+// reveals nothing about the sender. Import is deliberately strict: it accepts
+// only known "<role>.<mode>" keys with 6-digit hex values, clamps the name, and
+// the caller always mints a fresh theme id, so a hand-edited or hostile file
+// can neither overwrite an existing theme, inject arbitrary defaults keys, nor
+// blow up storage with unbounded data.
+
+static NSString * const kThemeExportMarkerKey = @"apolloThemeBuilder";
+static const NSInteger kThemeExportVersion = 1;
+static const NSUInteger kThemeImportMaxBytes = 256 * 1024; // generous; a theme is <1KB
+NSUInteger ApolloThemeBuilderMaxImportBytes(void) { return kThemeImportMaxBytes; }
+static const NSUInteger kThemeNameMaxLength = 60;
+
+// "RRGGBB" (uppercased) if the value is a valid 6-digit hex color, '#'/
+// whitespace tolerated, else nil.
+static NSString *ThemeBuilderNormalizeHex(id hex) {
+    if (![hex isKindOfClass:[NSString class]]) return nil;
+    NSString *clean = [[(NSString *)hex stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]
+                       stringByReplacingOccurrencesOfString:@"#" withString:@""];
+    if (clean.length != 6) return nil;
+    unsigned int v = 0;
+    NSScanner *scanner = [NSScanner scannerWithString:clean];
+    if (![scanner scanHexInt:&v] || !scanner.atEnd) return nil;
+    return clean.uppercaseString;
+}
+
+// Set of every accepted "<role>.<mode>" color key (8 roles × {light,dark}).
+static NSSet<NSString *> *ThemeBuilderValidColorKeys(void) {
+    static NSSet *keys;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSMutableSet *set = [NSMutableSet set];
+        for (NSString *role in ApolloThemeBuilderRoleKeys()) {
+            [set addObject:[role stringByAppendingString:@".light"]];
+            [set addObject:[role stringByAppendingString:@".dark"]];
+        }
+        keys = set;
+    });
+    return keys;
+}
+
+// Drop anything that isn't a valid role.mode key with a valid hex value;
+// normalizes surviving hex to uppercase.
+static NSDictionary<NSString *, NSString *> *ThemeBuilderSanitizeColors(id colors) {
+    if (![colors isKindOfClass:[NSDictionary class]]) return @{};
+    NSSet *valid = ThemeBuilderValidColorKeys();
+    NSMutableDictionary *out = [NSMutableDictionary dictionary];
+    for (id key in (NSDictionary *)colors) {
+        if (![key isKindOfClass:[NSString class]] || ![valid containsObject:key]) continue;
+        NSString *hex = ThemeBuilderNormalizeHex(((NSDictionary *)colors)[key]);
+        if (hex) out[key] = hex;
+    }
+    return out;
+}
+
+// Trim, fall back to a default, and clamp to kThemeNameMaxLength without
+// splitting a composed character (emoji) at the boundary.
+static NSString *ThemeBuilderClampName(id name, NSString *fallback) {
+    NSString *trimmed = [name isKindOfClass:[NSString class]]
+        ? [(NSString *)name stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]
+        : @"";
+    if (!trimmed.length) return fallback;
+    if (trimmed.length > kThemeNameMaxLength) {
+        NSRange r = [trimmed rangeOfComposedCharacterSequencesForRange:NSMakeRange(0, kThemeNameMaxLength)];
+        trimmed = [trimmed substringToIndex:r.length];
+    }
+    return trimmed;
+}
+
+NSData *ApolloThemeBuilderExportData(NSDictionary *theme) {
+    NSDictionary *payload = @{
+        kThemeExportMarkerKey: @(kThemeExportVersion),
+        @"name": ThemeBuilderClampName(theme[@"name"], @"Custom"),
+        @"colors": ThemeBuilderSanitizeColors(theme[@"colors"]),
+    };
+    NSError *error = nil;
+    NSData *data = [NSJSONSerialization dataWithJSONObject:payload
+                                                  options:NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys
+                                                    error:&error];
+    if (!data) ApolloLog(@"ThemeBuilder: export serialization failed: %@", error);
+    return data;
+}
+
+NSString *ApolloThemeBuilderExportFilename(NSString *themeName) {
+    NSString *name = ThemeBuilderClampName(themeName, @"Apollo Theme");
+    // Strip path-hostile characters so the file lands cleanly anywhere it's shared.
+    NSCharacterSet *illegal = [NSCharacterSet characterSetWithCharactersInString:@"/\\?%*|\"<>:"];
+    name = [[name componentsSeparatedByCharactersInSet:illegal] componentsJoinedByString:@"-"];
+    name = [name stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (!name.length || [name hasPrefix:@"."]) name = @"Apollo Theme";
+    return [name stringByAppendingPathExtension:@"json"];
+}
+
+BOOL ApolloThemeBuilderParseImport(NSData *data, NSString **outName,
+                                   NSDictionary<NSString *, NSString *> **outColors) {
+    if (outName) *outName = nil;
+    if (outColors) *outColors = nil;
+    if (![data isKindOfClass:[NSData class]] || data.length == 0 || data.length > kThemeImportMaxBytes) {
+        return NO;
+    }
+    id root = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
+    if (![root isKindOfClass:[NSDictionary class]]) return NO;
+    NSDictionary *dict = (NSDictionary *)root;
+
+    // Accept either our wrapped format ({name, colors}) or a bare "<role>.<mode>"
+    // -> hex map (forgiving of hand-authored files).
+    id colorsSource = [dict[@"colors"] isKindOfClass:[NSDictionary class]] ? dict[@"colors"] : dict;
+    NSDictionary *colors = ThemeBuilderSanitizeColors(colorsSource);
+
+    // No recognizable colors and no Theme Builder marker — not a theme file.
+    // (A marked file with empty colors is a valid "blank" theme and round-trips.)
+    BOOL hasMarker = dict[kThemeExportMarkerKey] != nil;
+    if (colors.count == 0 && !hasMarker) return NO;
+
+    if (outName) *outName = ThemeBuilderClampName(dict[@"name"], @"Imported Theme");
+    if (outColors) *outColors = colors;
+    return YES;
 }
 
 BOOL ApolloThemeBuilderIsEnabled(void) {
@@ -676,6 +817,48 @@ static UIImageView *ThemeBuilderImageViewIvar(id object, const char *name) {
     return [value isKindOfClass:[UIImageView class]] ? (UIImageView *)value : nil;
 }
 
+// Paint the themed selection colour over a highlighted cell. Apollo's own list
+// cells (IconText settings/profile rows…) highlight by swapping their
+// backgroundColor, which the custom-theme remap collapses onto the card colour;
+// this re-applies a visible highlight on every layout while pressed, and the
+// cell's own %orig restores its normal background on release. Used by the
+// class-scoped cell hooks below (covers profiles too, not just settings).
+static void ThemeBuilderApplyHighlight(UITableViewCell *cell) {
+    if (!sRemapActive || !cell.highlighted) return;
+    NSString *mode = (cell.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) ? @"dark" : @"light";
+    UIColor *sel = ApolloThemeBuilderSelectionColor(mode);
+    if (sel && ![cell.contentView.backgroundColor isEqual:sel]) {
+        cell.backgroundColor = sel;
+        cell.contentView.backgroundColor = sel;
+    }
+}
+
+// Texture (AsyncDisplayKit) cell nodes — profile feature rows, feed posts,
+// comments — aren't UITableViewCells: they draw their pressed state by
+// recolouring a `backgroundNode` (an ASDisplayNode), which the custom-theme
+// remap collapses onto the card colour. After the node's own setHighlighted
+// runs, repaint that node to the visible themed selection while pressed; on
+// release the node's %orig restores its normal colour and we leave it.
+static void ThemeBuilderApplyNodeHighlight(id node, BOOL highlighted) {
+    // Press-only: Apollo restores the normal colour on release, so we just
+    // override the pressed shade (the darker colour it uses is invisible on a
+    // dark custom theme).
+    if (!sRemapActive || !highlighted) return;
+    UIUserInterfaceStyle style = UITraitCollection.currentTraitCollection.userInterfaceStyle;
+    NSString *mode = (style == UIUserInterfaceStyleDark) ? @"dark" : @"light";
+    UIColor *sel = ApolloThemeBuilderSelectionColor(mode);
+    if (!sel) return;
+    // Recolour the *visible card* that Apollo darkens on press. For the profile
+    // feature rows that's a child `insideNode` (an inset card); a full-width
+    // `backgroundNode` sits behind it purely to colour the inset side-margins —
+    // recolouring that one made the highlight bleed around/behind the card. For
+    // post cells there's no insideNode, so it's the cell node itself.
+    id target = ThemeBuilderObjectIvar(node, "insideNode");
+    if (![target respondsToSelector:@selector(setBackgroundColor:)]) target = node;
+    if ([target respondsToSelector:@selector(setBackgroundColor:)])
+        ((void (*)(id, SEL, UIColor *))objc_msgSend)(target, @selector(setBackgroundColor:), sel);
+}
+
 static void ThemeBuilderApplyAccentImageView(id cell) {
     if (!sRemapActive) return;
 
@@ -835,6 +1018,98 @@ void ApolloThemeBuilderActivateDonorLive(void) {
 
 %end
 
+// Give every Apollo settings/search cell a themed tap highlight in one place,
+// scoped by the owning view controller (an Apollo Settings*/Search*ViewController)
+// rather than by cell class — those screens mix Eureka and several Apollo cell
+// types — so the feed, comments and other lists are untouched. Applied from both
+// layoutSubviews AND setHighlighted: some cells (e.g. ApolloSubtitleTableViewCell,
+// which Filters & Blocks uses) don't route their layoutSubviews through this hook,
+// so the layout-only path missed them — setHighlighted always runs.
+// The owning view-controller class name if this cell belongs to an Apollo
+// settings/search list, else nil. Used to scope every side effect (including the
+// re-layout) to those screens only — never UIKit's own table views such as the
+// keyboard's input-switcher menu.
+static NSString *ThemeBuilderListCellOwner(UITableViewCell *cell) {
+    UIView *v = cell.superview;
+    while (v && ![v isKindOfClass:[UITableView class]]) v = v.superview;
+    if (![v isKindOfClass:[UITableView class]]) return nil;
+    id delegate = ((UITableView *)v).delegate;
+    if (!delegate) return nil;
+    NSString *owner = NSStringFromClass([delegate class]);
+    BOOL inScope = [owner containsString:@"ViewController"]
+        && ([owner containsString:@"Settings"] || [owner containsString:@"Search"]
+            || [owner containsString:@"Friends"]);
+    return inScope ? owner : nil;
+}
+
+static void ThemeBuilderColorListCell(UITableViewCell *cell) {
+    if (!sRemapActive) return;
+    NSString *owner = ThemeBuilderListCellOwner(cell);
+    if (!owner) return;
+    NSString *mode = (cell.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) ? @"dark" : @"light";
+    UIColor *sel = ApolloThemeBuilderSelectionColor(mode);
+    if (!sel) return;
+    // Eureka settings cells highlight via a selectedBackgroundView over their card.
+    // This is the idiomatic, self-restoring mechanism — UIKit shows it on press and
+    // hides it on release, so it can never get stuck — set it on every in-scope cell.
+    if (![cell.selectedBackgroundView.backgroundColor isEqual:sel]) {
+        UIView *bg = [[UIView alloc] init];
+        bg.backgroundColor = sel;
+        cell.selectedBackgroundView = bg;
+    }
+    // Apollo's OWN cells ignore selectedBackgroundView and instead swap their
+    // backgroundColor, which the remap collapses onto the card (invisible) — so for
+    // those we paint the themed selection directly. This is scoped to Apollo cells AND
+    // restored to the card colour when NOT highlighted: a Eureka cell never repaints its
+    // own contentView, so painting it here would linger after release (hiding the card).
+    // Appearance/Theme Builder own their cell background, so leave those alone.
+    BOOL isApolloCell = [NSStringFromClass([cell class]) containsString:@"Apollo"];
+    if (isApolloCell && ![owner containsString:@"Appearance"]) {
+        UIColor *want = cell.highlighted ? sel
+            : ApolloThemeBuilderColorFromHex(ApolloThemeBuilderSavedHex(kApolloThemeRolePrimaryBG, mode));
+        if (want && ![cell.contentView.backgroundColor isEqual:want]) {
+            cell.backgroundColor = want;
+            cell.contentView.backgroundColor = want;
+        }
+    }
+}
+
+%hook UITableViewCell
+
+- (void)layoutSubviews {
+    %orig;
+    ThemeBuilderColorListCell(self);
+}
+
+- (void)setHighlighted:(BOOL)highlighted animated:(BOOL)animated {
+    %orig;
+    // Re-run layoutSubviews so the themed highlight is applied on press and the
+    // cell's own %orig restores its normal background on release — but ONLY for
+    // our settings/search cells. Calling setNeedsLayout on every UITableViewCell
+    // (the keyboard's input-switcher menu, alerts, …) is an unwanted side effect.
+    if (sRemapActive && ThemeBuilderListCellOwner(self)) [self setNeedsLayout];
+}
+
+%end
+
+// ApolloSubtitleTableViewCell (used by Filters & Blocks) doesn't route its
+// layoutSubviews through the base UITableViewCell hook above, so the shared
+// coloring never reached it. Hook it directly — after its own layout — the same
+// way IconTextTableViewCell is handled.
+%hook _TtC6Apollo27ApolloSubtitleTableViewCell
+
+- (void)layoutSubviews {
+    %orig;
+    ThemeBuilderColorListCell((UITableViewCell *)self);
+}
+
+- (void)setHighlighted:(BOOL)highlighted animated:(BOOL)animated {
+    %orig;
+    if (sRemapActive) [(UITableViewCell *)self setNeedsLayout];
+}
+
+%end
+
 // These UIKit menu rows are the visible outlier for custom light themes:
 // under the outrun donor, their glyph assets arrive as original-rendered
 // images, so Apollo's tint writes are ignored. Stock light themes use the
@@ -846,16 +1121,19 @@ void ApolloThemeBuilderActivateDonorLive(void) {
 - (void)layoutSubviews {
     %orig;
     ThemeBuilderApplyAccentImageView(self);
+    ThemeBuilderApplyHighlight((UITableViewCell *)self);
 }
 
 - (void)setHighlighted:(BOOL)highlighted animated:(BOOL)animated {
     %orig;
     ThemeBuilderApplyAccentImageView(self);
+    if (sRemapActive) [(UITableViewCell *)self setNeedsLayout];
 }
 
 - (void)setSelected:(BOOL)selected animated:(BOOL)animated {
     %orig;
     ThemeBuilderApplyAccentImageView(self);
+    if (sRemapActive) [(UITableViewCell *)self setNeedsLayout];
 }
 
 %end
@@ -889,6 +1167,77 @@ void ApolloThemeBuilderActivateDonorLive(void) {
     id spec = %orig;
     ThemeBuilderApplyAccentImageNode(self);
     return spec;
+}
+
+%end
+
+// Profile feature rows (Posts / Comments / Multireddits / Trophies) are Texture
+// cell nodes, not table cells, so the table-cell highlight hooks don't reach
+// them. Repaint their backgroundNode to the themed selection while pressed.
+%hook _TtC6Apollo22ProfileFeatureCellNode
+
+- (void)setHighlighted:(BOOL)highlighted {
+    %orig;
+    ThemeBuilderApplyNodeHighlight(self, highlighted);
+}
+
+%end
+
+// Feed post cells are Texture nodes too, but recolour the node's own background
+// (not a child backgroundNode) to a darker shade on press — invisible on a dark
+// custom theme. Repaint to the visible themed selection while pressed.
+%hook _TtC6Apollo17LargePostCellNode
+
+- (void)setHighlighted:(BOOL)highlighted {
+    %orig;
+    ThemeBuilderApplyNodeHighlight(self, highlighted);
+}
+
+%end
+
+%hook _TtC6Apollo19CompactPostCellNode
+
+- (void)setHighlighted:(BOOL)highlighted {
+    %orig;
+    ThemeBuilderApplyNodeHighlight(self, highlighted);
+}
+
+%end
+
+// Comment cells (profile Comments/Saved/Overview, thread comments) are Texture
+// nodes too — same node-highlight path as the feed posts.
+%hook _TtC6Apollo15CommentCellNode
+
+- (void)setHighlighted:(BOOL)highlighted {
+    %orig;
+    ThemeBuilderApplyNodeHighlight(self, highlighted);
+}
+
+%end
+
+// The Text Size slider lives in a Eureka custom cell (TextSliderCell) that has
+// no grouped-card backgroundView — its card area is painted by its contentView.
+// Apollo colors that contentView with the primaryBG role, which on this screen
+// is the table's page color (the Appearance VC paints its tableView background
+// with primaryBG and the cell cards with secondaryBG). Standard cells hide that
+// behind their own secondaryBG card, but the slider cell shows the primaryBG
+// contentView directly, so the slider reads as sitting on the page rather than
+// inside its card. Stock themes don't notice because their primaryBG and
+// secondaryBG are nearly identical; a custom theme makes them diverge. Repaint
+// the contentView to the same card color the other cells use, after Apollo's
+// own layout has run.
+%hook _TtC6Apollo14TextSliderCell
+
+- (void)layoutSubviews {
+    %orig;
+    if (!sRemapActive) return;
+    UITableViewCell *cell = (UITableViewCell *)self;
+    NSString *mode = (cell.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) ? @"dark" : @"light";
+    // Match whatever card color the willDisplay hook gave the cell (secondaryBG),
+    // falling back to the role directly if it wasn't set.
+    UIColor *card = cell.backgroundColor
+        ?: ApolloThemeBuilderColorFromHex(ApolloThemeBuilderSavedHex(kApolloThemeRoleSecondaryBG, mode));
+    if (card) cell.contentView.backgroundColor = card;
 }
 
 %end
@@ -981,6 +1330,47 @@ static UIImage *ThemeBuilderPickerSwatch(void) {
 
 %end
 
+// The injected Theme Builder row is a stock cell, so its label font doesn't
+// follow Apollo's in-app Text Size setting (the native Eureka rows are sized
+// from it, using the medium system weight). Match them by copying the current
+// font off a native sibling — and do it in layoutSubviews, because a one-shot
+// assignment doesn't survive the table's later layout/reuse passes when the
+// slider changes, whereas layoutSubviews always runs after those.
+@interface ApolloRebornThemeBuilderRowCell : UITableViewCell
+@property (nonatomic, strong) UIFont *apollo_targetFont;
+@end
+@implementation ApolloRebornThemeBuilderRowCell
+- (UIFont *)apollo_sampleNativeFont {
+    UIView *v = self.superview;
+    while (v && ![v isKindOfClass:[UITableView class]]) v = v.superview;
+    if (![v isKindOfClass:[UITableView class]]) return nil;
+    for (UITableViewCell *c in ((UITableView *)v).visibleCells) {
+        if (c == self || ![c isKindOfClass:[UITableViewCell class]]) continue;
+        NSString *t = c.textLabel.text;
+        if (c.textLabel.font && t.length && ![t isEqualToString:@"Theme Builder"]) return c.textLabel.font;
+    }
+    return nil;
+}
+- (void)layoutSubviews {
+    // Enforce the last-sampled native font: a one-shot assignment doesn't survive
+    // the table's layout/reuse passes, but layoutSubviews always re-applies it.
+    if (self.apollo_targetFont && ![self.textLabel.font isEqual:self.apollo_targetFont])
+        self.textLabel.font = self.apollo_targetFont;
+    [super layoutSubviews];
+    // Re-sample on the next runloop, when visibleCells is populated (it isn't yet
+    // during the layout cascade). This also tracks live Text Size slider changes.
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        typeof(self) s = weakSelf; if (!s) return;
+        UIFont *f = [s apollo_sampleNativeFont];
+        if (f && ![f isEqual:s.apollo_targetFont]) {
+            s.apollo_targetFont = f;
+            [s setNeedsLayout];
+        }
+    });
+}
+@end
+
 static NSInteger (*sAppearanceRowsOrig)(id, SEL, UITableView *, NSInteger);
 static UITableViewCell *(*sAppearanceCellOrig)(id, SEL, UITableView *, NSIndexPath *);
 static CGFloat (*sAppearanceHeightOrig)(id, SEL, UITableView *, NSIndexPath *);
@@ -1041,7 +1431,7 @@ static UITableViewCell *ThemeBuilderAppearanceCell(id self, SEL _cmd, UITableVie
     if (ip.section == 0 && ip.row == 1) {
         static NSString *reuse = @"ApolloRebornThemeBuilderAppearanceCell";
         UITableViewCell *cell = [tv dequeueReusableCellWithIdentifier:reuse];
-        if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:reuse];
+        if (!cell) cell = [[ApolloRebornThemeBuilderRowCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:reuse];
         cell.textLabel.text = @"Theme Builder";
         cell.detailTextLabel.text = nil;
         cell.accessoryView = nil;
@@ -1113,6 +1503,9 @@ static void ThemeBuilderAppearanceWillDisplay(id self, SEL _cmd, UITableView *tv
         NSIndexPath *adjusted = ThemeBuilderAppearanceAdjustedIndexPath(ip);
         if (sAppearanceWillDisplayOrig) sAppearanceWillDisplayOrig(self, _cmd, tv, cell, adjusted);
     }
+    // The injected Theme Builder row keeps its label sized to the native rows via
+    // ApolloRebornThemeBuilderRowCell's layoutSubviews (it tracks Apollo's Text
+    // Size setting) — no per-display font handling needed here.
     if (sRemapActive) {
         NSString *mode = (tv.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) ? @"dark" : @"light";
         UIColor *cellBG = ApolloThemeBuilderColorFromHex(ApolloThemeBuilderSavedHex(kApolloThemeRoleSecondaryBG, mode));
@@ -1121,7 +1514,9 @@ static void ThemeBuilderAppearanceWillDisplay(id self, SEL _cmd, UITableView *tv
         if (cellBG) {
             cell.backgroundColor = cellBG;
             UIView *sel = [[UIView alloc] init];
-            sel.backgroundColor = [cellBG colorWithAlphaComponent:0.7];
+            // Visible tap highlight derived from the card colour (the old
+            // secondaryBG@0.7 was nearly indistinguishable from the background).
+            sel.backgroundColor = ApolloThemeBuilderSelectionColor(mode) ?: [cellBG colorWithAlphaComponent:0.7];
             cell.selectedBackgroundView = sel;
         }
         if (textColor) cell.textLabel.textColor = textColor;

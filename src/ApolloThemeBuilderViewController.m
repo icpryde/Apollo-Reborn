@@ -1,6 +1,7 @@
 #import "ApolloThemeBuilderViewController.h"
 #import "ApolloThemeBuilder.h"
 #import "ApolloCommon.h"
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 // Relative luminance (sRGB-weighted; good enough for a contrast hint) + WCAG
 // contrast ratio, used to warn about color combos that can't be auto-fixed.
@@ -37,7 +38,7 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
 @implementation ThemeBuilderPreset
 @end
 
-@interface ApolloThemeBuilderViewController () <UIColorPickerViewControllerDelegate>
+@interface ApolloThemeBuilderViewController () <UIColorPickerViewControllerDelegate, UIDocumentPickerDelegate>
 @property (nonatomic, copy) NSString *editingRole;
 @property (nonatomic, copy) NSString *editingMode;
 @property (nonatomic, strong) NSTimer *repaintDebounce;
@@ -53,6 +54,9 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = self.colorEditorMode ? ApolloThemeBuilderActiveCustomThemeName() : @"Theme Builder";
+    // Give the table an opaque background before the push transition's first
+    // frame so the previous screen never shows through while sliding in.
+    [self applyThemeColors];
 }
 
 - (instancetype)initColorEditor {
@@ -90,7 +94,10 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
 
 - (void)applyThemeColors {
     if (!ApolloThemeBuilderIsEnabled()) {
-        self.tableView.backgroundColor = nil; // restore system default
+        // Use the opaque grouped-table default, NOT nil — nil leaves the table
+        // view transparent, which shows the previous screen straight through the
+        // push transition (and behind the cells anywhere the theme isn't active).
+        self.tableView.backgroundColor = UIColor.systemGroupedBackgroundColor;
         return;
     }
     NSString *mode = [self previewMode];
@@ -99,6 +106,18 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
 }
 
 - (UITableView *)tableViewForWillDisplay { return self.tableView; }
+
+// Tint for the builder's own controls (New Theme, the ⋯ menu, the Active label).
+// When a custom theme is active the app's accent is the theme's accent, so these
+// should match it instead of the hardcoded system blue.
+- (UIColor *)builderAccentColor {
+    if (ApolloThemeBuilderIsEnabled()) {
+        UIColor *accent = ApolloThemeBuilderColorFromHex(
+            ApolloThemeBuilderSavedHex(kApolloThemeRoleAccent, [self previewMode]));
+        if (accent) return accent;
+    }
+    return UIColor.systemBlueColor;
+}
 
 #pragma mark - Live preview
 
@@ -432,11 +451,12 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
     return (indexPath.row >= 0 && indexPath.row < roles.count) ? roles[indexPath.row] : nil;
 }
 
-- (UIMenu *)menuForTheme:(NSDictionary *)theme {
+- (UIMenu *)menuForTheme:(NSDictionary *)theme sourceView:(UIView *)sourceView {
     NSString *themeID = theme[@"id"];
     BOOL active = [themeID isEqualToString:ApolloThemeBuilderActiveCustomTheme()[@"id"]];
     BOOL canDelete = ApolloThemeBuilderCustomThemes().count > 1;
     __weak typeof(self) weakSelf = self;
+    __weak UIView *weakSource = sourceView;
     UIAction *edit = [UIAction actionWithTitle:@"Edit Colors" image:[UIImage systemImageNamed:@"paintpalette"]
                                     identifier:nil handler:^(__kindof UIAction *action) {
         [weakSelf pushColorEditorForThemeID:themeID];
@@ -463,6 +483,10 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
         [weakSelf refreshPreview];
         ApolloThemeBuilderForceRepaint();
     }];
+    UIAction *share = [UIAction actionWithTitle:@"Share Theme…" image:[UIImage systemImageNamed:@"square.and.arrow.up"]
+                                     identifier:nil handler:^(__kindof UIAction *action) {
+        [weakSelf exportTheme:theme fromSourceView:weakSource];
+    }];
     UIAction *rename = [UIAction actionWithTitle:@"Rename" image:[UIImage systemImageNamed:@"pencil"]
                                       identifier:nil handler:^(__kindof UIAction *action) {
         ApolloThemeBuilderSetActiveCustomThemeID(themeID);
@@ -474,7 +498,7 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
         [weakSelf confirmDeleteTheme];
     }];
     delete.attributes = canDelete ? UIMenuElementAttributesDestructive : UIMenuElementAttributesDisabled;
-    return [UIMenu menuWithTitle:@"" children:@[edit, use, template, duplicate, rename, delete]];
+    return [UIMenu menuWithTitle:@"" children:@[edit, use, template, duplicate, share, rename, delete]];
 }
 
 - (void)pushColorEditorForThemeID:(NSString *)themeID {
@@ -575,7 +599,7 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
             button.frame = cell.contentView.bounds;
             button.autoresizingMask = UIViewAutoresizingFlexibleWidth;
             button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
-            button.tintColor = UIColor.systemBlueColor;
+            button.tintColor = [self builderAccentColor];
             [button setImage:[UIImage systemImageNamed:@"plus.circle.fill"] forState:UIControlStateNormal];
             [button setTitle:@" New Theme" forState:UIControlStateNormal];
             button.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
@@ -590,12 +614,13 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
         UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
         cell.textLabel.text = [theme[@"name"] length] ? theme[@"name"] : @"Custom";
         cell.detailTextLabel.text = active ? @"Active" : @"Tap to use";
-        cell.detailTextLabel.textColor = active ? UIColor.systemBlueColor : UIColor.secondaryLabelColor;
+        cell.detailTextLabel.textColor = active ? [self builderAccentColor] : UIColor.secondaryLabelColor;
         cell.accessoryType = active ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
         UIButton *more = [UIButton buttonWithType:UIButtonTypeSystem];
         more.frame = CGRectMake(0, 0, 34, 34);
+        more.tintColor = [self builderAccentColor];
         [more setImage:[UIImage systemImageNamed:@"ellipsis.circle"] forState:UIControlStateNormal];
-        more.menu = [self menuForTheme:theme];
+        more.menu = [self menuForTheme:theme sourceView:more];
         more.showsMenuAsPrimaryAction = YES;
         cell.accessoryView = more;
         return cell;
@@ -651,9 +676,12 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
     UIColor *grayColor = ApolloThemeBuilderColorFromHex(ApolloThemeBuilderSavedHex(kApolloThemeRoleGray, mode));
     if (secondaryBG) {
         cell.backgroundColor = secondaryBG;
-        // Clear the default selected-background highlight so it doesn't flash white
+        // Replace the default highlight (which flashed white under a custom theme)
+        // with a visible tap highlight derived from the card colour — the old
+        // secondaryBG@0.7 was nearly indistinguishable from the background.
         cell.selectedBackgroundView = [[UIView alloc] init];
-        cell.selectedBackgroundView.backgroundColor = [secondaryBG colorWithAlphaComponent:0.7];
+        cell.selectedBackgroundView.backgroundColor =
+            ApolloThemeBuilderSelectionColor(mode) ?: [secondaryBG colorWithAlphaComponent:0.7];
     }
     if (textColor) {
         cell.textLabel.textColor = textColor;
@@ -727,8 +755,155 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
         [self refreshPreview];
         ApolloThemeBuilderForceRepaint();
     }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Import from File…" style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *action) {
+        // Name comes from the imported file, so the text field above is ignored.
+        dispatch_async(dispatch_get_main_queue(), ^{ [self presentImportPicker]; });
+    }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
+}
+
+#pragma mark - Import / Export
+
+- (void)exportTheme:(NSDictionary *)theme fromSourceView:(UIView *)sourceView {
+    NSData *data = ApolloThemeBuilderExportData(theme);
+    if (!data.length) {
+        [self presentImportAlertWithTitle:@"Couldn’t Share Theme"
+                                  message:@"This theme could not be prepared for sharing."];
+        return;
+    }
+    NSString *filename = ApolloThemeBuilderExportFilename(theme[@"name"]);
+    NSURL *url = [[NSURL fileURLWithPath:NSTemporaryDirectory() isDirectory:YES] URLByAppendingPathComponent:filename];
+    NSError *error = nil;
+    if (![data writeToURL:url options:NSDataWritingAtomic error:&error]) {
+        ApolloLog(@"ThemeBuilder: export write failed: %@", error);
+        [self presentImportAlertWithTitle:@"Couldn’t Share Theme"
+                                  message:@"The theme file could not be written."];
+        return;
+    }
+    UIActivityViewController *activity =
+        [[UIActivityViewController alloc] initWithActivityItems:@[url] applicationActivities:nil];
+    // Remove the scratch file once sharing finishes or is cancelled. (Must run
+    // from the activity's own completion, not presentViewController:'s — the
+    // share targets may still be reading the URL after the sheet is presented.)
+    activity.completionWithItemsHandler = ^(UIActivityType _Nullable activityType, BOOL completed,
+                                            NSArray *_Nullable items, NSError *_Nullable err) {
+        [[NSFileManager defaultManager] removeItemAtURL:url error:NULL];
+    };
+    UIView *anchor = sourceView ?: self.view;
+    activity.popoverPresentationController.sourceView = anchor;
+    activity.popoverPresentationController.sourceRect = anchor.bounds;
+    [self presentViewController:activity animated:YES completion:nil];
+}
+
+- (void)presentImportPicker {
+    // Content types: a theme file is plain JSON, but on a REAL (sideloaded) device a
+    // ".json" is often tagged generically — public.data or a dyn.* UTI — because no
+    // installed app claims the extension. The picker greys out (disables) any file that
+    // doesn't *conform* to a requested type, and UTI conformance only flows downward
+    // (public.json conforms up to text/data, but public.data/dyn.* don't conform down to
+    // public.json). A JSON-only filter therefore makes a generically-tagged file
+    // untappable: no selection, no delegate callback, no log — exactly the "tap does
+    // nothing" symptom. So we widen to the umbrella ancestors (data/item) too and
+    // validate by parsing after the pick. (The sibling Backup/Restore picker gets away
+    // with a single UTTypeZIP because .zip is universally tagged public.zip-archive.)
+    NSArray<UTType *> *types = @[ UTTypeJSON, UTTypePlainText, UTTypeText, UTTypeData, UTTypeItem ];
+    // asCopy:YES (import/copy mode) makes iOS copy the file into our own temp container
+    // and hand back a directly-readable, app-local URL — eliminating the security-scoped
+    // / FileProvider XPC round-trip that an ad-hoc-signed build can't complete (and that
+    // the Simulator silently lets slide). Mirrors Apollo's working restoreSettings picker.
+    UIDocumentPickerViewController *picker =
+        [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:types asCopy:YES];
+    picker.delegate = self;
+    picker.allowsMultipleSelection = NO;
+    picker.shouldShowFileExtensions = YES;
+    picker.modalPresentationStyle = UIModalPresentationFormSheet; // match the app's other document pickers
+    [self presentViewController:picker animated:YES completion:nil];
+}
+
+- (void)importThemeFromURL:(NSURL *)url {
+    ApolloLog(@"ThemeBuilder: import begin url=%@", url.path);
+    // asCopy:YES vends an app-local copy, so this is usually a no-op; keep it as harmless
+    // best-effort in case the OS ever hands back a security-scoped URL.
+    BOOL scoped = [url startAccessingSecurityScopedResource];
+    // Enforce the size cap BEFORE reading: a theme is <1KB, so reject anything large up
+    // front rather than loading a multi-hundred-MB file into RAM (which could spike
+    // memory / get us jetsammed) only for the parser's own cap to bounce it afterwards.
+    NSNumber *fileSize = nil;
+    [url getResourceValue:&fileSize forKey:NSURLFileSizeKey error:NULL];
+    NSUInteger cap = ApolloThemeBuilderMaxImportBytes();
+    if (fileSize && fileSize.unsignedLongLongValue > cap) {
+        if (scoped) [url stopAccessingSecurityScopedResource];
+        ApolloLog(@"ThemeBuilder: import rejected oversize bytes=%@ cap=%lu", fileSize, (unsigned long)cap);
+        [self presentImportAlertWithTitle:@"Couldn’t Import Theme"
+                                  message:@"This file is too large to be an Apollo theme."];
+        return;
+    }
+    // Read through a file coordinator so an iCloud-Drive file that is only a placeholder
+    // gets materialized (downloaded) before we read it — a bare dataWithContentsOfURL:
+    // returns nil for an un-downloaded cloud file. NSDataReadingMappedIfSafe maps rather
+    // than copies into RAM, a second guard if the size couldn't be read above.
+    __block NSData *data = nil;
+    __block NSError *readError = nil;
+    NSError *coordError = nil;
+    NSFileCoordinator *coordinator = [[NSFileCoordinator alloc] initWithFilePresenter:nil];
+    [coordinator coordinateReadingItemAtURL:url
+                                    options:NSFileCoordinatorReadingWithoutChanges
+                                      error:&coordError
+                                 byAccessor:^(NSURL *readURL) {
+        data = [NSData dataWithContentsOfURL:readURL options:NSDataReadingMappedIfSafe error:&readError];
+    }];
+    if (scoped) [url stopAccessingSecurityScopedResource];
+    if (!data) {
+        ApolloLog(@"ThemeBuilder: import read failed coord=%@ read=%@", coordError, readError);
+        [self presentImportAlertWithTitle:@"Couldn’t Import Theme"
+                                  message:@"The selected file could not be read."];
+        return;
+    }
+    ApolloLog(@"ThemeBuilder: import read ok bytes=%lu", (unsigned long)data.length);
+    NSString *name = nil;
+    NSDictionary<NSString *, NSString *> *colors = nil;
+    if (!ApolloThemeBuilderParseImport(data, &name, &colors)) {
+        ApolloLog(@"ThemeBuilder: import parse rejected bytes=%lu", (unsigned long)data.length);
+        [self presentImportAlertWithTitle:@"Not an Apollo Theme"
+                                  message:@"This file isn’t a valid Apollo theme. Import a “.json” file exported from Theme Builder’s Share Theme option."];
+        return;
+    }
+    ApolloThemeBuilderCreateCustomTheme(name, colors); // mints a fresh id + makes it active
+    [self.tableView reloadData];
+    [self refreshPreview];
+    ApolloThemeBuilderForceRepaint();
+    ApolloLog(@"ThemeBuilder: import success name=%@ colors=%lu", name, (unsigned long)colors.count);
+    [self presentImportAlertWithTitle:@"Theme Imported"
+                              message:[NSString stringWithFormat:@"“%@” was added to My Themes.",
+                                       ApolloThemeBuilderActiveCustomThemeName()]];
+}
+
+- (void)presentImportAlertWithTitle:(NSString *)title message:(NSString *)message {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:title
+                                                                   message:message
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+#pragma mark - UIDocumentPickerDelegate
+
+- (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+    // Unconditional log BEFORE the nil check so a device trace proves the delegate fired
+    // and whether a URL was delivered (count==0 ⇒ empty/cancelled selection).
+    ApolloLog(@"ThemeBuilder: import didPickDocuments count=%lu first=%@",
+              (unsigned long)urls.count, urls.firstObject.path);
+    NSURL *url = urls.firstObject;
+    if (!url) return;
+    // Defer to the next runloop so the import's result alert isn't presented while the
+    // picker is still animating its dismissal (which silently drops the alert on device).
+    dispatch_async(dispatch_get_main_queue(), ^{ [self importThemeFromURL:url]; });
+}
+
+- (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)controller {
+    ApolloLog(@"ThemeBuilder: import picker cancelled");
 }
 
 - (void)presentRenameThemeDialog {
