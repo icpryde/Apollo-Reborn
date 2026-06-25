@@ -816,6 +816,22 @@ static UIImageView *ThemeBuilderImageViewIvar(id object, const char *name) {
     return [value isKindOfClass:[UIImageView class]] ? (UIImageView *)value : nil;
 }
 
+// Paint the themed selection colour over a highlighted cell. Apollo's own list
+// cells (IconText settings/profile rows…) highlight by swapping their
+// backgroundColor, which the custom-theme remap collapses onto the card colour;
+// this re-applies a visible highlight on every layout while pressed, and the
+// cell's own %orig restores its normal background on release. Used by the
+// class-scoped cell hooks below (covers profiles too, not just settings).
+static void ThemeBuilderApplyHighlight(UITableViewCell *cell) {
+    if (!sRemapActive || !cell.highlighted) return;
+    NSString *mode = (cell.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) ? @"dark" : @"light";
+    UIColor *sel = ApolloThemeBuilderSelectionColor(mode);
+    if (sel && ![cell.contentView.backgroundColor isEqual:sel]) {
+        cell.backgroundColor = sel;
+        cell.contentView.backgroundColor = sel;
+    }
+}
+
 static void ThemeBuilderApplyAccentImageView(id cell) {
     if (!sRemapActive) return;
 
@@ -1037,16 +1053,19 @@ void ApolloThemeBuilderActivateDonorLive(void) {
 - (void)layoutSubviews {
     %orig;
     ThemeBuilderApplyAccentImageView(self);
+    ThemeBuilderApplyHighlight((UITableViewCell *)self);
 }
 
 - (void)setHighlighted:(BOOL)highlighted animated:(BOOL)animated {
     %orig;
     ThemeBuilderApplyAccentImageView(self);
+    if (sRemapActive) [(UITableViewCell *)self setNeedsLayout];
 }
 
 - (void)setSelected:(BOOL)selected animated:(BOOL)animated {
     %orig;
     ThemeBuilderApplyAccentImageView(self);
+    if (sRemapActive) [(UITableViewCell *)self setNeedsLayout];
 }
 
 %end
