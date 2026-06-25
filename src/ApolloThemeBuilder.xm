@@ -1132,6 +1132,10 @@ static UIImage *ThemeBuilderPickerSwatch(void) {
 
 %end
 
+// Last font seen on a native Appearance settings row, used to size the injected
+// Theme Builder row to match Apollo's in-app Text Size setting (see willDisplay).
+static UIFont *sLastNativeSettingsFont = nil;
+
 static NSInteger (*sAppearanceRowsOrig)(id, SEL, UITableView *, NSInteger);
 static UITableViewCell *(*sAppearanceCellOrig)(id, SEL, UITableView *, NSIndexPath *);
 static CGFloat (*sAppearanceHeightOrig)(id, SEL, UITableView *, NSIndexPath *);
@@ -1263,6 +1267,36 @@ static void ThemeBuilderAppearanceWillDisplay(id self, SEL _cmd, UITableView *tv
     if (!ThemeBuilderAppearanceIsBuilderRow(ip)) {
         NSIndexPath *adjusted = ThemeBuilderAppearanceAdjustedIndexPath(ip);
         if (sAppearanceWillDisplayOrig) sAppearanceWillDisplayOrig(self, _cmd, tv, cell, adjusted);
+    } else {
+        // Our injected Theme Builder row is a stock UITableViewCell, whose default
+        // label font ignores Apollo's in-app Text Size setting that the native
+        // settings rows are sized from (and they use the medium system weight, not
+        // body-regular). Match them by copying a native sibling cell's font. Apply
+        // the last-known native font immediately to avoid a flash, then re-sample a
+        // current sibling on the next runloop — visibleCells isn't populated yet
+        // during the willDisplay cascade — so it also tracks live slider changes.
+        if (sLastNativeSettingsFont) cell.textLabel.font = sLastNativeSettingsFont;
+        __weak UITableViewCell *weakCell = cell;
+        __weak UITableView *weakTv = tv;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UITableViewCell *c = weakCell; UITableView *t = weakTv;
+            if (!c || !t) return;
+            UIFont *nativeFont = nil;
+            for (UITableViewCell *vc in t.visibleCells) {
+                if (vc == c || ![vc isKindOfClass:[UITableViewCell class]]) continue;
+                NSIndexPath *vip = [t indexPathForCell:vc];
+                if (vip.section == 0 && vip.row != 1 && vc.textLabel.font) { nativeFont = vc.textLabel.font; break; }
+            }
+            if (!nativeFont) {
+                for (UITableViewCell *vc in t.visibleCells) {
+                    if (vc != c && vc.textLabel.font && ![vc.textLabel.text isEqualToString:@"Theme Builder"]) { nativeFont = vc.textLabel.font; break; }
+                }
+            }
+            if (nativeFont) {
+                sLastNativeSettingsFont = nativeFont;
+                c.textLabel.font = nativeFont;
+            }
+        });
     }
     if (sRemapActive) {
         NSString *mode = (tv.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) ? @"dark" : @"light";
