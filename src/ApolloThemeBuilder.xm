@@ -832,6 +832,27 @@ static void ThemeBuilderApplyHighlight(UITableViewCell *cell) {
     }
 }
 
+// Texture (AsyncDisplayKit) cell nodes — profile feature rows, feed posts,
+// comments — aren't UITableViewCells: they draw their pressed state by
+// recolouring a `backgroundNode` (an ASDisplayNode), which the custom-theme
+// remap collapses onto the card colour. After the node's own setHighlighted
+// runs, repaint that node to the visible themed selection while pressed; on
+// release the node's %orig restores its normal colour and we leave it.
+static void ThemeBuilderApplyNodeHighlight(id node, BOOL highlighted) {
+    if (!sRemapActive) return;
+    id bgNode = ThemeBuilderObjectIvar(node, "backgroundNode");
+    if (![bgNode respondsToSelector:@selector(setBackgroundColor:)]) return;
+    UIUserInterfaceStyle style = UITraitCollection.currentTraitCollection.userInterfaceStyle;
+    NSString *mode = (style == UIUserInterfaceStyleDark) ? @"dark" : @"light";
+    // Pressed → the visible themed highlight; released → restore the card colour
+    // ourselves (the node's own setHighlighted:NO leaves the pressed colour in
+    // place until the next layout pass, so a tap-cancel could otherwise linger).
+    UIColor *color = highlighted
+        ? ApolloThemeBuilderSelectionColor(mode)
+        : ApolloThemeBuilderColorFromHex(ApolloThemeBuilderSavedHex(kApolloThemeRolePrimaryBG, mode));
+    if (color) ((void (*)(id, SEL, UIColor *))objc_msgSend)(bgNode, @selector(setBackgroundColor:), color);
+}
+
 static void ThemeBuilderApplyAccentImageView(id cell) {
     if (!sRemapActive) return;
 
@@ -1099,6 +1120,18 @@ void ApolloThemeBuilderActivateDonorLive(void) {
     id spec = %orig;
     ThemeBuilderApplyAccentImageNode(self);
     return spec;
+}
+
+%end
+
+// Profile feature rows (Posts / Comments / Multireddits / Trophies) are Texture
+// cell nodes, not table cells, so the table-cell highlight hooks don't reach
+// them. Repaint their backgroundNode to the themed selection while pressed.
+%hook _TtC6Apollo22ProfileFeatureCellNode
+
+- (void)setHighlighted:(BOOL)highlighted {
+    %orig;
+    ThemeBuilderApplyNodeHighlight(self, highlighted);
 }
 
 %end
