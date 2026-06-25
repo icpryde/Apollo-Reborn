@@ -1017,53 +1017,73 @@ void ApolloThemeBuilderActivateDonorLive(void) {
 
 %end
 
-// Only the two settings screens the builder hooks directly (Appearance + Theme
-// Builder) gave their cells a themed tap highlight — every other settings screen
-// fell back to the system selection, which reads wrong against a custom theme.
-// Give every Apollo settings cell the same themed highlight in one place, scoped
-// by the owning view controller (an Apollo Settings*ViewController) rather than
-// by cell class — those screens mix Eureka and several Apollo cell types — so
-// the feed, comments and other lists are untouched.
-%hook UITableViewCell
-
-- (void)layoutSubviews {
-    %orig;
+// Give every Apollo settings/search cell a themed tap highlight in one place,
+// scoped by the owning view controller (an Apollo Settings*/Search*ViewController)
+// rather than by cell class — those screens mix Eureka and several Apollo cell
+// types — so the feed, comments and other lists are untouched. Applied from both
+// layoutSubviews AND setHighlighted: some cells (e.g. ApolloSubtitleTableViewCell,
+// which Filters & Blocks uses) don't route their layoutSubviews through this hook,
+// so the layout-only path missed them — setHighlighted always runs.
+static void ThemeBuilderColorListCell(UITableViewCell *cell) {
     if (!sRemapActive) return;
-    UIView *v = self.superview;
+    UIView *v = cell.superview;
     while (v && ![v isKindOfClass:[UITableView class]]) v = v.superview;
     if (![v isKindOfClass:[UITableView class]]) return;
     id delegate = ((UITableView *)v).delegate;
     if (!delegate) return;
     NSString *owner = NSStringFromClass([delegate class]);
-    if (![owner containsString:@"Settings"] || ![owner containsString:@"ViewController"]) return;
-    NSString *mode = (self.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) ? @"dark" : @"light";
+    BOOL inScope = [owner containsString:@"ViewController"]
+        && ([owner containsString:@"Settings"] || [owner containsString:@"Search"]);
+    if (!inScope) return;
+    NSString *mode = (cell.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) ? @"dark" : @"light";
     UIColor *sel = ApolloThemeBuilderSelectionColor(mode);
     if (!sel) return;
-    // Eureka settings cells (Appearance, General, …) highlight via a
-    // selectedBackgroundView shown over their card.
-    if (![self.selectedBackgroundView.backgroundColor isEqual:sel]) {
+    // Eureka settings cells highlight via a selectedBackgroundView over their card.
+    if (![cell.selectedBackgroundView.backgroundColor isEqual:sel]) {
         UIView *bg = [[UIView alloc] init];
         bg.backgroundColor = sel;
-        self.selectedBackgroundView = bg;
+        cell.selectedBackgroundView = bg;
     }
-    // Apollo's own settings cells (ApolloDefault/RightDetail/IconText…) instead
-    // highlight by swapping their backgroundColor, which the custom-theme remap
-    // collapses onto the card colour — so the tap looks dead. Paint the themed
-    // selection while the cell is highlighted, re-applied here on every layout
-    // because the cell re-applies its own highlight each pass. Appearance/Theme
-    // Builder own their cell background, so leave those alone.
-    if (self.highlighted && ![owner containsString:@"Appearance"]
-        && ![self.contentView.backgroundColor isEqual:sel]) {
-        self.backgroundColor = sel;
-        self.contentView.backgroundColor = sel;
+    // Apollo's own cells instead swap their backgroundColor, which the remap
+    // collapses onto the card — paint the themed selection while pressed.
+    // Appearance/Theme Builder own their cell background, so leave those alone.
+    if (cell.highlighted && ![owner containsString:@"Appearance"]
+        && ![cell.contentView.backgroundColor isEqual:sel]) {
+        cell.backgroundColor = sel;
+        cell.contentView.backgroundColor = sel;
     }
+}
+
+%hook UITableViewCell
+
+- (void)layoutSubviews {
+    %orig;
+    ThemeBuilderColorListCell(self);
 }
 
 - (void)setHighlighted:(BOOL)highlighted animated:(BOOL)animated {
     %orig;
-    // Re-run layoutSubviews so the themed highlight above is applied on press and
-    // removed on release (the cell's own %orig restores its normal background).
+    // Re-run layoutSubviews so the themed highlight is applied on press and the
+    // cell's own %orig restores its normal background on release.
     if (sRemapActive) [self setNeedsLayout];
+}
+
+%end
+
+// ApolloSubtitleTableViewCell (used by Filters & Blocks) doesn't route its
+// layoutSubviews through the base UITableViewCell hook above, so the shared
+// coloring never reached it. Hook it directly — after its own layout — the same
+// way IconTextTableViewCell is handled.
+%hook _TtC6Apollo27ApolloSubtitleTableViewCell
+
+- (void)layoutSubviews {
+    %orig;
+    ThemeBuilderColorListCell((UITableViewCell *)self);
+}
+
+- (void)setHighlighted:(BOOL)highlighted animated:(BOOL)animated {
+    %orig;
+    if (sRemapActive) [(UITableViewCell *)self setNeedsLayout];
 }
 
 %end
