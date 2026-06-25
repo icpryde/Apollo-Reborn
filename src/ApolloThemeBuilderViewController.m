@@ -107,6 +107,18 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
 
 - (UITableView *)tableViewForWillDisplay { return self.tableView; }
 
+// Tint for the builder's own controls (New Theme, the ⋯ menu, the Active label).
+// When a custom theme is active the app's accent is the theme's accent, so these
+// should match it instead of the hardcoded system blue.
+- (UIColor *)builderAccentColor {
+    if (ApolloThemeBuilderIsEnabled()) {
+        UIColor *accent = ApolloThemeBuilderColorFromHex(
+            ApolloThemeBuilderSavedHex(kApolloThemeRoleAccent, [self previewMode]));
+        if (accent) return accent;
+    }
+    return UIColor.systemBlueColor;
+}
+
 #pragma mark - Live preview
 
 // Which appearance the preview (and the live app behind us) is currently
@@ -587,7 +599,7 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
             button.frame = cell.contentView.bounds;
             button.autoresizingMask = UIViewAutoresizingFlexibleWidth;
             button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
-            button.tintColor = UIColor.systemBlueColor;
+            button.tintColor = [self builderAccentColor];
             [button setImage:[UIImage systemImageNamed:@"plus.circle.fill"] forState:UIControlStateNormal];
             [button setTitle:@" New Theme" forState:UIControlStateNormal];
             button.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
@@ -602,10 +614,11 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
         UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
         cell.textLabel.text = [theme[@"name"] length] ? theme[@"name"] : @"Custom";
         cell.detailTextLabel.text = active ? @"Active" : @"Tap to use";
-        cell.detailTextLabel.textColor = active ? UIColor.systemBlueColor : UIColor.secondaryLabelColor;
+        cell.detailTextLabel.textColor = active ? [self builderAccentColor] : UIColor.secondaryLabelColor;
         cell.accessoryType = active ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
         UIButton *more = [UIButton buttonWithType:UIButtonTypeSystem];
         more.frame = CGRectMake(0, 0, 34, 34);
+        more.tintColor = [self builderAccentColor];
         [more setImage:[UIImage systemImageNamed:@"ellipsis.circle"] forState:UIControlStateNormal];
         more.menu = [self menuForTheme:theme sourceView:more];
         more.showsMenuAsPrimaryAction = YES;
