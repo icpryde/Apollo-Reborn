@@ -45,19 +45,28 @@
 //    always holds the full Reddit-reported set. Every moderator-power check
 //    app-wide sees the real list.
 // 2. `-[RDKUser moderatedSubreddits]` is hooked. It returns the full array
-//    everywhere EXCEPT inside the Subreddits list's table data-source/delegate
-//    methods, where it returns the array with hidden subs removed. A
-//    thread-local depth counter, bumped only around those methods' `%orig`,
-//    scopes the filtering precisely (and keeps background mod-power checks on
-//    other threads unaffected).
+//    everywhere EXCEPT inside the Subreddits list's row-SIZING/BUILDING table
+//    methods (numberOfRows, heightForHeader, cellForRow), where it returns the
+//    array with hidden subs removed. A thread-local depth counter, bumped only
+//    around those methods' `%orig`, scopes the filtering precisely (and keeps
+//    background mod-power checks on other threads unaffected).
 // 3. In Edit mode the filter is bypassed so hidden rows reappear (faded, with
 //    a green plus circle) and can be unhidden inline.
 //
 // Because numberOfRows, heightForHeader and cellForRow all read the same
 // filtered getter, the MODERATOR section's row count, header and cells stay
 // consistent automatically — when every moderated sub is hidden the section
-// collapses to nothing, with no index-path remapping. Toggling Edit mode just
-// reloads the table; no network refetch is needed.
+// collapses to nothing. Toggling Edit mode just reloads the table; no network
+// refetch is needed.
+//
+// The methods that NAVIGATE off a row (didSelect, contextMenu) are kept OUT of
+// the filter window: navigating pushes a view controller whose mod-toolbar gate
+// reads `moderatedSubreddits` synchronously during the push, so doing it under
+// the filter would drop mod tools for a sub you moderate-but-hid yet reached
+// from another section. They instead translate the tapped (filtered) row to its
+// full-list index and run `%orig` at depth 0, so resolution stays correct while
+// the navigation always sees the complete list (see
+// ApolloHideModResolveModeratorIndexPath).
 //
 // The hidden list is stored in NSUserDefaults under
 // UDKeyHiddenModeratorSubreddits as an array of display names, compared
@@ -228,6 +237,65 @@ static UITableView *ApolloHideModTableView(UIViewController *viewController) {
     return [tableView isKindOfClass:[UITableView class]] ? tableView : nil;
 }
 
+// MARK: - Index remap for navigation/context-menu taps
+
+// The current user's FULL (unfiltered) moderated-subreddits list. Called only at
+// filter depth 0, so the hooked getter returns the complete array — the same
+// object the Subreddits list's MODERATOR rows are built from (the list reads
+// currentUser.moderatedSubreddits, and currentUser is the shared client's).
+static NSArray *ApolloHideModCurrentModeratedSubreddits(void) {
+    Class clientClass = objc_getClass("RDKClient");
+    if (!clientClass || ![clientClass respondsToSelector:@selector(sharedClient)]) return nil;
+    id client = ((id (*)(id, SEL))objc_msgSend)(clientClass, @selector(sharedClient));
+    if (![client respondsToSelector:@selector(currentUser)]) return nil;
+    id user = ((id (*)(id, SEL))objc_msgSend)(client, @selector(currentUser));
+    if (![user respondsToSelector:@selector(moderatedSubreddits)]) return nil;
+    id list = ((id (*)(id, SEL))objc_msgSend)(user, @selector(moderatedSubreddits));
+    return [list isKindOfClass:[NSArray class]] ? list : nil;
+}
+
+// Translate a MODERATOR-section index path from "position among the visible
+// (hidden-filtered) rows" to "position in the full moderatedSubreddits array".
+//
+// This lets the row-resolving methods (didSelect / contextMenu) run their %orig
+// at filter depth 0 instead of inside the display-scope window. That matters
+// because Apollo resolves the moderator row as `moderatedSubreddits[row]` and
+// then navigates: a tap pushes the subreddit's posts view controller, and UIKit
+// runs that controller's viewDidLoad/viewWillAppear: synchronously inside
+// pushViewController:. Those gate the moderator toolbar on
+// currentUser.moderatedSubreddits, so if the push ran under the filter window
+// the freshly opened sub could lose its mod tools — the very bug this PR fixes —
+// for a sub you moderate, have hidden, but are still subscribed to (so it stays
+// reachable from the alphabetical section while hidden). Running at depth 0 keeps
+// every such check on the complete list; remapping keeps resolution correct.
+//
+// Returns the input unchanged for any row that needs no translation: non-
+// MODERATOR sections (Apollo resolves those from its sectionedSubreddits model,
+// already aligned to the full data and never filtered), Edit mode (filter
+// bypassed, rows already the full list), nothing hidden, or anything we can't
+// resolve — in which case the conservative fallback is the original index path.
+static NSIndexPath *ApolloHideModResolveModeratorIndexPath(id viewController, UITableView *tableView, NSIndexPath *indexPath) {
+    if (!indexPath || sShowHiddenForEditing) return indexPath;
+    if (ApolloHideModHiddenList().count == 0) return indexPath;
+    if (![ApolloHideModSectionTitle(viewController, tableView, indexPath.section) isEqualToString:@"MODERATOR"]) return indexPath;
+
+    NSArray *full = ApolloHideModCurrentModeratedSubreddits();
+    NSArray *filtered = ApolloHideModFilteredList(full);
+    if (filtered == full) return indexPath; // nothing hidden among the moderated subs
+
+    NSInteger visibleRow = indexPath.row;
+    if (visibleRow < 0 || visibleRow >= (NSInteger)filtered.count) return indexPath;
+
+    id target = filtered[visibleRow];
+    NSUInteger fullIndex = [full indexOfObjectIdenticalTo:target];
+    if (fullIndex == NSNotFound) fullIndex = [full indexOfObject:target];
+    if (fullIndex == NSNotFound || (NSInteger)fullIndex == visibleRow) return indexPath;
+
+    ApolloLog(@"[HideModSubs] remap moderator row %ld -> %lu (full list) so navigation keeps mod powers",
+              (long)visibleRow, (unsigned long)fullIndex);
+    return [NSIndexPath indexPathForRow:(NSInteger)fullIndex inSection:indexPath.section];
+}
+
 // MARK: - Edit-mode hide/unhide control
 
 // Hide/unhide glyph drawn by hand so the visible circle is exactly 22pt —
@@ -348,13 +416,17 @@ static void ApolloHideModDecorateCell(UIViewController *viewController, UITableV
 }
 
 // --- Display-scope window ---
-// Each of these data-source/delegate methods reads currentUser.moderatedSubreddits
-// (directly or via Apollo's inlined helpers) to size, build, navigate, or
-// configure the MODERATOR section. Bumping the thread-local depth around %orig
-// makes the getter return the hidden-filtered list for the whole of that work,
-// so row counts, header height, cells, taps and the context menu all agree.
-// Outside this window — and on any other thread — the getter returns the full
-// list, so moderator powers are never affected.
+// These data-source/delegate methods read currentUser.moderatedSubreddits
+// (directly or via Apollo's inlined helpers) to SIZE and BUILD the MODERATOR
+// section. Bumping the thread-local depth around %orig makes the getter return
+// the hidden-filtered list for the whole of that work, so row count, header
+// height and cells all agree. Outside this window — and on any other thread —
+// the getter returns the full list, so moderator powers are never affected.
+//
+// Note: the methods that also NAVIGATE off a row (didSelect, contextMenu) are
+// deliberately NOT in this window. They run %orig at depth 0 against a remapped
+// index path instead — see ApolloHideModResolveModeratorIndexPath for why
+// pushing a view controller under the filter would reintroduce the mod-tools bug.
 
 - (long long)tableView:(UITableView *)tableView numberOfRowsInSection:(long long)section {
     sListFilterDepth++;
@@ -370,17 +442,26 @@ static void ApolloHideModDecorateCell(UIViewController *viewController, UITableV
     return result;
 }
 
+// Taps and context menus must NOT run inside the display-scope window: they
+// resolve `moderatedSubreddits[row]` and then navigate, and the push runs the
+// opened subreddit's mod-power check synchronously (see
+// ApolloHideModResolveModeratorIndexPath). So instead of bumping the depth we
+// translate the visible (filtered) row to its full-list index and let %orig
+// resolve + navigate at depth 0, where every mod check sees the complete list.
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
-    sListFilterDepth++;
-    %orig;
-    sListFilterDepth--;
+    NSIndexPath *resolved = ApolloHideModResolveModeratorIndexPath(self, tableView, indexPath);
+    if (resolved != indexPath) {
+        // %orig is about to act on a different (full-list) index path, so clear
+        // the user's visible selection ourselves — otherwise the row they
+        // actually tapped would stay highlighted.
+        [tableView deselectRowAtIndexPath:indexPath animated:NO];
+    }
+    %orig(tableView, resolved);
 }
 
 - (id)tableView:(UITableView *)tableView contextMenuConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath point:(CGPoint)point {
-    sListFilterDepth++;
-    id result = %orig;
-    sListFilterDepth--;
-    return result;
+    NSIndexPath *resolved = ApolloHideModResolveModeratorIndexPath(self, tableView, indexPath);
+    return %orig(tableView, resolved, point);
 }
 
 - (void)tableView:(UITableView *)tableView commitEditingStyle:(UITableViewCellEditingStyle)editingStyle forRowAtIndexPath:(NSIndexPath *)indexPath {
