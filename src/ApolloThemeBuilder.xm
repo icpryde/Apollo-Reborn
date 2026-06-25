@@ -199,6 +199,22 @@ NSString *ApolloThemeBuilderHexFromColor(UIColor *color) {
             (int)lround(r * 255.0), (int)lround(g * 255.0), (int)lround(b * 255.0)];
 }
 
+UIColor *ApolloThemeBuilderSelectionColor(NSString *mode) {
+    UIColor *card = ApolloThemeBuilderColorFromHex(ApolloThemeBuilderSavedHex(kApolloThemeRolePrimaryBG, mode));
+    if (!card) return nil;
+    CGFloat r = 0, g = 0, b = 0, a = 0;
+    if (![card getRed:&r green:&g blue:&b alpha:&a]) return nil;
+    // Tap highlight = the card colour nudged toward white (dark mode) or black
+    // (light mode), mirroring iOS's pressed-row shade so it's clearly visible
+    // against any custom background while keeping the theme's hue.
+    BOOL dark = [mode isEqualToString:@"dark"];
+    CGFloat target = dark ? 1.0 : 0.0, k = 0.16;
+    return [UIColor colorWithRed:r + (target - r) * k
+                           green:g + (target - g) * k
+                            blue:b + (target - b) * k
+                           alpha:1.0];
+}
+
 NSString *ApolloThemeBuilderSavedHex(NSString *roleKey, NSString *mode) {
     NSDictionary *colors = ApolloThemeBuilderActiveCustomTheme()[@"colors"];
     NSString *saved = colors[[NSString stringWithFormat:@"%@.%@", roleKey, mode]];
@@ -1132,9 +1148,46 @@ static UIImage *ThemeBuilderPickerSwatch(void) {
 
 %end
 
-// Last font seen on a native Appearance settings row, used to size the injected
-// Theme Builder row to match Apollo's in-app Text Size setting (see willDisplay).
-static UIFont *sLastNativeSettingsFont = nil;
+// The injected Theme Builder row is a stock cell, so its label font doesn't
+// follow Apollo's in-app Text Size setting (the native Eureka rows are sized
+// from it, using the medium system weight). Match them by copying the current
+// font off a native sibling — and do it in layoutSubviews, because a one-shot
+// assignment doesn't survive the table's later layout/reuse passes when the
+// slider changes, whereas layoutSubviews always runs after those.
+@interface ApolloRebornThemeBuilderRowCell : UITableViewCell
+@property (nonatomic, strong) UIFont *apollo_targetFont;
+@end
+@implementation ApolloRebornThemeBuilderRowCell
+- (UIFont *)apollo_sampleNativeFont {
+    UIView *v = self.superview;
+    while (v && ![v isKindOfClass:[UITableView class]]) v = v.superview;
+    if (![v isKindOfClass:[UITableView class]]) return nil;
+    for (UITableViewCell *c in ((UITableView *)v).visibleCells) {
+        if (c == self || ![c isKindOfClass:[UITableViewCell class]]) continue;
+        NSString *t = c.textLabel.text;
+        if (c.textLabel.font && t.length && ![t isEqualToString:@"Theme Builder"]) return c.textLabel.font;
+    }
+    return nil;
+}
+- (void)layoutSubviews {
+    // Enforce the last-sampled native font: a one-shot assignment doesn't survive
+    // the table's layout/reuse passes, but layoutSubviews always re-applies it.
+    if (self.apollo_targetFont && ![self.textLabel.font isEqual:self.apollo_targetFont])
+        self.textLabel.font = self.apollo_targetFont;
+    [super layoutSubviews];
+    // Re-sample on the next runloop, when visibleCells is populated (it isn't yet
+    // during the layout cascade). This also tracks live Text Size slider changes.
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        typeof(self) s = weakSelf; if (!s) return;
+        UIFont *f = [s apollo_sampleNativeFont];
+        if (f && ![f isEqual:s.apollo_targetFont]) {
+            s.apollo_targetFont = f;
+            [s setNeedsLayout];
+        }
+    });
+}
+@end
 
 static NSInteger (*sAppearanceRowsOrig)(id, SEL, UITableView *, NSInteger);
 static UITableViewCell *(*sAppearanceCellOrig)(id, SEL, UITableView *, NSIndexPath *);
@@ -1196,7 +1249,7 @@ static UITableViewCell *ThemeBuilderAppearanceCell(id self, SEL _cmd, UITableVie
     if (ip.section == 0 && ip.row == 1) {
         static NSString *reuse = @"ApolloRebornThemeBuilderAppearanceCell";
         UITableViewCell *cell = [tv dequeueReusableCellWithIdentifier:reuse];
-        if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:reuse];
+        if (!cell) cell = [[ApolloRebornThemeBuilderRowCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:reuse];
         cell.textLabel.text = @"Theme Builder";
         cell.detailTextLabel.text = nil;
         cell.accessoryView = nil;
@@ -1267,37 +1320,10 @@ static void ThemeBuilderAppearanceWillDisplay(id self, SEL _cmd, UITableView *tv
     if (!ThemeBuilderAppearanceIsBuilderRow(ip)) {
         NSIndexPath *adjusted = ThemeBuilderAppearanceAdjustedIndexPath(ip);
         if (sAppearanceWillDisplayOrig) sAppearanceWillDisplayOrig(self, _cmd, tv, cell, adjusted);
-    } else {
-        // Our injected Theme Builder row is a stock UITableViewCell, whose default
-        // label font ignores Apollo's in-app Text Size setting that the native
-        // settings rows are sized from (and they use the medium system weight, not
-        // body-regular). Match them by copying a native sibling cell's font. Apply
-        // the last-known native font immediately to avoid a flash, then re-sample a
-        // current sibling on the next runloop — visibleCells isn't populated yet
-        // during the willDisplay cascade — so it also tracks live slider changes.
-        if (sLastNativeSettingsFont) cell.textLabel.font = sLastNativeSettingsFont;
-        __weak UITableViewCell *weakCell = cell;
-        __weak UITableView *weakTv = tv;
-        dispatch_async(dispatch_get_main_queue(), ^{
-            UITableViewCell *c = weakCell; UITableView *t = weakTv;
-            if (!c || !t) return;
-            UIFont *nativeFont = nil;
-            for (UITableViewCell *vc in t.visibleCells) {
-                if (vc == c || ![vc isKindOfClass:[UITableViewCell class]]) continue;
-                NSIndexPath *vip = [t indexPathForCell:vc];
-                if (vip.section == 0 && vip.row != 1 && vc.textLabel.font) { nativeFont = vc.textLabel.font; break; }
-            }
-            if (!nativeFont) {
-                for (UITableViewCell *vc in t.visibleCells) {
-                    if (vc != c && vc.textLabel.font && ![vc.textLabel.text isEqualToString:@"Theme Builder"]) { nativeFont = vc.textLabel.font; break; }
-                }
-            }
-            if (nativeFont) {
-                sLastNativeSettingsFont = nativeFont;
-                c.textLabel.font = nativeFont;
-            }
-        });
     }
+    // The injected Theme Builder row keeps its label sized to the native rows via
+    // ApolloRebornThemeBuilderRowCell's layoutSubviews (it tracks Apollo's Text
+    // Size setting) — no per-display font handling needed here.
     if (sRemapActive) {
         NSString *mode = (tv.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) ? @"dark" : @"light";
         UIColor *cellBG = ApolloThemeBuilderColorFromHex(ApolloThemeBuilderSavedHex(kApolloThemeRoleSecondaryBG, mode));
@@ -1306,7 +1332,9 @@ static void ThemeBuilderAppearanceWillDisplay(id self, SEL _cmd, UITableView *tv
         if (cellBG) {
             cell.backgroundColor = cellBG;
             UIView *sel = [[UIView alloc] init];
-            sel.backgroundColor = [cellBG colorWithAlphaComponent:0.7];
+            // Visible tap highlight derived from the card colour (the old
+            // secondaryBG@0.7 was nearly indistinguishable from the background).
+            sel.backgroundColor = ApolloThemeBuilderSelectionColor(mode) ?: [cellBG colorWithAlphaComponent:0.7];
             cell.selectedBackgroundView = sel;
         }
         if (textColor) cell.textLabel.textColor = textColor;

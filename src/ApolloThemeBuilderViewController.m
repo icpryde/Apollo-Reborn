@@ -663,9 +663,12 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
     UIColor *grayColor = ApolloThemeBuilderColorFromHex(ApolloThemeBuilderSavedHex(kApolloThemeRoleGray, mode));
     if (secondaryBG) {
         cell.backgroundColor = secondaryBG;
-        // Clear the default selected-background highlight so it doesn't flash white
+        // Replace the default highlight (which flashed white under a custom theme)
+        // with a visible tap highlight derived from the card colour — the old
+        // secondaryBG@0.7 was nearly indistinguishable from the background.
         cell.selectedBackgroundView = [[UIView alloc] init];
-        cell.selectedBackgroundView.backgroundColor = [secondaryBG colorWithAlphaComponent:0.7];
+        cell.selectedBackgroundView.backgroundColor =
+            ApolloThemeBuilderSelectionColor(mode) ?: [secondaryBG colorWithAlphaComponent:0.7];
     }
     if (textColor) {
         cell.textLabel.textColor = textColor;

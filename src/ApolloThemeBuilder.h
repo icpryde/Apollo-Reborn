@@ -82,4 +82,9 @@ void ApolloThemeBuilderForceRepaint(void);
 UIColor *ApolloThemeBuilderColorFromHex(NSString *hex);
 NSString *ApolloThemeBuilderHexFromColor(UIColor *color);
 
+// A visible cell-selection highlight for the given mode ("light"/"dark"),
+// derived from the card (primaryBG) colour so a tap reads clearly against the
+// theme. Returns nil if no primaryBG is set.
+UIColor *ApolloThemeBuilderSelectionColor(NSString *mode);
+
 __END_DECLS
