@@ -1311,7 +1311,29 @@ static NSString *ApolloLPCleanMultilineDisplayText(NSString *text) {
 }
 
 static NSString *ApolloLPDisplayTitleForPreview(ApolloLinkPreview *preview) {
-    return ApolloLPCleanDisplayText(preview.title);
+    NSString *clean = ApolloLPCleanDisplayText(preview.title);
+
+    // Some pages (single-page apps like fifa.com match-center URLs) only expose
+    // a numeric-ID <title> ("285023 289273 400021448"), which renders as a
+    // meaningless series of numbers in the card. Substitute a clean website
+    // name derived from the source — the eyebrow still shows the full domain.
+    if (ApolloIsJunkNumericTitle(clean)) {
+        NSString *site = preview.siteName;
+        NSString *name = nil;
+        if (site.length > 0 && [site containsString:@"."] && ![site containsString:@" "]) {
+            // Host-like siteName ("fifa.com") -> "FIFA".
+            name = ApolloWebsiteNameFromHost(site);
+        } else if (site.length > 0 && !ApolloIsJunkNumericTitle(site)) {
+            // Already a presentable name (og:site_name / curated, e.g. "YouTube").
+            name = site;
+        }
+        if (name.length > 0) {
+            ApolloLPLogOncePerHost(site, [NSString stringWithFormat:@"junk-numeric-title-substituted->%@", name]);
+            return name;
+        }
+    }
+
+    return clean;
 }
 
 static NSString *ApolloLPDisplayDescriptionForPreview(ApolloLinkPreview *preview) {

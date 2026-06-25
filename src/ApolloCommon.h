@@ -34,6 +34,18 @@ NSString *ApolloBundledResourcePath(NSString *baseName, NSString *extension);
 NSString *ApolloGetLinkButtonNodeURLString(id linkButtonNode);
 void ApolloPresentWebURLFromViewController(UIViewController *presenter, NSURL *url);
 
+// Returns YES when a link-card title is a numeric-ID-style junk string —
+// contains at least one digit but no letters at all (e.g. the scraped
+// "285023 289273 400021448" title from a single-page-app page). Used to decide
+// when to substitute a website name for an unhelpful machine-scraped title.
+BOOL ApolloIsJunkNumericTitle(NSString *title);
+
+// Derives a presentable website name from a host ("fifa.com" -> "FIFA",
+// "news.bbc.co.uk" -> "BBC", "theverge.com" -> "Theverge"). Short registrable
+// labels are uppercased as acronyms; longer ones are title-cased. Returns nil
+// when no usable name can be derived (e.g. a raw IP host).
+NSString *ApolloWebsiteNameFromHost(NSString *host);
+
 // Returns YES for Apple's out-of-process share/compose controllers that the
 // tweak must never traverse or mutate. Their class names end in
 // "ComposeViewController" (e.g. MFMessageComposeViewController), so loose
