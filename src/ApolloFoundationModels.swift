@@ -185,6 +185,15 @@ public final class ApolloFoundationModels: NSObject {
                     }
                     if !latest.isEmpty || Task.isCancelled { break }
                 }
+                // A cancellation can surface as a clean end-of-stream (the loop
+                // finishing without `streamResponse` throwing `CancellationError`),
+                // especially when the break above fires on `Task.isCancelled`.
+                // Re-check here and route through the catch's code-6 sentinel
+                // instead of falling through as an empty/partial success — otherwise
+                // the ObjC side never sees the navigation-cancellation code and
+                // marks the post failed/suppressed (and won't regenerate on reopen,
+                // since `onComplete` lands after `viewDidDisappear` clears the set).
+                if Task.isCancelled { throw CancellationError() }
                 aiLog.debug("completed \(identifier, privacy: .public) after \(String(describing: ContinuousClock.now - startedAt), privacy: .public)")
                 onComplete(latest, nil)
             } catch {
