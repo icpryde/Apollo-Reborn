@@ -798,28 +798,60 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
 }
 
 - (void)presentImportPicker {
+    // Content types: a theme file is plain JSON, but on a REAL (sideloaded) device a
+    // ".json" is often tagged generically — public.data or a dyn.* UTI — because no
+    // installed app claims the extension. The picker greys out (disables) any file that
+    // doesn't *conform* to a requested type, and UTI conformance only flows downward
+    // (public.json conforms up to text/data, but public.data/dyn.* don't conform down to
+    // public.json). A JSON-only filter therefore makes a generically-tagged file
+    // untappable: no selection, no delegate callback, no log — exactly the "tap does
+    // nothing" symptom. So we widen to the umbrella ancestors (data/item) too and
+    // validate by parsing after the pick. (The sibling Backup/Restore picker gets away
+    // with a single UTTypeZIP because .zip is universally tagged public.zip-archive.)
+    NSArray<UTType *> *types = @[ UTTypeJSON, UTTypePlainText, UTTypeText, UTTypeData, UTTypeItem ];
+    // asCopy:YES (import/copy mode) makes iOS copy the file into our own temp container
+    // and hand back a directly-readable, app-local URL — eliminating the security-scoped
+    // / FileProvider XPC round-trip that an ad-hoc-signed build can't complete (and that
+    // the Simulator silently lets slide). Mirrors Apollo's working restoreSettings picker.
     UIDocumentPickerViewController *picker =
-        [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeJSON, UTTypeText]];
+        [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:types asCopy:YES];
     picker.delegate = self;
     picker.allowsMultipleSelection = NO;
+    picker.shouldShowFileExtensions = YES;
     picker.modalPresentationStyle = UIModalPresentationFormSheet; // match the app's other document pickers
     [self presentViewController:picker animated:YES completion:nil];
 }
 
 - (void)importThemeFromURL:(NSURL *)url {
+    ApolloLog(@"ThemeBuilder: import begin url=%@", url.path);
+    // asCopy:YES vends an app-local copy, so this is usually a no-op; keep it as harmless
+    // best-effort in case the OS ever hands back a security-scoped URL.
     BOOL scoped = [url startAccessingSecurityScopedResource];
-    NSError *error = nil;
-    NSData *data = [NSData dataWithContentsOfURL:url options:0 error:&error];
+    // Read through a file coordinator so an iCloud-Drive file that is only a placeholder
+    // gets materialized (downloaded) before we read it — a bare dataWithContentsOfURL:
+    // returns nil for an un-downloaded cloud file.
+    __block NSData *data = nil;
+    __block NSError *readError = nil;
+    NSError *coordError = nil;
+    NSFileCoordinator *coordinator = [[NSFileCoordinator alloc] initWithFilePresenter:nil];
+    [coordinator coordinateReadingItemAtURL:url
+                                    options:NSFileCoordinatorReadingWithoutChanges
+                                      error:&coordError
+                                 byAccessor:^(NSURL *readURL) {
+        data = [NSData dataWithContentsOfURL:readURL options:0 error:&readError];
+    }];
     if (scoped) [url stopAccessingSecurityScopedResource];
     if (!data) {
-        ApolloLog(@"ThemeBuilder: import read failed: %@", error);
+        ApolloLog(@"ThemeBuilder: import read failed coord=%@ read=%@", coordError, readError);
         [self presentImportAlertWithTitle:@"Couldn’t Import Theme"
                                   message:@"The selected file could not be read."];
         return;
     }
+    ApolloLog(@"ThemeBuilder: import read ok bytes=%lu", (unsigned long)data.length);
     NSString *name = nil;
     NSDictionary<NSString *, NSString *> *colors = nil;
     if (!ApolloThemeBuilderParseImport(data, &name, &colors)) {
+        ApolloLog(@"ThemeBuilder: import parse rejected bytes=%lu", (unsigned long)data.length);
         [self presentImportAlertWithTitle:@"Not an Apollo Theme"
                                   message:@"This file isn’t a valid Apollo theme. Import a “.json” file exported from Theme Builder’s Share Theme option."];
         return;
@@ -828,6 +860,7 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
     [self.tableView reloadData];
     [self refreshPreview];
     ApolloThemeBuilderForceRepaint();
+    ApolloLog(@"ThemeBuilder: import success name=%@ colors=%lu", name, (unsigned long)colors.count);
     [self presentImportAlertWithTitle:@"Theme Imported"
                               message:[NSString stringWithFormat:@"“%@” was added to My Themes.",
                                        ApolloThemeBuilderActiveCustomThemeName()]];
@@ -844,8 +877,19 @@ typedef NS_ENUM(NSInteger, ThemeBuilderSection) {
 #pragma mark - UIDocumentPickerDelegate
 
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+    // Unconditional log BEFORE the nil check so a device trace proves the delegate fired
+    // and whether a URL was delivered (count==0 ⇒ empty/cancelled selection).
+    ApolloLog(@"ThemeBuilder: import didPickDocuments count=%lu first=%@",
+              (unsigned long)urls.count, urls.firstObject.path);
     NSURL *url = urls.firstObject;
-    if (url) [self importThemeFromURL:url];
+    if (!url) return;
+    // Defer to the next runloop so the import's result alert isn't presented while the
+    // picker is still animating its dismissal (which silently drops the alert on device).
+    dispatch_async(dispatch_get_main_queue(), ^{ [self importThemeFromURL:url]; });
+}
+
+- (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)controller {
+    ApolloLog(@"ThemeBuilder: import picker cancelled");
 }
 
 - (void)presentRenameThemeDialog {
