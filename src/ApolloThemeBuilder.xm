@@ -975,6 +975,57 @@ void ApolloThemeBuilderActivateDonorLive(void) {
 
 %end
 
+// Only the two settings screens the builder hooks directly (Appearance + Theme
+// Builder) gave their cells a themed tap highlight — every other settings screen
+// fell back to the system selection, which reads wrong against a custom theme.
+// Give every Apollo settings cell the same themed highlight in one place, scoped
+// by the owning view controller (an Apollo Settings*ViewController) rather than
+// by cell class — those screens mix Eureka and several Apollo cell types — so
+// the feed, comments and other lists are untouched.
+%hook UITableViewCell
+
+- (void)layoutSubviews {
+    %orig;
+    if (!sRemapActive) return;
+    UIView *v = self.superview;
+    while (v && ![v isKindOfClass:[UITableView class]]) v = v.superview;
+    if (![v isKindOfClass:[UITableView class]]) return;
+    id delegate = ((UITableView *)v).delegate;
+    if (!delegate) return;
+    NSString *owner = NSStringFromClass([delegate class]);
+    if (![owner containsString:@"Settings"] || ![owner containsString:@"ViewController"]) return;
+    NSString *mode = (self.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) ? @"dark" : @"light";
+    UIColor *sel = ApolloThemeBuilderSelectionColor(mode);
+    if (!sel) return;
+    // Eureka settings cells (Appearance, General, …) highlight via a
+    // selectedBackgroundView shown over their card.
+    if (![self.selectedBackgroundView.backgroundColor isEqual:sel]) {
+        UIView *bg = [[UIView alloc] init];
+        bg.backgroundColor = sel;
+        self.selectedBackgroundView = bg;
+    }
+    // Apollo's own settings cells (ApolloDefault/RightDetail/IconText…) instead
+    // highlight by swapping their backgroundColor, which the custom-theme remap
+    // collapses onto the card colour — so the tap looks dead. Paint the themed
+    // selection while the cell is highlighted, re-applied here on every layout
+    // because the cell re-applies its own highlight each pass. Appearance/Theme
+    // Builder own their cell background, so leave those alone.
+    if (self.highlighted && ![owner containsString:@"Appearance"]
+        && ![self.contentView.backgroundColor isEqual:sel]) {
+        self.backgroundColor = sel;
+        self.contentView.backgroundColor = sel;
+    }
+}
+
+- (void)setHighlighted:(BOOL)highlighted animated:(BOOL)animated {
+    %orig;
+    // Re-run layoutSubviews so the themed highlight above is applied on press and
+    // removed on release (the cell's own %orig restores its normal background).
+    if (sRemapActive) [self setNeedsLayout];
+}
+
+%end
+
 // These UIKit menu rows are the visible outlier for custom light themes:
 // under the outrun donor, their glyph assets arrive as original-rendered
 // images, so Apollo's tint writes are ignored. Stock light themes use the
