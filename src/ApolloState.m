@@ -74,3 +74,6 @@ NSString *sTagFilterMode = @"blur";
 BOOL sTagFilterNSFW = YES;
 BOOL sTagFilterSpoiler = YES;
 NSDictionary<NSString *, NSDictionary *> *sTagFilterSubredditOverrides = nil;
+
+NSDictionary<NSString *, NSDictionary *> *sPostFilterSubreddits = nil;
+NSArray<NSString *> *sPostFilterNameSubstrings = nil;

@@ -123,6 +123,19 @@ static NSString *const UDKeyTagFilterSpoiler = @"TagFilterSpoiler";        // gl
 // Missing keys fall back to global settings.
 static NSString *const UDKeyTagFilterSubredditOverrides = @"TagFilterSubredditOverrides";
 
+// Post filters (Reborn) — device-wide content filters layered onto Apollo's
+// native Filters & Blocks screen. Independent of Apollo's account-synced filter
+// prefs (filteredSubreddits / blockedUsers) and of the Tag Filters feature above.
+// Per-subreddit rules: dictionary keyed by lowercased subreddit name. Each value
+// is a dictionary with optional keys:
+//   "keywords" -> NSArray<NSString *>  (lowercased; hide posts whose title/link contains any)
+//   "flairs"   -> NSArray<NSString *>  (lowercased; hide posts whose flair label equals any)
+static NSString *const UDKeyPostFilterSubreddits = @"PostFilterSubreddits";
+// Subreddit-name substrings: NSArray<NSString *> (lowercased). Hide any subreddit
+// whose name CONTAINS one of these substrings — both posts in feeds and the
+// subreddit's own search suggestions (e.g. "circlejerk" hides r/carscirclejerk).
+static NSString *const UDKeyPostFilterNameSubstrings = @"PostFilterNameSubstrings";
+
 // Web JSON spike (see ApolloWebJSON.m). Master switch for re-pointing
 // whitelisted listing reads at cookie-authenticated www.reddit.com JSON.
 static NSString *const UDKeyWebJSONEnabled = @"WebJSONEnabled";

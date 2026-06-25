@@ -226,3 +226,9 @@ extern BOOL sTagFilterSpoiler;
 // Lowercased subreddit name -> dictionary with optional keys:
 //   nsfw (NSNumber BOOL), spoiler (NSNumber BOOL), mode (NSString).
 extern NSDictionary<NSString *, NSDictionary *> *sTagFilterSubredditOverrides;
+
+// Post filters (Reborn) feature — see UserDefaultConstants.h.
+// Lowercased subreddit -> @{ @"keywords": NSArray<NSString*>, @"flairs": NSArray<NSString*> }.
+extern NSDictionary<NSString *, NSDictionary *> *sPostFilterSubreddits;
+// Lowercased subreddit-name substrings (hide any subreddit whose name contains one).
+extern NSArray<NSString *> *sPostFilterNameSubstrings;

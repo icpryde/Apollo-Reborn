@@ -19,6 +19,7 @@
 #import "Tweak.h"
 #import "CustomAPIViewController.h"
 #import "UserDefaultConstants.h"
+#import "ApolloPostFilterStore.h"
 #import "Defaults.h"
 #import "ApolloMarkdownToolbarGif.h"
 #import "ApolloWebAuthViewController.h"
@@ -1448,6 +1449,8 @@ static void initializeRandomSources() {
                                     UDKeyTagFilterNSFW: @YES,
                                     UDKeyTagFilterSpoiler: @YES,
                                     UDKeyTagFilterSubredditOverrides: @{},
+                                    UDKeyPostFilterSubreddits: @{},
+                                    UDKeyPostFilterNameSubstrings: @[],
                                     UDKeyWebJSONEnabled: @NO,
                                     UDKeyNotificationBackendURL: @"",
                                     UDKeyNotificationBackendRegistrationToken: @"",
@@ -1635,6 +1638,55 @@ static void initializeRandomSources() {
             }
         }
         sTagFilterSubredditOverrides = [clean copy];
+    }
+
+    // Post filters (Reborn) hydration — defensive isKindOfClass-guarded rebuild
+    // (defaults can carry user-imported / backup-restored junk). Normalize keys and
+    // terms through ApolloPostFilterStore — the SAME single source of truth the
+    // write side uses — so runtime lookups match even for externally-edited plists
+    // (sub keys get the r/ strip; flairs get emoji-strip + whitespace-collapse).
+    // Keep sub keys even when their rule lists are empty (an added but unconfigured
+    // subreddit stays in the list until explicitly removed).
+    {
+        id raw = [[NSUserDefaults standardUserDefaults] objectForKey:UDKeyPostFilterSubreddits];
+        NSMutableDictionary<NSString *, NSDictionary *> *clean = [NSMutableDictionary dictionary];
+        if ([raw isKindOfClass:[NSDictionary class]]) {
+            for (id key in (NSDictionary *)raw) {
+                if (![key isKindOfClass:[NSString class]]) continue;
+                NSString *sub = [ApolloPostFilterStore normalizeSubreddit:(NSString *)key];
+                if (sub.length == 0) continue;
+                id v = ((NSDictionary *)raw)[key];
+                if (![v isKindOfClass:[NSDictionary class]]) continue;
+                NSMutableDictionary *rules = [NSMutableDictionary dictionary];
+                for (NSString *field in @[@"keywords", @"flairs"]) {
+                    id arr = ((NSDictionary *)v)[field];
+                    if (![arr isKindOfClass:[NSArray class]]) continue;
+                    BOOL isFlairs = [field isEqualToString:@"flairs"];
+                    NSMutableArray<NSString *> *terms = [NSMutableArray array];
+                    for (id t in (NSArray *)arr) {
+                        if (![t isKindOfClass:[NSString class]]) continue;
+                        NSString *s = isFlairs ? [ApolloPostFilterStore normalizeFlair:(NSString *)t]
+                                               : [ApolloPostFilterStore normalizeTerm:(NSString *)t];
+                        if (s.length > 0 && ![terms containsObject:s]) [terms addObject:s];
+                    }
+                    if (terms.count > 0) rules[field] = [terms copy];
+                }
+                clean[sub] = [rules copy];
+            }
+        }
+        sPostFilterSubreddits = [clean copy];
+    }
+    {
+        id raw = [[NSUserDefaults standardUserDefaults] objectForKey:UDKeyPostFilterNameSubstrings];
+        NSMutableArray<NSString *> *clean = [NSMutableArray array];
+        if ([raw isKindOfClass:[NSArray class]]) {
+            for (id v in (NSArray *)raw) {
+                if (![v isKindOfClass:[NSString class]]) continue;
+                NSString *s = [ApolloPostFilterStore normalizeTerm:(NSString *)v];
+                if (s.length > 0 && ![clean containsObject:s]) [clean addObject:s];
+            }
+        }
+        sPostFilterNameSubstrings = [clean copy];
     }
 
     // Trim ReadPostIDs if over configured max
