@@ -5,8 +5,9 @@
 #import "UserDefaultConstants.h"
 
 typedef NS_ENUM(NSInteger, ApolloLPSettingsSection) {
-    ApolloLPSettingsSectionModes = 0,  // Body + Comments preview modes
-    ApolloLPSettingsSectionColor,      // Card color picker + quick swatches + reset
+    ApolloLPSettingsSectionPreview = 0, // Live sample cards (full + compact)
+    ApolloLPSettingsSectionModes,       // Body + Comments preview modes
+    ApolloLPSettingsSectionColor,       // Card color picker + quick swatches + reset
     ApolloLPSettingsSectionCount,
 };
 
@@ -26,7 +27,190 @@ static NSArray<NSString *> *ApolloLPQuickSwatchHexes(void) {
              @"007AFF", @"5856D6", @"AF52DE", @"FF2D55"];
 }
 
+#pragma mark - Live Preview Cards
+
+// A small UIKit mock of a rich link preview card (full + compact) that recolors
+// to mirror the real renderer: a solid fill of the chosen color with title /
+// site / description text auto-contrasted to black or white. Lets the user see
+// their color on a fake card while picking, without needing a real link.
+@interface ApolloLPPreviewCardsView : UIView
+- (void)applyCardColorHex:(NSString *)hex;
+@end
+
+@implementation ApolloLPPreviewCardsView {
+    UIView *_fullCard;
+    UIImageView *_fullImage;
+    UILabel *_fullSite;
+    UILabel *_fullTitle;
+    UILabel *_fullDesc;
+    UIView *_compactCard;
+    UIImageView *_compactThumb;
+    UILabel *_compactSite;
+    UILabel *_compactTitle;
+    UILabel *_compactDesc;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        [self buildCards];
+        [self applyCardColorHex:sLinkPreviewCardColorHex];
+    }
+    return self;
+}
+
+- (UILabel *)labelSize:(CGFloat)size weight:(UIFontWeight)weight lines:(NSInteger)lines {
+    UILabel *label = [UILabel new];
+    label.font = [UIFont systemFontOfSize:size weight:weight];
+    label.numberOfLines = lines;
+    label.lineBreakMode = NSLineBreakByTruncatingTail;
+    label.translatesAutoresizingMaskIntoConstraints = NO;
+    return label;
+}
+
+- (UILabel *)caption:(NSString *)text {
+    UILabel *label = [UILabel new];
+    label.font = [UIFont systemFontOfSize:12.0 weight:UIFontWeightSemibold];
+    label.textColor = [UIColor secondaryLabelColor];
+    label.text = [text uppercaseString];
+    label.translatesAutoresizingMaskIntoConstraints = NO;
+    return label;
+}
+
+- (UIImageView *)imagePlaceholder {
+    UIImageView *view = [[UIImageView alloc] init];
+    view.translatesAutoresizingMaskIntoConstraints = NO;
+    view.contentMode = UIViewContentModeCenter;
+    view.clipsToBounds = YES;
+    view.layer.cornerRadius = 8.0;
+    view.backgroundColor = [UIColor systemGray4Color];
+    if (@available(iOS 13.0, *)) {
+        view.image = [UIImage systemImageNamed:@"photo"];
+        view.tintColor = [UIColor systemGray2Color];
+    }
+    return view;
+}
+
+- (UIView *)roundedCard {
+    UIView *card = [UIView new];
+    card.translatesAutoresizingMaskIntoConstraints = NO;
+    card.layer.cornerRadius = 10.0;
+    card.clipsToBounds = YES;
+    return card;
+}
+
+- (void)buildCards {
+    self.translatesAutoresizingMaskIntoConstraints = NO;
+
+    // ---- Full (hero) card: image on top, text below ----
+    _fullCard = [self roundedCard];
+    _fullImage = [self imagePlaceholder];
+    _fullSite = [self labelSize:11.0 weight:UIFontWeightSemibold lines:1];
+    _fullTitle = [self labelSize:15.0 weight:UIFontWeightSemibold lines:2];
+    _fullDesc = [self labelSize:13.0 weight:UIFontWeightRegular lines:1];
+    [_fullCard addSubview:_fullImage];
+    [_fullCard addSubview:_fullSite];
+    [_fullCard addSubview:_fullTitle];
+    [_fullCard addSubview:_fullDesc];
+    [NSLayoutConstraint activateConstraints:@[
+        [_fullImage.topAnchor constraintEqualToAnchor:_fullCard.topAnchor constant:10.0],
+        [_fullImage.leadingAnchor constraintEqualToAnchor:_fullCard.leadingAnchor constant:10.0],
+        [_fullImage.trailingAnchor constraintEqualToAnchor:_fullCard.trailingAnchor constant:-10.0],
+        [_fullImage.heightAnchor constraintEqualToConstant:88.0],
+        [_fullSite.topAnchor constraintEqualToAnchor:_fullImage.bottomAnchor constant:9.0],
+        [_fullSite.leadingAnchor constraintEqualToAnchor:_fullCard.leadingAnchor constant:12.0],
+        [_fullSite.trailingAnchor constraintEqualToAnchor:_fullCard.trailingAnchor constant:-12.0],
+        [_fullTitle.topAnchor constraintEqualToAnchor:_fullSite.bottomAnchor constant:3.0],
+        [_fullTitle.leadingAnchor constraintEqualToAnchor:_fullCard.leadingAnchor constant:12.0],
+        [_fullTitle.trailingAnchor constraintEqualToAnchor:_fullCard.trailingAnchor constant:-12.0],
+        [_fullDesc.topAnchor constraintEqualToAnchor:_fullTitle.bottomAnchor constant:3.0],
+        [_fullDesc.leadingAnchor constraintEqualToAnchor:_fullCard.leadingAnchor constant:12.0],
+        [_fullDesc.trailingAnchor constraintEqualToAnchor:_fullCard.trailingAnchor constant:-12.0],
+        [_fullDesc.bottomAnchor constraintEqualToAnchor:_fullCard.bottomAnchor constant:-11.0],
+    ]];
+
+    // ---- Compact card: thumbnail left, text right ----
+    _compactCard = [self roundedCard];
+    _compactThumb = [self imagePlaceholder];
+    _compactSite = [self labelSize:11.0 weight:UIFontWeightSemibold lines:1];
+    _compactTitle = [self labelSize:15.0 weight:UIFontWeightSemibold lines:1];
+    _compactDesc = [self labelSize:13.0 weight:UIFontWeightRegular lines:2];
+    [_compactCard addSubview:_compactThumb];
+    [_compactCard addSubview:_compactSite];
+    [_compactCard addSubview:_compactTitle];
+    [_compactCard addSubview:_compactDesc];
+    [NSLayoutConstraint activateConstraints:@[
+        [_compactThumb.topAnchor constraintEqualToAnchor:_compactCard.topAnchor constant:10.0],
+        [_compactThumb.leadingAnchor constraintEqualToAnchor:_compactCard.leadingAnchor constant:10.0],
+        [_compactThumb.widthAnchor constraintEqualToConstant:64.0],
+        [_compactThumb.heightAnchor constraintEqualToConstant:64.0],
+        [_compactThumb.bottomAnchor constraintLessThanOrEqualToAnchor:_compactCard.bottomAnchor constant:-10.0],
+        [_compactSite.topAnchor constraintEqualToAnchor:_compactCard.topAnchor constant:11.0],
+        [_compactSite.leadingAnchor constraintEqualToAnchor:_compactThumb.trailingAnchor constant:10.0],
+        [_compactSite.trailingAnchor constraintEqualToAnchor:_compactCard.trailingAnchor constant:-12.0],
+        [_compactTitle.topAnchor constraintEqualToAnchor:_compactSite.bottomAnchor constant:3.0],
+        [_compactTitle.leadingAnchor constraintEqualToAnchor:_compactThumb.trailingAnchor constant:10.0],
+        [_compactTitle.trailingAnchor constraintEqualToAnchor:_compactCard.trailingAnchor constant:-12.0],
+        [_compactDesc.topAnchor constraintEqualToAnchor:_compactTitle.bottomAnchor constant:3.0],
+        [_compactDesc.leadingAnchor constraintEqualToAnchor:_compactThumb.trailingAnchor constant:10.0],
+        [_compactDesc.trailingAnchor constraintEqualToAnchor:_compactCard.trailingAnchor constant:-12.0],
+        [_compactDesc.bottomAnchor constraintLessThanOrEqualToAnchor:_compactCard.bottomAnchor constant:-11.0],
+    ]];
+
+    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[
+        [self caption:@"Full"], _fullCard, [self caption:@"Compact"], _compactCard,
+    ]];
+    stack.axis = UILayoutConstraintAxisVertical;
+    stack.spacing = 6.0;
+    stack.translatesAutoresizingMaskIntoConstraints = NO;
+    [stack setCustomSpacing:14.0 afterView:_fullCard];
+    [self addSubview:stack];
+    [NSLayoutConstraint activateConstraints:@[
+        [stack.topAnchor constraintEqualToAnchor:self.topAnchor],
+        [stack.leadingAnchor constraintEqualToAnchor:self.leadingAnchor],
+        [stack.trailingAnchor constraintEqualToAnchor:self.trailingAnchor],
+        [stack.bottomAnchor constraintEqualToAnchor:self.bottomAnchor],
+    ]];
+
+    _fullSite.text = @"WEBSITE.COM";
+    _fullTitle.text = @"Example link preview title";
+    _fullDesc.text = @"A short description of the linked page.";
+    _compactSite.text = @"WEBSITE.COM";
+    _compactTitle.text = @"Example link preview title";
+    _compactDesc.text = @"A short description of the linked page.";
+}
+
+- (void)applyCardColorHex:(NSString *)hex {
+    UIColor *custom = (hex.length > 0) ? ApolloColorFromHexString(hex) : nil;
+    UIColor *cardColor;
+    UIColor *titleColor;
+    UIColor *secondaryColor;
+    if (custom) {
+        // Mirror the real renderer: solid fill + auto-contrast ink.
+        cardColor = custom;
+        BOOL light = ApolloColorIsLight(custom);
+        titleColor = light ? [UIColor colorWithWhite:0.0 alpha:1.0] : [UIColor colorWithWhite:1.0 alpha:1.0];
+        secondaryColor = [titleColor colorWithAlphaComponent:light ? 0.62 : 0.78];
+    } else {
+        // Default ("no color"): the standard neutral card look.
+        cardColor = [UIColor secondarySystemBackgroundColor];
+        titleColor = [UIColor labelColor];
+        secondaryColor = [UIColor secondaryLabelColor];
+    }
+    _fullCard.backgroundColor = cardColor;
+    _compactCard.backgroundColor = cardColor;
+    _fullSite.textColor = secondaryColor;
+    _fullTitle.textColor = titleColor;
+    _fullDesc.textColor = secondaryColor;
+    _compactSite.textColor = secondaryColor;
+    _compactTitle.textColor = titleColor;
+    _compactDesc.textColor = secondaryColor;
+}
+
+@end
+
 @interface ApolloLinkPreviewSettingsViewController () <UIColorPickerViewControllerDelegate>
+@property (nonatomic, strong) ApolloLPPreviewCardsView *previewView;
 @end
 
 @implementation ApolloLinkPreviewSettingsViewController
@@ -34,6 +218,13 @@ static NSArray<NSString *> *ApolloLPQuickSwatchHexes(void) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"Rich Link Previews";
+    // The preview cell is taller than a stock row and self-sizes from its content.
+    self.tableView.estimatedRowHeight = 60.0;
+    self.tableView.rowHeight = UITableViewAutomaticDimension;
+}
+
+- (void)refreshPreview {
+    [self.previewView applyCardColorHex:sLinkPreviewCardColorHex];
 }
 
 - (void)viewWillAppear:(BOOL)animated {
@@ -96,6 +287,7 @@ static NSArray<NSString *> *ApolloLPQuickSwatchHexes(void) {
 - (void)applyCardColorHex:(NSString *)hex {
     [self storeCardColorHex:hex];
     [self broadcastChangeForArea:@"card-color"];
+    [self refreshPreview];
     [self.tableView reloadData];
 }
 
@@ -158,11 +350,11 @@ static NSArray<NSString *> *ApolloLPQuickSwatchHexes(void) {
 #pragma mark - UIColorPickerViewControllerDelegate
 
 - (void)colorPickerViewControllerDidSelectColor:(UIColorPickerViewController *)viewController {
-    // Fires continuously while dragging — store the value and lightly refresh the
-    // Color section, but defer the heavy feed broadcast to didFinish.
+    // Fires continuously while dragging. Update the live preview (visible above
+    // the picker sheet) immediately; defer the heavier feed broadcast + full
+    // table refresh (Color row swatch + #hex) to didFinish.
     [self storeCardColorHex:ApolloHexStringFromColor(viewController.selectedColor)];
-    [self.tableView reloadSections:[NSIndexSet indexSetWithIndex:ApolloLPSettingsSectionColor]
-                  withRowAnimation:UITableViewRowAnimationNone];
+    [self refreshPreview];
 }
 
 - (void)colorPickerViewControllerDidFinish:(UIColorPickerViewController *)viewController {
@@ -177,6 +369,7 @@ static NSArray<NSString *> *ApolloLPQuickSwatchHexes(void) {
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     switch (section) {
+        case ApolloLPSettingsSectionPreview: return 1;
         case ApolloLPSettingsSectionModes: return 2;
         case ApolloLPSettingsSectionColor: return [self hasCustomColor] ? 3 : 2;
         default: return 0;
@@ -185,6 +378,7 @@ static NSArray<NSString *> *ApolloLPQuickSwatchHexes(void) {
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
     switch (section) {
+        case ApolloLPSettingsSectionPreview: return @"Card Preview";
         case ApolloLPSettingsSectionModes: return @"Previews";
         case ApolloLPSettingsSectionColor: return @"Card Color";
         default: return nil;
@@ -192,6 +386,9 @@ static NSArray<NSString *> *ApolloLPQuickSwatchHexes(void) {
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
+    if (section == ApolloLPSettingsSectionPreview) {
+        return @"Sample full and compact cards — they update live as you change the color below.";
+    }
     if (section == ApolloLPSettingsSectionModes) {
         return @"Off hides the card, Compact shows a small thumbnail row, Full shows a large hero image card.";
     }
@@ -273,7 +470,30 @@ static NSArray<NSString *> *ApolloLPQuickSwatchHexes(void) {
     return cell;
 }
 
+- (UITableViewCell *)previewCell {
+    UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+    cell.selectionStyle = UITableViewCellSelectionStyleNone;
+    if (!self.previewView) {
+        self.previewView = [[ApolloLPPreviewCardsView alloc] initWithFrame:CGRectZero];
+    }
+    // Re-host the persistent preview view so it survives reloadData and can be
+    // updated live (a view has one superview, so detach before re-adding).
+    [self.previewView removeFromSuperview];
+    [cell.contentView addSubview:self.previewView];
+    [NSLayoutConstraint activateConstraints:@[
+        [self.previewView.topAnchor constraintEqualToAnchor:cell.contentView.topAnchor constant:8.0],
+        [self.previewView.leadingAnchor constraintEqualToAnchor:cell.contentView.layoutMarginsGuide.leadingAnchor],
+        [self.previewView.trailingAnchor constraintEqualToAnchor:cell.contentView.layoutMarginsGuide.trailingAnchor],
+        [self.previewView.bottomAnchor constraintEqualToAnchor:cell.contentView.bottomAnchor constant:-10.0],
+    ]];
+    [self.previewView applyCardColorHex:sLinkPreviewCardColorHex];
+    return cell;
+}
+
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (indexPath.section == ApolloLPSettingsSectionPreview) {
+        return [self previewCell];
+    }
     if (indexPath.section == ApolloLPSettingsSectionModes) {
         return [self modeCellForBody:(indexPath.row == 0)];
     }
