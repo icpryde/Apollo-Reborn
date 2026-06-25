@@ -839,26 +839,23 @@ static void ThemeBuilderApplyHighlight(UITableViewCell *cell) {
 // runs, repaint that node to the visible themed selection while pressed; on
 // release the node's %orig restores its normal colour and we leave it.
 static void ThemeBuilderApplyNodeHighlight(id node, BOOL highlighted) {
-    if (!sRemapActive) return;
+    // Press-only: Apollo restores the normal colour on release, so we just
+    // override the pressed shade (the darker colour it uses is invisible on a
+    // dark custom theme).
+    if (!sRemapActive || !highlighted) return;
     UIUserInterfaceStyle style = UITraitCollection.currentTraitCollection.userInterfaceStyle;
     NSString *mode = (style == UIUserInterfaceStyleDark) ? @"dark" : @"light";
     UIColor *sel = ApolloThemeBuilderSelectionColor(mode);
     if (!sel) return;
-    id bgNode = ThemeBuilderObjectIvar(node, "backgroundNode");
-    if ([bgNode respondsToSelector:@selector(setBackgroundColor:)]) {
-        // Profile-style cells (ProfileFeatureCellNode) recolour a child
-        // backgroundNode and DON'T restore it on release, so we drive both
-        // directions ourselves (card colour when not pressed).
-        UIColor *color = highlighted ? sel
-            : ApolloThemeBuilderColorFromHex(ApolloThemeBuilderSavedHex(kApolloThemeRolePrimaryBG, mode));
-        if (color) ((void (*)(id, SEL, UIColor *))objc_msgSend)(bgNode, @selector(setBackgroundColor:), color);
-    } else if (highlighted && [node respondsToSelector:@selector(setBackgroundColor:)]) {
-        // Post-style cells (LargePostCellNode / CompactPostCellNode) recolour the
-        // node's own background to a darker shade on press — invisible on a dark
-        // theme. Override to the visible highlight; the node's own
-        // setHighlighted:NO restores the normal colour, so we only touch press.
-        ((void (*)(id, SEL, UIColor *))objc_msgSend)(node, @selector(setBackgroundColor:), sel);
-    }
+    // Recolour the *visible card* that Apollo darkens on press. For the profile
+    // feature rows that's a child `insideNode` (an inset card); a full-width
+    // `backgroundNode` sits behind it purely to colour the inset side-margins —
+    // recolouring that one made the highlight bleed around/behind the card. For
+    // post cells there's no insideNode, so it's the cell node itself.
+    id target = ThemeBuilderObjectIvar(node, "insideNode");
+    if (![target respondsToSelector:@selector(setBackgroundColor:)]) target = node;
+    if ([target respondsToSelector:@selector(setBackgroundColor:)])
+        ((void (*)(id, SEL, UIColor *))objc_msgSend)(target, @selector(setBackgroundColor:), sel);
 }
 
 static void ThemeBuilderApplyAccentImageView(id cell) {
