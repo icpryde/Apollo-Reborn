@@ -1355,17 +1355,15 @@ static void initializeRandomSources() {
         sLinkPreviewCardColor = ApolloLinkPreviewCardColorNeutral;
         [standardDefaults setInteger:sLinkPreviewCardColor forKey:UDKeyLinkPreviewCardColor];
     }
-    // Free-form hex card color supersedes the legacy preset enum. The hex key is
-    // intentionally NOT in registerDefaults so its absence reliably marks a
-    // first launch on a build with the color picker: migrate a non-Neutral
-    // preset selection into hex once, so the user's chosen hue carries over
-    // (now an accurate full-card fill rather than the old faint tint).
+    // Free-form hex card color. Default is "" — the neutral card — so a bright
+    // full-fill is fully opt-in via the picker. The legacy preset enum is
+    // deliberately NOT promoted into a color: those presets only ever rendered as
+    // a faint 8-14% tint, so turning them into a bold full-card fill on update
+    // would be jarring. Existing pickers re-choose a color if they want one.
     NSString *cardColorHex = [standardDefaults stringForKey:UDKeyLinkPreviewCardColorHex];
     if (![standardDefaults objectForKey:UDKeyLinkPreviewCardColorHex]) {
-        cardColorHex = (sLinkPreviewCardColor != ApolloLinkPreviewCardColorNeutral)
-            ? ApolloHexStringFromColor(ApolloLinkPreviewPresetColor(sLinkPreviewCardColor))
-            : @"";
-        [standardDefaults setObject:(cardColorHex ?: @"") forKey:UDKeyLinkPreviewCardColorHex];
+        cardColorHex = @"";
+        [standardDefaults setObject:@"" forKey:UDKeyLinkPreviewCardColorHex];
     }
     ApolloSetLinkPreviewCardColorHex(cardColorHex);
     ApolloLog(@"[LinkPreviews] settings loaded bodyMode=%ld commentsMode=%ld cardColor=%ld cardColorHex=%@", (long)sLinkPreviewBodyMode, (long)sLinkPreviewCommentsMode, (long)sLinkPreviewCardColor, sLinkPreviewCardColorHex ?: @"(default)");

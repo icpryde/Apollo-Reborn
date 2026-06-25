@@ -2500,14 +2500,12 @@ static void ApolloReplayValetKeychainItems(NSArray<NSDictionary *> *items) {
         [defaults setInteger:sLinkPreviewCardColor forKey:UDKeyLinkPreviewCardColor];
     }
     // Free-form hex card color. A backup made by a build with the color picker
-    // carries the hex key directly; an older backup only has the legacy preset
-    // enum, so migrate it once (matches the launch-time logic in Tweak.xm).
+    // carries the hex key directly; otherwise the card starts neutral (the legacy
+    // preset enum is not promoted to a full-card fill — see Tweak.xm).
     NSString *restoredCardColorHex = [defaults stringForKey:UDKeyLinkPreviewCardColorHex];
     if (![defaults objectForKey:UDKeyLinkPreviewCardColorHex]) {
-        restoredCardColorHex = (sLinkPreviewCardColor != ApolloLinkPreviewCardColorNeutral)
-            ? ApolloHexStringFromColor(ApolloLinkPreviewPresetColor(sLinkPreviewCardColor))
-            : @"";
-        [defaults setObject:(restoredCardColorHex ?: @"") forKey:UDKeyLinkPreviewCardColorHex];
+        restoredCardColorHex = @"";
+        [defaults setObject:@"" forKey:UDKeyLinkPreviewCardColorHex];
     }
     ApolloSetLinkPreviewCardColorHex(restoredCardColorHex);
     sEnableBulkTranslation = [defaults boolForKey:UDKeyEnableBulkTranslation];
