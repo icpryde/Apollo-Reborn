@@ -306,7 +306,43 @@ BOOL ApolloIsJunkNumericTitle(NSString *title) {
     if ([trimmed rangeOfCharacterFromSet:[NSCharacterSet decimalDigitCharacterSet]].location == NSNotFound) {
         return NO;
     }
-    return YES;
+
+    // The title is now letter-free with at least one digit, but that still
+    // covers numbers a user would legitimately want to keep: a year ("2024",
+    // "1917"), a short number ("300"), a date ("9/11"), or a phone-number page
+    // ("1-800-273-8255"). Only substitute when it actually looks like a scraped
+    // internal-ID dump rather than a plausible real title — i.e. either:
+    //   * a single long run of digits (timestamps, opaque IDs), or
+    //   * several whitespace-separated all-numeric tokens (the fifa.com
+    //     match-center "285023 289273 400021448" pattern).
+    NSCharacterSet *digits = [NSCharacterSet decimalDigitCharacterSet];
+
+    NSUInteger longestRun = 0, currentRun = 0, totalDigits = 0;
+    for (NSUInteger i = 0; i < trimmed.length; i++) {
+        if ([digits characterIsMember:[trimmed characterAtIndex:i]]) {
+            currentRun++;
+            totalDigits++;
+            if (currentRun > longestRun) longestRun = currentRun;
+        } else {
+            currentRun = 0;
+        }
+    }
+    // A run this long is not a year/date/short number; it's an ID or timestamp.
+    if (longestRun >= 7) return YES;
+
+    NSUInteger numericTokens = 0;
+    for (NSString *token in [trimmed componentsSeparatedByCharactersInSet:
+                             [NSCharacterSet whitespaceAndNewlineCharacterSet]]) {
+        if (token.length == 0) continue;
+        if ([token rangeOfCharacterFromSet:[digits invertedSet]].location == NSNotFound) {
+            numericTokens++; // token is purely digits
+        }
+    }
+    // Multiple bare numeric tokens (with enough digits to not be, say, "12 34")
+    // is the multi-ID dump shape, not a real headline.
+    if (numericTokens >= 2 && totalDigits >= 6) return YES;
+
+    return NO;
 }
 
 NSString *ApolloWebsiteNameFromHost(NSString *host) {
