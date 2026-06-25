@@ -332,40 +332,59 @@ static UIView *ApolloPFSectionFooterView(NSString *text) {
 
 #pragma mark - Collapsible Blocked Users header
 
-// Tappable header that replaces the native "BLOCKED USERS" header: shows the count
-// and a chevron, and toggles the section open/closed.
+// Tappable header shown ONLY while the section is expanded — styled to mirror the
+// collapsed "Blocked Users (N)" row (same themed rounded bar + chevron) so it's
+// obviously the same control, now pointing down to collapse. Tapping it collapses.
 %new
 - (UIView *)apollo_pfBlockedToggleHeaderForTable:(UITableView *)tableView {
-    BOOL expanded = [objc_getAssociatedObject(self, kApolloPFBlockedExpandedKey) boolValue];
     NSInteger nativeRows = [objc_getAssociatedObject(self, kApolloPFBlockedNativeCountKey) integerValue];
     NSInteger count = MAX((NSInteger)0, nativeRows - 1); // exclude the "Add User" row
+
+    // Sample the themed cell background from a real native cell so the bar matches
+    // Apollo's current theme (synthwave, etc.), falling back to the system colour.
+    UIColor *cellBG = [UIColor secondarySystemGroupedBackgroundColor];
+    @try {
+        UITableViewCell *probe = [self tableView:tableView cellForRowAtIndexPath:[NSIndexPath indexPathForRow:0 inSection:0]];
+        UIColor *c = probe.backgroundColor ?: probe.contentView.backgroundColor;
+        if (c && CGColorGetAlpha(c.CGColor) > 0.01) cellBG = c;
+    } @catch (__unused id e) {}
 
     UIView *container = [[UIView alloc] init];
     container.userInteractionEnabled = YES;
 
+    UIView *bar = [[UIView alloc] init];
+    bar.translatesAutoresizingMaskIntoConstraints = NO;
+    bar.backgroundColor = cellBG;
+    bar.layer.cornerRadius = 10.0;
+    bar.layer.cornerCurve = kCACornerCurveContinuous;
+    [container addSubview:bar];
+
     UILabel *label = [[UILabel alloc] init];
     label.translatesAutoresizingMaskIntoConstraints = NO;
-    label.text = [NSString stringWithFormat:@"BLOCKED USERS (%ld)", (long)count];
-    label.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
-    label.textColor = [UIColor secondaryLabelColor];
-    label.numberOfLines = 1;
-    [container addSubview:label];
+    label.text = [NSString stringWithFormat:@"Blocked Users (%ld)", (long)count];
+    label.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
+    label.textColor = [UIColor labelColor];
+    [bar addSubview:label];
 
-    UIImageView *chevron = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:(expanded ? @"chevron.down" : @"chevron.right")]];
+    UIImageView *chevron = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"chevron.down"]];
     chevron.translatesAutoresizingMaskIntoConstraints = NO;
-    chevron.tintColor = [UIColor secondaryLabelColor];
+    chevron.tintColor = [UIColor tertiaryLabelColor];
     chevron.contentMode = UIViewContentModeScaleAspectFit;
-    [container addSubview:chevron];
+    [bar addSubview:chevron];
 
     [NSLayoutConstraint activateConstraints:@[
-        [label.leadingAnchor constraintEqualToAnchor:container.leadingAnchor constant:20.0],
-        [label.topAnchor constraintEqualToAnchor:container.topAnchor constant:18.0],
-        [label.bottomAnchor constraintEqualToAnchor:container.bottomAnchor constant:-6.0],
+        [bar.leadingAnchor constraintEqualToAnchor:container.leadingAnchor constant:16.0],
+        [bar.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-16.0],
+        [bar.topAnchor constraintEqualToAnchor:container.topAnchor constant:6.0],
+        [bar.bottomAnchor constraintEqualToAnchor:container.bottomAnchor constant:-6.0],
+        [label.leadingAnchor constraintEqualToAnchor:bar.leadingAnchor constant:16.0],
+        [label.topAnchor constraintEqualToAnchor:bar.topAnchor constant:11.0],
+        [label.bottomAnchor constraintEqualToAnchor:bar.bottomAnchor constant:-11.0],
         [chevron.centerYAnchor constraintEqualToAnchor:label.centerYAnchor],
-        [chevron.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-20.0],
+        [chevron.trailingAnchor constraintEqualToAnchor:bar.trailingAnchor constant:-16.0],
         [chevron.leadingAnchor constraintGreaterThanOrEqualToAnchor:label.trailingAnchor constant:8.0],
-        [chevron.widthAnchor constraintEqualToConstant:12.0],
-        [chevron.heightAnchor constraintEqualToConstant:12.0],
+        [chevron.widthAnchor constraintEqualToConstant:13.0],
+        [chevron.heightAnchor constraintEqualToConstant:13.0],
     ]];
 
     // Weakly remember the table so the tap handler can reload just this section.
