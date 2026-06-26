@@ -1616,7 +1616,17 @@ static NSAttributedString *__attribute__((unused)) ApolloDeletedCommentsAttribut
     if (![attributedText isKindOfClass:[NSAttributedString class]] || attributedText.length == 0) return attributedText;
     if (ApolloDeletedCommentsAttributedTextHasVisibleReasonChip(attributedText)) return attributedText;
 
-    NSString *text = ApolloDeletedCommentsNormalizedReasonLabel(ApolloDeletedCommentsTrimmedString(attributedText.string));
+    // A node that trims to empty has no text to classify, so it can never be a
+    // deleted-comment reason label. Bail before normalizing: this hook fires for
+    // EVERY ASTextNode in the app, and NormalizedReasonLabel() defaults an empty
+    // string to "REMOVED BY MOD". Without this guard, unrelated blank placeholder
+    // labels get stamped with the chip — e.g. the subreddit sidebar's VISITORS /
+    // CONTRIBUTIONS stat values, which are momentarily blank while their counts
+    // load and briefly flashed "REMOVED BY MOD" before the real numbers arrived.
+    NSString *trimmedSource = ApolloDeletedCommentsTrimmedString(attributedText.string);
+    if (trimmedSource.length == 0) return attributedText;
+
+    NSString *text = ApolloDeletedCommentsNormalizedReasonLabel(trimmedSource);
     BOOL exactReasonLabel = ApolloDeletedCommentsStringIsReasonLabel(text);
     if (!exactReasonLabel) return attributedText;
 
