@@ -36,6 +36,10 @@ BOOL sSubredditListEnhancements = YES;
 BOOL sEnableFlairColors = NO;
 BOOL sEnableInlineImages = NO;
 BOOL sEnableChatMedia = NO;   // effective default YES via registerDefaults (UDKeyEnableChatMedia)
+BOOL sEnableAISummaries = NO;
+BOOL sEnableAIPostSummaries = YES;
+BOOL sEnableAICommentSummaries = YES;
+BOOL sEnableTapToSummarize = NO;
 NSInteger sInlineImageAlignment = ApolloInlineImageAlignmentCenter;
 NSInteger sAutoplayInlineGIFMode = ApolloAutoplayInlineGIFModeDefault;
 NSInteger sLinkPreviewBodyMode = ApolloLinkPreviewModeOff;
@@ -75,3 +79,6 @@ NSString *sTagFilterMode = @"blur";
 BOOL sTagFilterNSFW = YES;
 BOOL sTagFilterSpoiler = YES;
 NSDictionary<NSString *, NSDictionary *> *sTagFilterSubredditOverrides = nil;
+
+NSDictionary<NSString *, NSDictionary *> *sPostFilterSubreddits = nil;
+NSArray<NSString *> *sPostFilterNameSubstrings = nil;

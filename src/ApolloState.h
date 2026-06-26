@@ -65,6 +65,16 @@ extern BOOL sEnableInlineImages;
 // stock Apollo chat. Independent of sShowUserAvatars. See ApolloChatInlineImages/Composer.xm.
 extern BOOL sEnableChatMedia;
 
+// On-device AI summaries (Apple FoundationModels, iOS 26+). Off by default.
+// When on, a post summary is rendered at the bottom of the post and a comment
+// summary at the top of the comments, generated automatically on open. See
+// ApolloAISummary.xm.
+extern BOOL sEnableAISummaries;
+// Sub-toggles (only consulted while sEnableAISummaries is on). Default YES.
+extern BOOL sEnableAIPostSummaries;     // post / link / both summaries
+extern BOOL sEnableAICommentSummaries;  // the "Discussion so far" summary
+extern BOOL sEnableTapToSummarize;      // generate only on tap (off = automatic)
+
 // Horizontal alignment for inline media containers narrower than the row width
 // (tall portrait images, height-capped images). Has no effect on full-width media.
 typedef NS_ENUM(NSInteger, ApolloInlineImageAlignment) {
@@ -230,3 +240,9 @@ extern BOOL sTagFilterSpoiler;
 // Lowercased subreddit name -> dictionary with optional keys:
 //   nsfw (NSNumber BOOL), spoiler (NSNumber BOOL), mode (NSString).
 extern NSDictionary<NSString *, NSDictionary *> *sTagFilterSubredditOverrides;
+
+// Post filters (Reborn) feature — see UserDefaultConstants.h.
+// Lowercased subreddit -> @{ @"keywords": NSArray<NSString*>, @"flairs": NSArray<NSString*> }.
+extern NSDictionary<NSString *, NSDictionary *> *sPostFilterSubreddits;
+// Lowercased subreddit-name substrings (hide any subreddit whose name contains one).
+extern NSArray<NSString *> *sPostFilterNameSubstrings;

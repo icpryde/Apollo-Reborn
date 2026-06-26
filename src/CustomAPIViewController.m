@@ -2,6 +2,9 @@
 #import "ApolloCommon.h"
 #import "ApolloNotificationBackend.h"
 #import "ApolloWebSessionLoginViewController.h"
+#import "ApolloAISettingsViewController.h"
+#import "ApolloWebSessionStore.h"
+#import "ApolloAccountCredentials.h"
 #import "ApolloState.h"
 #import "ApolloUserProfileCache.h"
 #import "ApolloLinkPreviewCache.h"
@@ -25,6 +28,7 @@ typedef NS_ENUM(NSInteger, SectionIndex) {
     SectionBackupRestore = 0,
     SectionAPIKeys,
     SectionGeneral,
+    SectionApolloAI,
     SectionLinkPreviews,
     SectionMedia,
     SectionSubreddits,
@@ -173,7 +177,7 @@ typedef NS_ENUM(NSInteger, Tag) {
 
 - (NSString *)apollo_redirectURIDetailText {
     if ([self apollo_usesCustomOAuthSignIn]) {
-        return @"Must match the redirect URI registered with your Reddit API app. Any URI scheme is supported.";
+        return @"Must match the redirect URI registered with your Reddit API app. Any URI scheme is supported, including http/https (required for \"Web app\" Reddit API clients).";
     }
 
     NSString *registered = [[self registeredURLSchemes] componentsJoinedByString:@", "];
@@ -480,8 +484,9 @@ typedef NS_ENUM(NSInteger, Tag) {
         [self.tableView reloadRowsAtIndexPaths:@[[NSIndexPath indexPathForRow:kAPIKeyRowWebSessionLogin inSection:SectionAPIKeys]]
                               withRowAnimation:UITableViewRowAnimationNone];
     }
-    // Refresh the Rich Link Previews status subtitle after returning from its subview.
-    [self.tableView reloadSections:[NSIndexSet indexSetWithIndex:SectionLinkPreviews]
+    // Refresh the Apollo AI and Rich Link Previews status subtitles after returning
+    // from their subviews.
+    [self.tableView reloadSections:[NSIndexSet indexSetWithIndexesInRange:NSMakeRange(SectionApolloAI, 2)]
                   withRowAnimation:UITableViewRowAnimationNone];
 }
 
@@ -529,9 +534,10 @@ typedef NS_ENUM(NSInteger, Tag) {
         // row, so the count is its index + 1, minus the Web Session Login row when
         // the mode is off.
         case SectionAPIKeys: return kAPIKeyRowWidgetSetupCode + (sWebJSONEnabled ? 1 : 0);
-        // General base rows + the search-in-place toggle (effectiveRow 11), minus
-        // the "Tap to Show Deleted Comments" row when Show Deleted Comments is off.
+        // General base rows + the search-in-place toggle (effectiveRow 11),
+        // minus the conditional "Tap to Show Deleted Comments" row.
         case SectionGeneral: return sShowDeletedComments ? 12 : 11;
+        case SectionApolloAI: return 1;
         case SectionLinkPreviews: return 1;
         // Media base rows (the three "Rich Link Previews" rows moved out to their
         // own SectionLinkPreviews) plus the chat inline-media toggle, minus the two
@@ -549,6 +555,7 @@ typedef NS_ENUM(NSInteger, Tag) {
         case SectionBackupRestore: return @"Data";
         case SectionAPIKeys: return @"API Keys";
         case SectionGeneral: return @"General";
+        case SectionApolloAI: return @"Apollo AI";
         case SectionLinkPreviews: return @"Rich Link Previews";
         case SectionMedia: return @"Media";
         case SectionSubreddits: return @"Subreddits";
@@ -564,6 +571,7 @@ typedef NS_ENUM(NSInteger, Tag) {
         case SectionBackupRestore: cell = [self backupRestoreCellForRow:indexPath.row tableView:tableView]; break;
         case SectionAPIKeys: cell = [self apiKeyCellForRow:indexPath.row tableView:tableView]; break;
         case SectionGeneral: cell = [self generalCellForRow:indexPath.row tableView:tableView]; break;
+        case SectionApolloAI: cell = [self apolloAICellForTableView:tableView]; break;
         case SectionLinkPreviews: cell = [self linkPreviewsCellForTableView:tableView]; break;
         case SectionMedia: cell = [self mediaCellForRow:indexPath.row tableView:tableView]; break;
         case SectionSubreddits: cell = [self subredditCellForRow:indexPath.row tableView:tableView]; break;
@@ -772,29 +780,36 @@ typedef NS_ENUM(NSInteger, Tag) {
     // rows below it slide up one slot, so map back to the canonical index.
     NSInteger effectiveRow = ApolloAPIKeyCanonicalRow(row);
     switch (effectiveRow) {
+        // The Reddit API Key/Secret/Redirect URI fields below are the DEFAULT
+        // credentials, used by any account that has no per-account override.
+        // Per-account overrides (a different account using a different Reddit
+        // API client) are set from the account switcher's per-account editor
+        // (ApolloAccountSwitcherViewController), not here — see
+        // ApolloAccountCredentials.{h,m} for the resolution precedence.
+        // Stacked (label above, full-width field below) rather than the
+        // inline label-left/field-right layout — "Reddit API Key (Default)"
+        // and "Reddit API Secret (Default)" are long enough to crowd the
+        // field at the inline layout's fixed 0.55 width.
         case 0:
-            cell = [self textFieldCellWithIdentifier:@"Cell_API_Reddit"
-                                               label:@"Reddit API Key"
-                                         placeholder:@"Reddit API Key"
-                                                text:sRedditClientId
-                                                 tag:TagRedditClientId
-                                           numerical:NO];
+            cell = [self stackedTextFieldCellWithIdentifier:@"Cell_API_Reddit"
+                                                       label:@"Reddit API Key"
+                                                 placeholder:@"Reddit API Key"
+                                                        text:sRedditClientId
+                                                         tag:TagRedditClientId];
             break;
         case 1:
-            cell = [self textFieldCellWithIdentifier:@"Cell_API_RedditSecret"
-                                               label:@"Reddit API Secret"
-                                         placeholder:@"(usually empty)"
-                                                text:sRedditClientSecret
-                                                 tag:TagRedditClientSecret
-                                           numerical:NO];
+            cell = [self stackedTextFieldCellWithIdentifier:@"Cell_API_RedditSecret"
+                                                       label:@"Reddit API Secret"
+                                                 placeholder:@"Required for \"Web app\" clients; empty otherwise"
+                                                        text:sRedditClientSecret
+                                                         tag:TagRedditClientSecret];
             break;
         case 2:
-            cell = [self textFieldCellWithIdentifier:@"Cell_API_Imgur"
-                                               label:@"Imgur API Key"
-                                         placeholder:@"Imgur API Key"
-                                                text:sImgurClientId
-                                                 tag:TagImgurClientId
-                                           numerical:NO];
+            cell = [self stackedTextFieldCellWithIdentifier:@"Cell_API_Imgur"
+                                                       label:@"Imgur API Key"
+                                                 placeholder:@"Imgur API Key"
+                                                        text:sImgurClientId
+                                                         tag:TagImgurClientId];
             break;
         case 3:
             cell = [self stackedTextFieldCellWithIdentifier:@"Cell_API_ImageChest"
@@ -824,7 +839,7 @@ typedef NS_ENUM(NSInteger, Tag) {
         case 6:
             return [self switchCellWithIdentifier:@"Cell_API_CustomOAuth"
                                             label:@"Universal OAuth Sign-In"
-                                           detail:@"Signs in with an in-app web view so any Redirect URI works. Turn off for Apollo's native sign-in."
+                                           detail:@"Signs in with an in-app web view so any Redirect URI works, including http/https (\"Web app\" Reddit API clients). Turn off for Apollo's native sign-in."
                                                on:[self apollo_usesCustomOAuthSignIn]
                                            action:@selector(customOAuthSignInSwitchToggled:)];
         case 7:
@@ -855,7 +870,7 @@ typedef NS_ENUM(NSInteger, Tag) {
         case kAPIKeyRowWebJSONSwitch:
             return [self switchCellWithIdentifier:@"Cell_API_WebJSON"
                                             label:@"API-Key-Free Mode (Experimental)"
-                                           detail:@"Use Apollo by signing in to reddit.com instead of using API keys (OAuth). Supports browsing, voting, commenting, and saving."
+                                           detail:@"Master switch: lets accounts sign in to reddit.com instead of using API keys (OAuth). Add or manage individual web-session accounts from the account switcher."
                                                on:sWebJSONEnabled
                                            action:@selector(webJSONSwitchToggled:)];
         case kAPIKeyRowWebSessionLogin: {
@@ -866,24 +881,28 @@ typedef NS_ENUM(NSInteger, Tag) {
                 cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
                 cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
             }
-            cell.textLabel.text = @"Web Session Login (Experimental)";
+            cell.textLabel.text = @"Web Session Accounts (Experimental)";
             BOOL pendingRestart = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyWebJSONPendingRestart];
-            if (pendingRestart && sWebSessionCookieHeader.length > 0) {
+            NSString *pendingUsername = [[NSUserDefaults standardUserDefaults] stringForKey:UDKeyWebJSONPendingRestartUsername];
+            NSUInteger sessionCount = ApolloWebSessionUsernames().count;
+            if (pendingRestart) {
                 // Mid-session login synthesized an account AccountManager hasn't
                 // loaded yet — nudge the user to quit & reopen so it activates.
-                cell.detailTextLabel.text = sWebSessionUsername.length > 0
-                    ? [NSString stringWithFormat:@"Signed in as u/%@ — quit & reopen Apollo to activate", sWebSessionUsername]
+                cell.detailTextLabel.text = pendingUsername.length > 0
+                    ? [NSString stringWithFormat:@"Signed in as u/%@ — quit & reopen Apollo to activate", pendingUsername]
                     : @"Signed in — quit & reopen Apollo to activate";
                 cell.detailTextLabel.textColor = [UIColor systemOrangeColor];
-            } else if (sWebSessionCookieHeader.length > 0) {
+            } else if (sessionCount > 0) {
+                // Sessions are per-account now (the switcher is where you add/
+                // remove/re-auth individual ones) — this row just summarizes how
+                // many are configured and offers a quick way to add another.
                 cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
-                cell.detailTextLabel.text = sWebSessionUsername.length > 0
-                    ? [NSString stringWithFormat:@"Signed in as u/%@%@", sWebSessionUsername,
-                       sWebSessionModhash.length > 0 ? @"" : @" (read-only — no write token)"]
-                    : @"Session active";
+                cell.detailTextLabel.text = sessionCount == 1
+                    ? @"1 account signed in — manage from the account switcher"
+                    : [NSString stringWithFormat:@"%lu accounts signed in — manage from the account switcher", (unsigned long)sessionCount];
             } else {
                 cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
-                cell.detailTextLabel.text = @"Not signed in — tap to harvest a cookie";
+                cell.detailTextLabel.text = @"Not signed in — tap to add a web-session account";
             }
             return cell;
         }
@@ -990,6 +1009,26 @@ typedef NS_ENUM(NSInteger, Tag) {
         }
         default: return [[UITableViewCell alloc] init];
     }
+}
+
+- (UITableViewCell *)apolloAICellForTableView:(UITableView *)tableView {
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_ApolloAI"];
+    if (!cell) {
+        // Match the standard disclosure-row behavior used by API setup and
+        // other navigable settings: UIKit owns the chevron and the full row.
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle
+                                      reuseIdentifier:@"Cell_ApolloAI"];
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+    }
+    cell.textLabel.text = @"Apollo AI Settings";
+    cell.detailTextLabel.text = sEnableAISummaries
+        ? @"On-device AI enabled"
+        : @"On-device summaries and generation settings";
+    cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+    cell.detailTextLabel.numberOfLines = 0;
+    cell.detailTextLabel.lineBreakMode = NSLineBreakByWordWrapping;
+    return cell;
 }
 
 - (UITableViewCell *)mediaCellForRow:(NSInteger)row tableView:(UITableView *)tableView {
@@ -1391,7 +1430,7 @@ typedef NS_ENUM(NSInteger, Tag) {
             attributes:plainAttrs];
         [text appendAttributedString:[[NSAttributedString alloc] initWithString:@"more info"
             attributes:@{NSFontAttributeName: [UIFont systemFontOfSize:13], NSForegroundColorAttributeName: [self apollo_themeAccentColor], NSLinkAttributeName: [NSURL URLWithString:@"https://github.com/Apollo-Reborn/Apollo-Reborn?tab=readme-ov-file#dont-have-an-api-key"]}]];
-        [text appendAttributedString:[[NSAttributedString alloc] initWithString:@")."
+        [text appendAttributedString:[[NSAttributedString alloc] initWithString:@"). The Reddit API Key/Secret/Redirect URI above are the default, used by any signed-in account that doesn't have its own key — set a different key per account from the account switcher."
             attributes:plainAttrs]];
     } else if (section == SectionSubreddits) {
         text = [[NSMutableAttributedString alloc]
@@ -1464,8 +1503,27 @@ typedef NS_ENUM(NSInteger, Tag) {
 
 #pragma mark - UITableViewDelegate
 
+- (void)openApolloAISettings {
+    ApolloLog(@"[ApolloAISettings] opening settings screen navigationController=%@",
+              self.navigationController ? @"yes" : @"no");
+    ApolloAISettingsViewController *vc =
+        [[ApolloAISettingsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+    if (self.navigationController) {
+        [self.navigationController pushViewController:vc animated:YES];
+    } else {
+        UINavigationController *navigation =
+            [[UINavigationController alloc] initWithRootViewController:vc];
+        [self presentViewController:navigation animated:YES completion:nil];
+    }
+}
+
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
+
+    if (indexPath.section == SectionApolloAI) {
+        [self openApolloAISettings];
+        return;
+    }
 
     if (indexPath.section == SectionLinkPreviews) {
         [self openLinkPreviewSettings];
@@ -1490,7 +1548,7 @@ typedef NS_ENUM(NSInteger, Tag) {
         } else if (row == kAPIKeyRowSetupGuide) {
             [self pushInstructionsViewController];
         } else if (row == kAPIKeyRowWebSessionLogin) {
-            if ([[NSUserDefaults standardUserDefaults] boolForKey:UDKeyWebJSONPendingRestart] && sWebSessionCookieHeader.length > 0) {
+            if ([[NSUserDefaults standardUserDefaults] boolForKey:UDKeyWebJSONPendingRestart]) {
                 [self promptQuitToActivateWebSession];
             } else {
                 [self presentWebSessionLoginViewController];
@@ -1595,6 +1653,7 @@ typedef NS_ENUM(NSInteger, Tag) {
         if (row == kAPIKeyRowTroubleshooting || row == kAPIKeyRowSetupGuide ||
             row == kAPIKeyRowWebSessionLogin || row == kAPIKeyRowWidgetSetupCode) return YES;
     }
+    if (indexPath.section == SectionApolloAI) return YES;
     if (indexPath.section == SectionLinkPreviews) return YES;
     if (indexPath.section == SectionMedia) {
         NSInteger row = ApolloMediaLogicalRow(indexPath.row);
@@ -1888,8 +1947,35 @@ typedef NS_ENUM(NSInteger, Tag) {
 }
 
 - (void)webJSONSwitchToggled:(UISwitch *)sender {
+    // Turning this OFF while ANY account has a stored web session leaves that
+    // account with no working transport: no OAuth key is configured (it never
+    // needed one) and cookie auth just got disabled by this flag — every
+    // request for it would hang forever with no visible error. Confirm before
+    // applying so that's a deliberate choice, not a surprise.
+    NSUInteger webSessionCount = ApolloWebSessionUsernames().count;
+    if (sender.isOn == NO && sWebJSONEnabled && webSessionCount > 0) {
+        [sender setOn:YES animated:YES]; // revert the visual toggle pending confirmation
+        NSString *who = webSessionCount == 1 ? @"An account" : [NSString stringWithFormat:@"%lu accounts", (unsigned long)webSessionCount];
+        UIAlertController *alert = [UIAlertController
+            alertControllerWithTitle:@"Turn Off API-Key-Free Mode?"
+                             message:[NSString stringWithFormat:
+                                 @"%@ signed in via a web session, not an API key. Turning this off will make every request for it hang. Remove or re-sign-in that account first, or turn it back on if you change your mind.", who]
+                      preferredStyle:UIAlertControllerStyleAlert];
+        __weak typeof(self) weakSelf = self;
+        [alert addAction:[UIAlertAction actionWithTitle:@"Turn Off Anyway" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+            [sender setOn:NO animated:YES];
+            [weakSelf _applyWebJSONEnabled:NO];
+        }]];
+        [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
+        return;
+    }
+    [self _applyWebJSONEnabled:sender.isOn];
+}
+
+- (void)_applyWebJSONEnabled:(BOOL)enabled {
     BOOL wasOn = sWebJSONEnabled;
-    sWebJSONEnabled = sender.isOn;
+    sWebJSONEnabled = enabled;
     [[NSUserDefaults standardUserDefaults] setBool:sWebJSONEnabled forKey:UDKeyWebJSONEnabled];
     if (sWebJSONEnabled == wasOn) return;
 
@@ -1902,17 +1988,25 @@ typedef NS_ENUM(NSInteger, Tag) {
     }
 }
 
+// Adding ANOTHER web-session account when one already exists must clear the
+// shared WKWebView cookie jar first, or the login page would just silently
+// reuse the already-signed-in web user (see ApolloWebSessionLoginViewController.h).
 - (void)presentWebSessionLoginViewController {
-    ApolloWebSessionLoginViewController *vc = [[ApolloWebSessionLoginViewController alloc] init];
+    BOOL hasExistingWebSession = ApolloWebSessionUsernames().count > 0;
+    ApolloWebSessionLoginViewController *vc = hasExistingWebSession
+        ? [ApolloWebSessionLoginViewController loginControllerForAdditionalAccount]
+        : [ApolloWebSessionLoginViewController new];
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
     [self presentViewController:nav animated:YES completion:nil];
 }
 
 // A mid-session web login synthesized an account that AccountManager only loads at
 // launch. Offer to quit & reopen so it activates; "Re-sign In" falls back to the
-// login flow. The pending flag clears itself on the next launch (Tweak.xm %ctor).
+// login flow. The pending flag (+ username) clears itself on the next launch
+// (Tweak.xm %ctor).
 - (void)promptQuitToActivateWebSession {
-    NSString *who = sWebSessionUsername.length > 0 ? [NSString stringWithFormat:@"u/%@", sWebSessionUsername] : @"your account";
+    NSString *username = [[NSUserDefaults standardUserDefaults] stringForKey:UDKeyWebJSONPendingRestartUsername];
+    NSString *who = username.length > 0 ? [NSString stringWithFormat:@"u/%@", username] : @"your account";
     UIAlertController *alert = [UIAlertController
         alertControllerWithTitle:@"Quit & Reopen to Activate"
                          message:[NSString stringWithFormat:
@@ -1990,6 +2084,8 @@ typedef NS_ENUM(NSInteger, Tag) {
     NSArray<NSIndexPath *> *paths = @[[NSIndexPath indexPathForRow:4 inSection:SectionGeneral]];
     if (sShowDeletedComments) {
         [self.tableView insertRowsAtIndexPaths:paths withRowAnimation:UITableViewRowAnimationFade];
+        [self showAlertWithTitle:@"Show Deleted Comments"
+                          message:@"This feature uses Arctic Shift to recover deleted comments. When Arctic Shift is slow or rate-limited, comments may load more slowly or recovered comments may not appear."];
     } else {
         [self.tableView deleteRowsAtIndexPaths:paths withRowAnimation:UITableViewRowAnimationFade];
     }

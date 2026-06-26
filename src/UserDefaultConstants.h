@@ -8,6 +8,11 @@ static NSString *const UDKeyImgurClientId = @"ImgurApiClientId";
 static NSString *const UDKeyGiphyAPIKey = @"GiphyAPIKey";
 static NSString *const UDKeyImageChestAPIToken = @"ImageChestAPIToken";
 static NSString *const UDKeyRedirectURI = @"RedirectURI";
+// Per-account Reddit OAuth credential overrides (see ApolloAccountCredentials.{h,m}).
+// Flat dictionary: lowercased username -> {clientId, clientSecret, redirectURI}.
+// An account with no entry here falls back to the global client id/secret/redirect
+// URI above.
+static NSString *const UDKeyPerAccountCredentials = @"PerAccountAPICredentials";
 static NSString *const UDKeyUseCustomOAuthSignIn = @"UseCustomOAuthSignIn";
 static NSString *const UDKeyUserAgent = @"UserAgent";
 static NSString *const UDKeyBlockAnnouncements = @"DisableApollonouncements";
@@ -81,6 +86,16 @@ static NSString *const UDKeyLibreTranslateAPIKey = @"LibreTranslateAPIKey";
 // Array<String> of 2-letter language codes to leave untranslated (detected source language).
 static NSString *const UDKeyTranslationSkipLanguages = @"TranslationSkipLanguages";
 
+// On-device AI summaries (Apple FoundationModels, iOS 26+). Off by default.
+static NSString *const UDKeyEnableAISummaries = @"EnableAISummaries";
+// Sub-toggles, only meaningful while EnableAISummaries is on. Both default ON, so
+// turning the master on keeps the original behaviour (post + comment summaries).
+static NSString *const UDKeyEnableAIPostSummaries = @"EnableAIPostSummaries";       // post / link / both
+static NSString *const UDKeyEnableAICommentSummaries = @"EnableAICommentSummaries"; // discussion
+// When on, summaries are generated only when the user taps the card (rather than
+// automatically on open). Off by default. Cached summaries still show instantly.
+static NSString *const UDKeyEnableTapToSummarize = @"EnableTapToSummarize";
+
 // Picture-in-Picture: floating in-app mini-player for comments-page videos.
 static NSString *const UDKeyPictureInPictureEnabled = @"PictureInPictureEnabled";       // master switch
 // 0 = All Videos, 1 = Unmuted Videos Only, 2 = All Videos & GIFs (ApolloPiPActivationMode).
@@ -128,6 +143,19 @@ static NSString *const UDKeyTagFilterSpoiler = @"TagFilterSpoiler";        // gl
 // Missing keys fall back to global settings.
 static NSString *const UDKeyTagFilterSubredditOverrides = @"TagFilterSubredditOverrides";
 
+// Post filters (Reborn) — device-wide content filters layered onto Apollo's
+// native Filters & Blocks screen. Independent of Apollo's account-synced filter
+// prefs (filteredSubreddits / blockedUsers) and of the Tag Filters feature above.
+// Per-subreddit rules: dictionary keyed by lowercased subreddit name. Each value
+// is a dictionary with optional keys:
+//   "keywords" -> NSArray<NSString *>  (lowercased; hide posts whose title/link contains any)
+//   "flairs"   -> NSArray<NSString *>  (lowercased; hide posts whose flair label equals any)
+static NSString *const UDKeyPostFilterSubreddits = @"PostFilterSubreddits";
+// Subreddit-name substrings: NSArray<NSString *> (lowercased). Hide any subreddit
+// whose name CONTAINS one of these substrings — both posts in feeds and the
+// subreddit's own search suggestions (e.g. "circlejerk" hides r/carscirclejerk).
+static NSString *const UDKeyPostFilterNameSubstrings = @"PostFilterNameSubstrings";
+
 // Web JSON spike (see ApolloWebJSON.m). Master switch for re-pointing
 // whitelisted listing reads at cookie-authenticated www.reddit.com JSON.
 static NSString *const UDKeyWebJSONEnabled = @"WebJSONEnabled";
@@ -142,6 +170,12 @@ static NSString *const UDKeyWebSessionCookieHeader = @"WebSessionCookieHeader";
 // "restart to activate" indicator on the Web Session Login settings row, and is
 // cleared in %ctor on the next launch (where the fresh account load resolves it).
 static NSString *const UDKeyWebJSONPendingRestart = @"WebJSONPendingRestart";
+// The username the pending-restart synthesis above was for. Sessions are now
+// per-account (ApolloWebSessionStore), so this is the only way the "quit &
+// reopen to activate" UI knows WHICH account to name — the single global
+// sWebSessionUsername is migration scratch only and isn't touched by a fresh
+// per-account harvest. Set alongside UDKeyWebJSONPendingRestart; cleared with it.
+static NSString *const UDKeyWebJSONPendingRestartUsername = @"WebJSONPendingRestartUsername";
 
 // Self-hosted notification backend (forked apollo-backend). Empty disables —
 // the legacy hosts remain in the blocklist and requests are silently dropped.

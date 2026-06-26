@@ -607,17 +607,16 @@ static void ApolloRequestRedditMediaAssetViaCookie(NSData *mediaData,
         return;
     }
 
-    NSURL *url = [NSURL URLWithString:@"https://www.reddit.com/api/image_upload_s3.json"];
+    // Probe fragment marks the request so the Web JSON chokepoint leaves it alone —
+    // we set Cookie ourselves and re-pointing/counting it would be circular. The
+    // fragment is stripped by NSURLSession before transmission; Reddit never sees it.
+    NSURL *url = ApolloWebJSONProbeURL([NSURL URLWithString:@"https://www.reddit.com/api/image_upload_s3.json"]);
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
     request.HTTPMethod = @"POST";
     [request setValue:cookieHeader forHTTPHeaderField:@"Cookie"];
     if (modhash.length > 0) [request setValue:modhash forHTTPHeaderField:@"X-Modhash"];
     [request setValue:userAgent forHTTPHeaderField:@"User-Agent"];
     [request setValue:@"application/x-www-form-urlencoded" forHTTPHeaderField:@"Content-Type"];
-    // Tag so the Web JSON chokepoint (Tweak.xm) leaves this request untouched — we
-    // set the Cookie header ourselves; re-pointing or counting it would be circular.
-    [request setValue:@"1" forHTTPHeaderField:ApolloWebJSONProbeHeader];
-    // Don't let a session cookie jar override the header we just set.
     request.HTTPShouldHandleCookies = NO;
     NSString *body = [NSString stringWithFormat:@"filepath=%@&mimetype=%@&raw_json=1",
                       ApolloFormURLEncode(filename), ApolloFormURLEncode(mimeType)];

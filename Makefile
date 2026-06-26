@@ -20,6 +20,8 @@ SSZIPARCHIVE_FILES = $(wildcard $(SSZIPARCHIVE_DIR)/*.m) \
     $(wildcard $(SSZIPARCHIVE_DIR)/minizip/compat/*.c)
 
 ApolloReborn_FILES = \
+    $(SRC_DIR)/ApolloFoundationModels.swift \
+    $(SRC_DIR)/ApolloAISummary.xm \
     $(SRC_DIR)/Tweak.xm \
     $(SRC_DIR)/ApolloCommon.m \
     $(SRC_DIR)/ApolloSettingsTableViewController.m \
@@ -100,12 +102,21 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloWebJSON.m \
     $(SRC_DIR)/ApolloWebJSONIdentity.xm \
     $(SRC_DIR)/ApolloWebSessionLoginViewController.m \
+    $(SRC_DIR)/ApolloWebSessionStore.m \
     $(SRC_DIR)/ApolloManualSignInViewController.m \
+    $(SRC_DIR)/ApolloAccountCredentials.m \
+    $(SRC_DIR)/ApolloAccountSwitcherViewController.xm \
+    $(SRC_DIR)/ApolloSignInSplash.xm \
     $(SRC_DIR)/CustomAPIViewController.m \
+    $(SRC_DIR)/ApolloAISettingsViewController.m \
     $(SRC_DIR)/ApolloLinkPreviewSettingsViewController.m \
     $(SRC_DIR)/TranslationSettingsViewController.m \
     $(SRC_DIR)/SavedCategoriesViewController.m \
     $(SRC_DIR)/TagFiltersViewController.m \
+    $(SRC_DIR)/ApolloPostFilterStore.m \
+    $(SRC_DIR)/ApolloPostFilters.xm \
+    $(SRC_DIR)/ApolloFiltersBlocksInject.xm \
+    $(SRC_DIR)/ApolloSubredditFilterDetailViewController.m \
     $(SRC_DIR)/PictureInPictureViewController.m \
     $(SRC_DIR)/Defaults.m \
     $(SRC_DIR)/UIWindow+Apollo.m \
@@ -113,6 +124,17 @@ ApolloReborn_FILES = \
     $(SSZIPARCHIVE_FILES)
 ApolloReborn_FRAMEWORKS = UIKit Security AVFoundation AVKit OSLog NaturalLanguage ImageIO StoreKit Photos PhotosUI SafariServices SystemConfiguration WebKit AuthenticationServices CoreImage SwiftUI UniformTypeIdentifiers
 ApolloReborn_LIBRARIES = z iconv
+# FoundationModels (Apple on-device AI) only ships in the iOS 26+ SDK. Weak-link
+# it so the dylib still loads on older OSes (the Swift bridge guards every call
+# behind #available(iOS 26)), but ONLY when the build SDK actually contains the
+# framework. Older toolchains — e.g. CI's Xcode 16 / iOS 18 SDK, which predates
+# it — would otherwise fail at link with "framework 'FoundationModels' not
+# found". On those SDKs `#if canImport(FoundationModels)` is already false, so
+# the Swift bridge references no FM symbols and the flag isn't needed (the
+# feature simply reports unavailable in that build).
+ifneq ($(wildcard $(SYSROOT)/System/Library/Frameworks/FoundationModels.framework),)
+ApolloReborn_LDFLAGS += -weak_framework FoundationModels
+endif
 # Apple's Translation framework (used by the on-device "apple" translation provider in
 # ApolloAppleTranslation.swift) only exists on iOS 18.0+. Weak-link it so the tweak still
 # loads on older iOS, where the Apple provider is gated off at runtime.
@@ -142,6 +164,11 @@ ifeq ($(APOLLO_SIM_BUILD),1)
 # MobileSubstrate generator does, so force-include it for the MSHookIvar template
 # (a pure ObjC-runtime helper with no CydiaSubstrate link dependency).
 ApolloReborn_CFLAGS += -DAPOLLO_SIM_BUILD=1 -include substrate.h
+# Xcode 27 sim builds raise DEPLOY_MIN to 15.0 (older targets fail libc++'s
+# "no longer supported" check), which turns UIApplication.windows deprecation
+# warnings into -Werror failures. Silence them rather than rewriting working
+# device-targeted call sites just for the sim build.
+ApolloReborn_CFLAGS += -Wno-deprecated-declarations
 else
 ApolloReborn_OBJ_FILES = $(shell find $(FFMPEG_KIT_DIR) -name '*.a')
 
