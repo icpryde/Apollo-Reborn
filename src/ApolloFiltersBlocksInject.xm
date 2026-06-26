@@ -199,10 +199,9 @@ static UIView *ApolloPFSectionFooterView(NSString *text) {
 - (UIView *)tableView:(UITableView *)tableView viewForFooterInSection:(NSInteger)section {
     NSInteger native = [self apollo_pfNativeSectionCount:tableView];
     if (section < native) {
-        // Hide the native Blocked Users footer while collapsed (the lone summary row reads cleaner without it).
-        if (native > 0 && section == native - 1 && ![objc_getAssociatedObject(self, kApolloPFBlockedExpandedKey) boolValue]) {
-            return [[UIView alloc] init];
-        }
+        // Always the native footer — collapsed AND expanded — so it never appears/
+        // disappears during the toggle (which made its text flash to the left edge for
+        // a frame as it re-laid-out). It just slides down as the rows expand.
         return %orig;
     }
     NSString *text = (section == native)
@@ -428,11 +427,32 @@ static UIView *ApolloPFSectionFooterView(NSString *text) {
 
 %new
 - (void)apollo_pfSetBlockedExpanded:(BOOL)expanded table:(UITableView *)tableView {
+    BOOL was = [objc_getAssociatedObject(self, kApolloPFBlockedExpandedKey) boolValue];
     objc_setAssociatedObject(self, kApolloPFBlockedExpandedKey, @(expanded), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     if (![tableView isKindOfClass:[UITableView class]]) return;
     NSInteger native = [self apollo_pfNativeSectionCount:tableView];
     if (native <= 0) return;
-    [tableView reloadSections:[NSIndexSet indexSetWithIndex:native - 1] withRowAnimation:UITableViewRowAnimationAutomatic];
+    NSInteger section = native - 1;
+    NSInteger nativeCount = [objc_getAssociatedObject(self, kApolloPFBlockedNativeCountKey) integerValue];
+    // Animate only Apollo's rows (indices 1..nativeCount) in/out — NOT a full
+    // reloadSections — so the section's header/footer aren't re-laid-out (that re-layout
+    // was flashing the footer text to the left edge for a frame). Row 0 (our toggle)
+    // stays put; we just reload it to flip its chevron.
+    if (was == expanded || nativeCount <= 0) {
+        [tableView reloadSections:[NSIndexSet indexSetWithIndex:section] withRowAnimation:UITableViewRowAnimationAutomatic];
+        return;
+    }
+    NSMutableArray<NSIndexPath *> *rows = [NSMutableArray arrayWithCapacity:nativeCount];
+    for (NSInteger i = 1; i <= nativeCount; i++) [rows addObject:[NSIndexPath indexPathForRow:i inSection:section]];
+    @try {
+        [tableView beginUpdates];
+        if (expanded) [tableView insertRowsAtIndexPaths:rows withRowAnimation:UITableViewRowAnimationFade];
+        else          [tableView deleteRowsAtIndexPaths:rows withRowAnimation:UITableViewRowAnimationFade];
+        [tableView reloadRowsAtIndexPaths:@[[NSIndexPath indexPathForRow:0 inSection:section]] withRowAnimation:UITableViewRowAnimationNone];
+        [tableView endUpdates];
+    } @catch (__unused id e) {
+        [tableView reloadSections:[NSIndexSet indexSetWithIndex:section] withRowAnimation:UITableViewRowAnimationAutomatic];
+    }
 }
 
 // When the user taps the nav-bar Edit button while Blocked Users is collapsed, the lone
