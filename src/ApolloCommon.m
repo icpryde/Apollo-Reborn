@@ -310,6 +310,111 @@ NSString *ApolloGetLinkButtonNodeURLString(id linkButtonNode) {
     return nil;
 }
 
+#pragma mark - Junk link-card titles
+
+BOOL ApolloIsJunkNumericTitle(NSString *title) {
+    if (![title isKindOfClass:[NSString class]]) return NO;
+
+    NSString *trimmed = [title stringByTrimmingCharactersInSet:
+                         [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (trimmed.length == 0) return NO;
+
+    // Must contain no letters anywhere...
+    if ([trimmed rangeOfCharacterFromSet:[NSCharacterSet letterCharacterSet]].location != NSNotFound) {
+        return NO;
+    }
+    // ...but at least one digit (targets numeric-ID titles, while leaving
+    // emoji-only or punctuation-only titles untouched).
+    if ([trimmed rangeOfCharacterFromSet:[NSCharacterSet decimalDigitCharacterSet]].location == NSNotFound) {
+        return NO;
+    }
+
+    // The title is now letter-free with at least one digit, but that still
+    // covers numbers a user would legitimately want to keep: a year ("2024",
+    // "1917"), a short number ("300"), a date ("9/11"), or a phone-number page
+    // ("1-800-273-8255"). Only substitute when it actually looks like a scraped
+    // internal-ID dump rather than a plausible real title — i.e. either:
+    //   * a single long run of digits (timestamps, opaque IDs), or
+    //   * several whitespace-separated all-numeric tokens (the fifa.com
+    //     match-center "285023 289273 400021448" pattern).
+    NSCharacterSet *digits = [NSCharacterSet decimalDigitCharacterSet];
+
+    NSUInteger longestRun = 0, currentRun = 0, totalDigits = 0;
+    for (NSUInteger i = 0; i < trimmed.length; i++) {
+        if ([digits characterIsMember:[trimmed characterAtIndex:i]]) {
+            currentRun++;
+            totalDigits++;
+            if (currentRun > longestRun) longestRun = currentRun;
+        } else {
+            currentRun = 0;
+        }
+    }
+    // A run this long is not a year/date/short number; it's an ID or timestamp.
+    if (longestRun >= 7) return YES;
+
+    NSUInteger numericTokens = 0;
+    for (NSString *token in [trimmed componentsSeparatedByCharactersInSet:
+                             [NSCharacterSet whitespaceAndNewlineCharacterSet]]) {
+        if (token.length == 0) continue;
+        if ([token rangeOfCharacterFromSet:[digits invertedSet]].location == NSNotFound) {
+            numericTokens++; // token is purely digits
+        }
+    }
+    // Multiple bare numeric tokens (with enough digits to not be, say, "12 34")
+    // is the multi-ID dump shape, not a real headline.
+    if (numericTokens >= 2 && totalDigits >= 6) return YES;
+
+    return NO;
+}
+
+NSString *ApolloWebsiteNameFromHost(NSString *host) {
+    if (host.length == 0) return nil;
+
+    host = host.lowercaseString;
+    while ([host hasSuffix:@"."]) host = [host substringToIndex:host.length - 1];
+    if (host.length == 0) return nil;
+
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    for (NSString *p in [host componentsSeparatedByString:@"."]) {
+        if (p.length > 0) [parts addObject:p];
+    }
+    NSUInteger n = parts.count;
+    if (n == 0) return nil;
+
+    NSString *label;
+    if (n == 1) {
+        label = parts[0];
+    } else {
+        static NSSet *ccSLDs = nil; // second-level labels under country-code TLDs
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            ccSLDs = [NSSet setWithArray:@[@"co", @"com", @"org", @"net", @"gov",
+                                           @"edu", @"ac", @"gob", @"go", @"or", @"ne"]];
+        });
+        NSString *last = parts[n - 1];
+        NSString *secondLast = parts[n - 2];
+        if (n >= 3 && last.length == 2 && [ccSLDs containsObject:secondLast]) {
+            label = parts[n - 3];
+        } else {
+            label = parts[n - 2];
+        }
+    }
+    if (label.length == 0) return nil;
+
+    // Needs at least one letter, otherwise we'd just swap digits for digits.
+    if ([label rangeOfCharacterFromSet:[NSCharacterSet letterCharacterSet]].location == NSNotFound) {
+        return nil;
+    }
+
+    // Short labels are almost always acronyms (FIFA, ESPN, BBC, TIME); longer
+    // ones read better title-cased.
+    if (label.length <= 4) {
+        return label.uppercaseString;
+    }
+    NSString *first = [[label substringToIndex:1] uppercaseString];
+    return [first stringByAppendingString:[label substringFromIndex:1]];
+}
+
 UIImage *ApolloEmojiSettingsIcon(NSString *emoji, UIColor *backgroundColor, CGFloat size) {
     if (emoji.length == 0) return nil;
     if (size <= 0.0) size = 29.0;

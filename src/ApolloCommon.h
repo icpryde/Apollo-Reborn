@@ -28,6 +28,18 @@ UIImage *ApolloRebornOptionsSettingsIcon(CGFloat size);
 // inject-deb-local.sh). Returns nil if no layout has the file.
 NSString *ApolloBundledResourcePath(NSString *baseName, NSString *extension);
 
+// Returns YES when a link-card title is a numeric-ID-style junk string —
+// contains at least one digit but no letters at all (e.g. the scraped
+// "285023 289273 400021448" title from a single-page-app page). Used to decide
+// when to substitute a website name for an unhelpful machine-scraped title.
+BOOL ApolloIsJunkNumericTitle(NSString *title);
+
+// Derives a presentable website name from a host ("fifa.com" -> "FIFA",
+// "news.bbc.co.uk" -> "BBC", "theverge.com" -> "Theverge"). Short registrable
+// labels are uppercased as acronyms; longer ones are title-cased. Returns nil
+// when no usable name can be derived (e.g. a raw IP host).
+NSString *ApolloWebsiteNameFromHost(NSString *host);
+
 // Returns the URL string a LinkButtonNode is presenting, by reading either
 // the obj-c .url getter (older iOS) or the urlTextNode's attributed text
 // (iOS 26+ where the Swift URL ivar is no longer ObjC-bridged). May return
