@@ -206,6 +206,11 @@ static NSMutableDictionary<NSString *, NSString *> *sCommentSummaryCache;
 // dropped rather than kept forever. One stamp per thread (refreshed when either
 // of its summaries is regenerated).
 static NSMutableDictionary<NSString *, NSNumber *> *sSummaryTimestamps;
+// "post|fullName" / "comment|fullName" -> @(expanded). Remembers the open/closed
+// state the user left each summary card in, so reopening a thread restores it
+// rather than resetting to collapsed. In-memory (per app session); the cached
+// summary itself persists to disk, the lightweight UI state does not.
+static NSMutableDictionary<NSString *, NSNumber *> *sCardExpanded;
 // Link/article summaries reuse the post box. sLinkSummaryPosts marks which posts
 // are currently showing a LINK summary (vs a self-text post summary) so the title
 // and layout position differ. sArticleTextCache memoises fetched+extracted
@@ -308,6 +313,24 @@ static void ApolloAIStampSummary(NSString *fullName) {
     sSummaryTimestamps[fullName] = @([[NSDate date] timeIntervalSince1970]);
 }
 
+// Remember / recall the open-closed state the user left a card in, so reopening a
+// thread restores it. Keyed per thread and per card type (post vs comment).
+static NSString *ApolloAICardExpandedKey(NSString *fullName, BOOL isPost) {
+    if (fullName.length == 0) return nil;
+    return [NSString stringWithFormat:@"%@|%@", isPost ? @"post" : @"comment", fullName];
+}
+
+static void ApolloAIRememberCardExpanded(NSString *fullName, BOOL isPost, BOOL expanded) {
+    NSString *key = ApolloAICardExpandedKey(fullName, isPost);
+    if (key && sCardExpanded) sCardExpanded[key] = @(expanded);
+}
+
+// @(YES)/@(NO) if the user has a remembered choice for this card, else nil.
+static NSNumber *ApolloAIRememberedCardExpanded(NSString *fullName, BOOL isPost) {
+    NSString *key = ApolloAICardExpandedKey(fullName, isPost);
+    return (key && sCardExpanded) ? sCardExpanded[key] : nil;
+}
+
 // Drop in-memory cache entries whose summary is older than kApolloAICacheMaxAge
 // (or has no timestamp). Operates on the live dictionaries; run once after load.
 static void ApolloAIPruneExpiredSummaries(void) {
@@ -324,6 +347,13 @@ static void ApolloAIPruneExpiredSummaries(void) {
         [sCommentSummarySourceCounts removeObjectForKey:name];
         [sCommentSummarySignatures removeObjectForKey:name];
         [sSummaryTimestamps removeObjectForKey:name];
+        // Drop the per-thread side state for the same thread so these maps don't
+        // accumulate stale entries for summaries that no longer exist:
+        // sArticleTextCache (bare fullName, kilobytes each) and the remembered
+        // card open/closed state (prefixed keys).
+        [sArticleTextCache removeObjectForKey:name];
+        [sCardExpanded removeObjectForKey:[@"post|" stringByAppendingString:name]];
+        [sCardExpanded removeObjectForKey:[@"comment|" stringByAppendingString:name]];
         pruned++;
     }
     if (pruned > 0) {
@@ -417,6 +447,7 @@ static void ApolloAIEnsureState(void) {
         sPostSummaryCache = [NSMutableDictionary dictionary];
         sCommentSummaryCache = [NSMutableDictionary dictionary];
         sSummaryTimestamps = [NSMutableDictionary dictionary];
+        sCardExpanded = [NSMutableDictionary dictionary];
         sLinkSummaryPosts = [NSMutableSet set];
         sBothSummaryPosts = [NSMutableSet set];
         sPostSummaryMode = [NSMutableDictionary dictionary];
@@ -458,6 +489,7 @@ NSUInteger ApolloAIClearSummaryCache(void) {
     [sPostSummaryCache removeAllObjects];
     [sCommentSummaryCache removeAllObjects];
     [sSummaryTimestamps removeAllObjects];
+    [sCardExpanded removeAllObjects];
     [sPostSummaryMode removeAllObjects];
     [sArticleTextCache removeAllObjects];
     [sCommentSummarySourceCounts removeAllObjects];
@@ -1843,31 +1875,44 @@ static void ApolloAISetBoxState(id headerNode, BOOL isPost, ApolloAIBoxState sta
     if (!objc_getAssociatedObject(headerNode, expandedKey)) {
         objc_setAssociatedObject(headerNode, expandedKey, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
-    // "Open summaries automatically": when a box first reaches the ready state,
-    // open it on its own — unless the user has already made an explicit
-    // expand/collapse choice on this header. We set the real expanded flag here
-    // (rather than deriving it lazily) so every existing reader stays correct,
-    // including the ApolloAIAnyHeaderExpanded guard the ready call sites use to
-    // decide whether to remeasure the row: it now sees the box as expanded and
-    // fires the remeasure that visibly opens the card.
+    // Decide whether a (re)appearing READY card should open itself — only on a
+    // fresh header the user hasn't toggled yet, and never during loading (so text
+    // doesn't visibly stream into an already-open card). Precedence:
+    //   1. A remembered open/closed choice for this thread's card (sCardExpanded),
+    //      so a card reopens in exactly the state the user left it in.
+    //   2. Otherwise the auto defaults: "Open Summaries Automatically" (when not in
+    //      tap mode) or the per-header expand-on-ready intent set when the user
+    //      tapped this idle card to generate it. (The two are mutually exclusive in
+    //      settings; the tap-mode guard keeps tap winning regardless.)
+    // We set the real expanded flag here (not lazily) so existing readers — incl.
+    // the ApolloAIAnyHeaderExpanded guard the ready call sites use to remeasure —
+    // stay correct and the row visibly opens.
     const void *choiceKey = isPost ? &kApolloAIPostExpandChoiceKey : &kApolloAICommentExpandChoiceKey;
     const void *expandOnReadyKey = isPost ? &kApolloAIPostExpandOnReadyKey : &kApolloAICommentExpandOnReadyKey;
-    // Open the card on its own only once the summary is fully READY (never during
-    // loading), so the text doesn't visibly stream into an already-open card. Two
-    // triggers: the global "Open summaries automatically" setting, or a per-header
-    // expand-on-ready intent set when the user tapped this idle card to generate it.
-    // "Open automatically" and "Tap to Summarize" are mutually exclusive in
-    // settings; guard here too so tap mode always wins (a tapped card still opens
-    // via the per-header expand-on-ready flag below).
-    BOOL wantAutoOpen = (sEnableAIAutoExpandSummaries && !sEnableTapToSummarize) ||
-        [objc_getAssociatedObject(headerNode, expandOnReadyKey) boolValue];
+    NSString *boxFullName = objc_getAssociatedObject(headerNode, &kApolloAIHeaderFullNameKey);
     BOOL autoExpandedNow = NO;
-    if (state == ApolloAIBoxStateReady && wantAutoOpen &&
+    if (state == ApolloAIBoxStateReady &&
         ![objc_getAssociatedObject(headerNode, choiceKey) boolValue] &&
         ![objc_getAssociatedObject(headerNode, expandedKey) boolValue]) {
-        objc_setAssociatedObject(headerNode, expandedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(headerNode, expandOnReadyKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        autoExpandedNow = YES;
+        NSNumber *remembered = ApolloAIRememberedCardExpanded(boxFullName, isPost);
+        BOOL wantAutoOpen = (sEnableAIAutoExpandSummaries && !sEnableTapToSummarize) ||
+            [objc_getAssociatedObject(headerNode, expandOnReadyKey) boolValue];
+        if (remembered != nil) {
+            // Restore exactly how the user left this card; their choice wins over
+            // the auto defaults, so mark it as an explicit choice on this header.
+            objc_setAssociatedObject(headerNode, choiceKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(headerNode, expandOnReadyKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            if (remembered.boolValue) {
+                objc_setAssociatedObject(headerNode, expandedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                autoExpandedNow = YES;
+            }
+        } else if (wantAutoOpen) {
+            objc_setAssociatedObject(headerNode, expandedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(headerNode, expandOnReadyKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            autoExpandedNow = YES;
+        }
+        // Remember an auto/tap open so it reopens the same way next time.
+        if (autoExpandedNow) ApolloAIRememberCardExpanded(boxFullName, isPost, YES);
     } else if (state == ApolloAIBoxStateError || state == ApolloAIBoxStateEmpty ||
                state == ApolloAIBoxStateNone) {
         // The "open when ready" intent is moot once the box reaches a terminal
@@ -3032,6 +3077,8 @@ static void ApolloAILogTableStructure(UIViewController *vc) {
     objc_setAssociatedObject((id)self, &kApolloAIPostExpandChoiceKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     // A manual expand/collapse supersedes any pending open-on-ready intent.
     objc_setAssociatedObject((id)self, &kApolloAIPostExpandOnReadyKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    // Remember this so the card reopens in the same state next time.
+    ApolloAIRememberCardExpanded(fullName, YES, !expanded);
     ApolloAIRenderSummaryNode((id)self, YES);
     [(ASDisplayNode *)(id)self invalidateCalculatedLayout];
     [(ASDisplayNode *)(id)self setNeedsLayout];
@@ -3061,6 +3108,8 @@ static void ApolloAILogTableStructure(UIViewController *vc) {
     objc_setAssociatedObject((id)self, &kApolloAICommentExpandChoiceKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     // A manual expand/collapse supersedes any pending open-on-ready intent.
     objc_setAssociatedObject((id)self, &kApolloAICommentExpandOnReadyKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    // Remember this so the card reopens in the same state next time.
+    ApolloAIRememberCardExpanded(fullName, NO, !expanded);
     ApolloAIRenderSummaryNode((id)self, NO);
     [(ASDisplayNode *)(id)self invalidateCalculatedLayout];
     [(ASDisplayNode *)(id)self setNeedsLayout];
