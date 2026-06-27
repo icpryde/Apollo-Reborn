@@ -193,6 +193,59 @@ static CGFloat ApolloFeedSearchActiveRestTop(void) {
                                                       : ApolloFeedSearchRestTop();
 }
 
+// The current feed query text, or nil/empty when not searching.
+static NSString *ApolloFeedSearchQueryText(void) {
+    UIView *f = sFeedSearchField;
+    return [f isKindOfClass:[UITextField class]] ? [(UITextField *)f text] : nil;
+}
+
+// MARK: - "Search on top" — surface results above the subreddit chrome
+//
+// Apollo pins the feed so its top (the tableHeaderView: banner + description + Community Highlights) sits
+// just under the docked field, leaving the "Search r/X for query" row + matching posts buried ~400pt down.
+// When there's a query we instead want the feed scrolled so that header is off the top and the first
+// results row sits directly under the field. Returns the desired content-offset.y: rest when empty / no
+// header (e.g. Home), or (headerHeight - insetTop) when there's a query.
+//
+// Scoped to "Keep Search Bar In Place" mode: with the toggle off, the feed keeps its original
+// rest-pinned behavior (results below the chrome), so that mode is unchanged from stock Apollo.
+static CGFloat ApolloFeedSearchDesiredOffsetY(UIScrollView *sv) {
+    CGFloat rest = -ApolloFeedSearchActiveRestTop();
+    if (!sKeepSearchBarInPlace) return rest;          // OFF mode: original, no surfacing
+    if (ApolloFeedSearchQueryText().length == 0) return rest;
+    UIView *hdr = [sv respondsToSelector:@selector(tableHeaderView)] ? [(UITableView *)sv tableHeaderView] : nil;
+    CGFloat H = hdr ? CGRectGetHeight(hdr.frame) : 0.0;
+    if (H <= 1.0) return rest;
+    CGFloat surfaced = H - sv.contentInset.top; // first results row just under the docked field
+    return surfaced > rest ? surfaced : rest;
+}
+
+// When the chrome is surfaced off the top, its tail still sits in the band behind the translucent
+// field/nav and bleeds through the Liquid Glass. Hide the header view while surfaced so the glass blurs
+// the plain feed background instead of the scrolled-up Community Highlights; show it again otherwise.
+// Alpha-only (no layout/offset change). `surfaced` callers MUST pair every hide with a restore — the
+// teardown / disappear paths below force it back to visible so the banner can never get stuck hidden.
+static void ApolloFeedSearchSetHeaderHidden(UIScrollView *sv, BOOL hidden) {
+    UIView *hdr = [sv respondsToSelector:@selector(tableHeaderView)] ? [(UITableView *)sv tableHeaderView] : nil;
+    if (hdr && hdr.alpha != (hidden ? 0.0 : 1.0)) hdr.alpha = hidden ? 0.0 : 1.0;
+}
+
+// Force the captured feed's header back to visible (teardown / leaving — belt-and-suspenders against a
+// header left transparent).
+static void ApolloFeedSearchRestoreHeader(void) {
+    if (sFeedSearchTable) ApolloFeedSearchSetHeaderHidden(sFeedSearchTable, NO);
+}
+
+// YES while the feed is holding the surfaced position (query non-empty, chrome scrolled off, not being
+// dismissed or user-browsed). The single source of truth for "should the header be hidden right now".
+static BOOL ApolloFeedSearchIsSurfaced(UIScrollView *sv) {
+    if (!sv) return NO;
+    CGFloat rest = -ApolloFeedSearchActiveRestTop();
+    return sFeedSearchActive && !sFeedSearchDismissing && !sFeedSearchScrolledByUser &&
+           ApolloFeedSearchQueryText().length > 0 &&
+           (ApolloFeedSearchDesiredOffsetY(sv) > rest + 1.0);
+}
+
 // MARK: - Round "X" cancel button
 //
 // Replaces the "Cancel" text with a neutral-gray xmark in a circle matching the search-field pill. In
@@ -434,6 +487,14 @@ static void recenterCancelButton(void) {
     id field = ApolloObjectIvar(self, "searchTextField");
     if ([field isKindOfClass:[UIView class]]) sFeedSearchField = (UIView *)field;
 
+    // Re-assert the surfaced-header visibility after every relayout (runs regardless of Liquid Glass).
+    // setContentOffset: alone isn't enough on return: a reload there can recreate the header at full
+    // alpha (and Apollo may re-park via setBounds: instead of setContentOffset:), so the scrolled-up
+    // chrome bleeds back through the glass. Recompute it here so it stays hidden while surfaced.
+    if (sFeedSearchTable) {
+        ApolloFeedSearchSetHeaderHidden(sFeedSearchTable, ApolloFeedSearchIsSurfaced(sFeedSearchTable));
+    }
+
     // Liquid Glass only: keep the round-X styled and run its slide-in.
     if (!IsLiquidGlass()) return;
     id cancel = ApolloObjectIvar(self, "dismissSearchBarButton");
@@ -451,6 +512,7 @@ static void recenterCancelButton(void) {
     // and release on a timer guarded by a generation counter against a re-focus.
     if (IsLiquidGlass() && sKeepSearchBarInPlace) {
         sFeedSearchDismissing = YES;                  // pins stay armed via (active || dismissing)
+        ApolloFeedSearchRestoreHeader();              // bring the chrome back as the search closes
         NSUInteger gen = ++sFeedSearchDismissGen;     // a newer dismiss / re-focus invalidates this timer
         %orig;
         animateCancelOut();                           // fade the round-X out
@@ -471,6 +533,7 @@ static void recenterCancelButton(void) {
 
     // OFF (nav-hide): release the capture up front so Apollo's restore passes through, then run a short
     // dismissing window.
+    ApolloFeedSearchRestoreHeader();                 // bring the chrome back as the search closes
     sFeedSearchNavBar = nil;
     sFeedSearchActive = NO;
     sFeedSearchDismissing = YES;
@@ -478,6 +541,49 @@ static void recenterCancelButton(void) {
     animateCancelOut(); // slide the round-X out
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ sFeedSearchDismissing = NO; });
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    %orig;
+    if (!IsLiquidGlass() || MSHookIvar<BOOL>(self, "searchBarShouldStickToKeyboard")) return;
+    id field = ApolloObjectIvar(self, "searchTextField");
+    NSString *txt = [field isKindOfClass:[UITextField class]] ? [(UITextField *)field text] : nil;
+
+    // Issue 2 (in-place): returning to a feed whose search is being restored, Apollo re-runs its search
+    // takeover — it hides the nav bar AND docks the search toolbar to the very top (it assumes the nav is
+    // gone). In-place mode keeps the nav visible with the toolbar pinned just below it, but those pins only
+    // engage once the search is "active", and the takeover fires during the restoring field's
+    // becomeFirstResponder — BEFORE textFieldDidBeginEditing arms them. So without this the nav re-hides
+    // (or the toolbar lands on top of it). Arm the whole in-place pin set here (capture refs + the active
+    // flag) before the appear / re-focus, so the nav stays put and the toolbar docks below it from the
+    // first pass. textFieldDidBeginEditing re-arms idempotently if/when the field actually focuses.
+    if (sKeepSearchBarInPlace && txt.length > 0) {
+        sFeedSearchNavBar = [(UIViewController *)self navigationController].navigationBar;
+        if ([field isKindOfClass:[UIView class]]) sFeedSearchField = (UIView *)field;
+        id upper = ApolloObjectIvar(self, "upperToolbar");
+        if ([upper isKindOfClass:[UIView class]]) sFeedSearchToolbar = (UIView *)upper;
+        sFeedSearchActive = YES;
+        sFeedSearchDismissing = NO;
+        sFeedSearchScrolledByUser = NO;
+    }
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    if (!IsLiquidGlass() || MSHookIvar<BOOL>(self, "searchBarShouldStickToKeyboard")) return;
+    UINavigationBar *nb = [(UIViewController *)self navigationController].navigationBar;
+
+    // Issue 2 safety net: if the nav bar slipped into the hidden state before our block armed, restore
+    // it (in-place mode keeps it visible), and re-assert the toolbar so it sits below the nav instead of
+    // docked on top of it. Only touch the bar/toolbar we captured for this feed.
+    if (sKeepSearchBarInPlace && nb && nb == sFeedSearchNavBar) {
+        if (nb.transform.ty < -1.0) nb.transform = CGAffineTransformIdentity;
+        if (nb.alpha < 1.0) nb.alpha = 1.0;
+        // Route the toolbar back through the setFrame pin (now that the flags are armed) so it re-docks
+        // below the still-visible nav rather than at the top.
+        UIView *tb = sFeedSearchToolbar;
+        if (tb && sFeedSearchActive && !sFeedSearchScrolledByUser) [tb setFrame:tb.frame];
+    }
 }
 
 - (void)viewWillDisappear:(BOOL)animated {
@@ -521,18 +627,81 @@ static void recenterCancelButton(void) {
         UIScrollView *sv = (UIScrollView *)self;
         CGFloat rest = -ApolloFeedSearchActiveRestTop();
         BOOL userScrolling = sv.isDragging || sv.isDecelerating;
+        BOOL hasQuery = (ApolloFeedSearchQueryText().length > 0);
+        CGFloat target = ApolloFeedSearchDesiredOffsetY(sv); // rest (empty) or surfaced (query)
 
-        // Once the user drags, stop clamping; re-arm when they settle back at rest.
+        // Once the user drags, stop pinning so they can browse; re-arm when they settle back at/above
+        // the target (scrolling up toward the chrome snaps back; scrolling down through results is free).
         if (sv.isDragging) sFeedSearchScrolledByUser = YES;
-        else if (offset.y <= rest + 1.0) sFeedSearchScrolledByUser = NO;
+        else if (offset.y <= target + 1.0) sFeedSearchScrolledByUser = NO;
 
         if (sFeedSearchDismissing && !userScrolling) {
-            if (offset.y > rest) offset.y = rest; // teardown: only pull DOWN to rest, don't fight restore
+            if (offset.y > rest) offset.y = rest; // teardown: restore the chrome as the search dismisses
         } else if (sFeedSearchActive && !sFeedSearchDismissing && !userScrolling &&
-                   !sFeedSearchScrolledByUser && offset.y > rest) {
-            offset.y = rest; // kill Apollo's programmatic re-park (focus / keystroke / banner)
+                   !sFeedSearchScrolledByUser) {
+            if (hasQuery && target > rest + 1.0) {
+                offset.y = target;            // surfaced (in-place + query): hold the chrome scrolled off
+            } else if (offset.y > rest) {
+                offset.y = rest;              // otherwise: clamp down to rest only; keep pull-to-refresh
+            }
         }
+
+        // While holding the surfaced position, hide the header so the scrolled-up chrome doesn't bleed
+        // through the translucent field/nav; otherwise (empty query, dismissing, or the user scrolling to
+        // browse) keep it visible.
+        BOOL surfaced = hasQuery && sFeedSearchActive && !sFeedSearchDismissing &&
+                        !sFeedSearchScrolledByUser && (target > rest + 1.0);
+        ApolloFeedSearchSetHeaderHidden(sv, surfaced);
+
         %orig(offset);
+        return;
+    }
+    %orig;
+}
+
+// A scroll view's bounds.origin IS its contentOffset; Texture/Apollo re-park the feed via setBounds:
+// too, which setContentOffset: alone doesn't catch. Mirror the same pin here so the surfaced position
+// actually holds (otherwise a setBounds: re-park to rest renders before our next setContentOffset:).
+- (void)setBounds:(CGRect)bounds {
+    if ((UIScrollView *)self == sFeedSearchTable) {
+        UIScrollView *sv = (UIScrollView *)self;
+        // Only while surfacing (in-place + query); OFF mode never enters here, so its bounds pass through.
+        if (!sv.isDragging && !sv.isDecelerating && ApolloFeedSearchIsSurfaced(sv)) {
+            CGFloat want = ApolloFeedSearchDesiredOffsetY(sv);
+            if (fabs(bounds.origin.y - want) > 0.5) bounds.origin.y = want;
+            // Hide the header here too: the surface often lands via setBounds: (not setContentOffset:),
+            // and viewDidLayoutSubviews may not run again until the next keystroke — so without this the
+            // chrome bleeds through the glass until the 2nd letter. Pair with the surface, atomically.
+            ApolloFeedSearchSetHeaderHidden(sv, YES);
+        }
+    }
+    %orig(bounds);
+}
+
+// The header gets re-installed on reloads; hide the freshly-installed one immediately if we're surfaced.
+- (void)setTableHeaderView:(UIView *)header {
+    %orig;
+    if ((UIScrollView *)self == sFeedSearchTable && header && ApolloFeedSearchIsSurfaced((UIScrollView *)self)) {
+        header.alpha = 0.0;
+    }
+}
+
+%end
+
+// The subreddit header wrapper force-restores its own alpha to 1 in -layoutSubviews (anti-flash). While
+// the feed search is surfaced, that re-shows the scrolled-up chrome behind the glass every layout pass
+// (and wins the final frame on the first keystroke). Intercept its setAlpha: and hold it at 0 while
+// surfaced, for the captured feed's header only; otherwise pass through so it shows normally.
+@interface ApolloSubredditHeaderWrapperView : UIView
+@end
+
+%hook ApolloSubredditHeaderWrapperView
+
+- (void)setAlpha:(CGFloat)alpha {
+    if (alpha > 0.0 && sFeedSearchTable &&
+        (UIView *)self == [(UITableView *)sFeedSearchTable tableHeaderView] &&
+        ApolloFeedSearchIsSurfaced(sFeedSearchTable)) {
+        %orig(0.0);
         return;
     }
     %orig;
