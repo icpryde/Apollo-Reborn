@@ -534,9 +534,10 @@ typedef NS_ENUM(NSInteger, Tag) {
         // row, so the count is its index + 1, minus the Web Session Login row when
         // the mode is off.
         case SectionAPIKeys: return kAPIKeyRowWidgetSetupCode + (sWebJSONEnabled ? 1 : 0);
-        // General base rows + the search-in-place toggle (effectiveRow 11),
-        // minus the conditional "Tap to Show Deleted Comments" row.
-        case SectionGeneral: return sShowDeletedComments ? 12 : 11;
+        // General base rows + the search-in-place (effectiveRow 11) and
+        // follow-live-comments (effectiveRow 12) toggles, minus the conditional
+        // "Tap to Show Deleted Comments" row.
+        case SectionGeneral: return sShowDeletedComments ? 13 : 12;
         case SectionApolloAI: return 1;
         case SectionLinkPreviews: return 1;
         // Media base rows (the three "Rich Link Previews" rows moved out to their
@@ -1007,6 +1008,12 @@ typedef NS_ENUM(NSInteger, Tag) {
             cell.detailTextLabel.enabled = lgSupported;
             return cell;
         }
+        case 12:
+            return [self switchCellWithIdentifier:@"Cell_Gen_LiveCommentsFollow"
+                                            label:@"Follow New Live Comments"
+                                           detail:@"During Live Update comment sort, keep the newest at the top and show a jump button when you've scrolled down."
+                                               on:[defaults boolForKey:UDKeyLiveCommentsFollow]
+                                           action:@selector(liveCommentsFollowSwitchToggled:)];
         default: return [[UITableViewCell alloc] init];
     }
 }
@@ -2157,6 +2164,11 @@ typedef NS_ENUM(NSInteger, Tag) {
 - (void)keepSearchBarInPlaceSwitchToggled:(UISwitch *)sender {
     sKeepSearchBarInPlace = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:sKeepSearchBarInPlace forKey:UDKeyKeepSearchBarInPlace];
+}
+
+- (void)liveCommentsFollowSwitchToggled:(UISwitch *)sender {
+    sLiveCommentsFollow = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sLiveCommentsFollow forKey:UDKeyLiveCommentsFollow];
 }
 
 - (void)userAvatarsSwitchToggled:(UISwitch *)sender {
