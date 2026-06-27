@@ -1540,6 +1540,14 @@ static void initializeRandomSources() {
     sEnableAICommentSummaries = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyEnableAICommentSummaries];
     sEnableTapToSummarize = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyEnableTapToSummarize];
     sEnableAIAutoExpandSummaries = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyEnableAIAutoExpandSummaries];
+    // "Tap to Summarize" and "Open Summaries Automatically" are mutually exclusive in
+    // settings, but an interim build let both be enabled independently. Reconcile a
+    // leftover both-on state once at launch (tap wins, matching the runtime gate),
+    // so the settings rows can't end up both greyed and unrecoverable.
+    if (sEnableTapToSummarize && sEnableAIAutoExpandSummaries) {
+        sEnableAIAutoExpandSummaries = NO;
+        [[NSUserDefaults standardUserDefaults] setBool:NO forKey:UDKeyEnableAIAutoExpandSummaries];
+    }
     sInlineImageAlignment = [[NSUserDefaults standardUserDefaults] integerForKey:UDKeyInlineImageAlignment];
     if (sInlineImageAlignment < ApolloInlineImageAlignmentCenter || sInlineImageAlignment > ApolloInlineImageAlignmentRight) {
         sInlineImageAlignment = ApolloInlineImageAlignmentCenter;

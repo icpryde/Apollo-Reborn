@@ -108,7 +108,7 @@ typedef NS_ENUM(NSInteger, ApolloAISettingsSection) {
         return @"Summaries are generated entirely on-device using Apple Intelligence — no post or comment text is sent to an external AI service. Summarizing a linked article does fetch that page from its source website, which happens automatically when you open a thread unless Tap to Summarize is on.";
     }
     if (section == ApolloAISettingsSectionSummaries) {
-        return @"Tap to Summarize generates only the card you request. Leave it off to generate enabled summaries automatically when opening a thread. Open Summaries Automatically expands a card on its own once its summary is ready, instead of waiting for you to tap it open (cards you tap to generate always open once ready).";
+        return @"Tap to Summarize generates only the card you tap, and opens it once it's ready. Open Summaries Automatically instead generates enabled summaries when you open a thread and expands them on their own. These two are alternatives, so turning one on turns the other off.";
     }
     if (section == ApolloAISettingsSectionAvailability) {
         return @"Availability is diagnostic. On some iOS versions, sideloaded apps may report Apple Intelligence as disabled even when generation still works.";
@@ -143,14 +143,17 @@ typedef NS_ENUM(NSInteger, ApolloAISettingsSection) {
                                          enabled:enabled
                                           action:@selector(commentSummariesSwitchChanged:)];
             case 2:
+                // Mutually exclusive with Open Summaries Automatically: one is
+                // "tap to generate (and open)", the other is "auto-generate and
+                // auto-open" — they're alternatives, so each greys the other out.
                 return [self switchCellWithLabel:@"Tap to Summarize"
                                               on:[defaults boolForKey:UDKeyEnableTapToSummarize]
-                                         enabled:enabled
+                                         enabled:(enabled && !sEnableAIAutoExpandSummaries)
                                           action:@selector(tapToSummarizeSwitchChanged:)];
             case 3:
                 return [self switchCellWithLabel:@"Open Summaries Automatically"
                                               on:[defaults boolForKey:UDKeyEnableAIAutoExpandSummaries]
-                                         enabled:enabled
+                                         enabled:(enabled && !sEnableTapToSummarize)
                                           action:@selector(autoExpandSwitchChanged:)];
             default:
                 break;
@@ -242,11 +245,24 @@ typedef NS_ENUM(NSInteger, ApolloAISettingsSection) {
 - (void)tapToSummarizeSwitchChanged:(UISwitch *)sender {
     sEnableTapToSummarize = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:sEnableTapToSummarize forKey:UDKeyEnableTapToSummarize];
+    // Mutually exclusive with Open Summaries Automatically — turning this on turns
+    // that off, then reload so the other row greys/ungreys to match.
+    if (sEnableTapToSummarize && sEnableAIAutoExpandSummaries) {
+        sEnableAIAutoExpandSummaries = NO;
+        [[NSUserDefaults standardUserDefaults] setBool:NO forKey:UDKeyEnableAIAutoExpandSummaries];
+    }
+    [self reloadSummaryControls];
 }
 
 - (void)autoExpandSwitchChanged:(UISwitch *)sender {
     sEnableAIAutoExpandSummaries = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:sEnableAIAutoExpandSummaries forKey:UDKeyEnableAIAutoExpandSummaries];
+    // Mutually exclusive with Tap to Summarize (see above).
+    if (sEnableAIAutoExpandSummaries && sEnableTapToSummarize) {
+        sEnableTapToSummarize = NO;
+        [[NSUserDefaults standardUserDefaults] setBool:NO forKey:UDKeyEnableTapToSummarize];
+    }
+    [self reloadSummaryControls];
 }
 
 @end

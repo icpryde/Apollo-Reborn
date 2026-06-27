@@ -1660,15 +1660,22 @@ static NSAttributedString *ApolloAISummaryAttributedText(NSString *title,
                                                                        attributes:chevronAttributes]];
     }
 
-    // Trailing disclosure chevron.
-    NSAttributedString *chevronAttachment =
-        ApolloAISymbolAttachment(expanded ? @"chevron.down" : @"chevron.right", chevronFont, secondary);
-    [result appendAttributedString:[[NSAttributedString alloc] initWithString:@"  " attributes:chevronAttributes]];
-    if (chevronAttachment) {
-        [result appendAttributedString:chevronAttachment];
-    } else {
-        [result appendAttributedString:[[NSAttributedString alloc] initWithString:expanded ? @"▾" : @"▸"
-                                                                       attributes:chevronAttributes]];
+    // Trailing disclosure chevron — only when there's something to expand or
+    // collapse: an expanded card, or a collapsed ready/error card. Collapsed
+    // idle/loading cards rely on their "· Tap to summarize" / "· Summarizing…"
+    // subtitle instead, which keeps the longest title (e.g. "Post & link summary")
+    // on one line rather than wrapping the chevron onto a second row.
+    BOOL showChevron = expanded || state == ApolloAIBoxStateReady || state == ApolloAIBoxStateError;
+    if (showChevron) {
+        NSAttributedString *chevronAttachment =
+            ApolloAISymbolAttachment(expanded ? @"chevron.down" : @"chevron.right", chevronFont, secondary);
+        [result appendAttributedString:[[NSAttributedString alloc] initWithString:@"  " attributes:chevronAttributes]];
+        if (chevronAttachment) {
+            [result appendAttributedString:chevronAttachment];
+        } else {
+            [result appendAttributedString:[[NSAttributedString alloc] initWithString:expanded ? @"▾" : @"▸"
+                                                                           attributes:chevronAttributes]];
+        }
     }
 
     if (!expanded) return result;
@@ -1785,6 +1792,13 @@ static void ApolloAIRenderSummaryNode(id headerNode, BOOL isPost) {
     }
     textNode.attributedText = ApolloAISummaryAttributedText(
         title, state, body, expanded, isPost, sourceCount, ApolloAISummaryThemeAccent(headerNode));
+    // Clamp the chevron-less collapsed states (idle / loading / empty) to a single
+    // line so a long title + "· Tap to summarize" subtitle can't wrap. Ready/Error
+    // collapsed cards KEEP their trailing chevron, so leave them unclamped — at large
+    // Dynamic Type they may wrap rather than tail-truncate (and clip) the chevron.
+    // Expanded cards need the full body, so they're unclamped too.
+    BOOL clampToOneLine = !expanded && state != ApolloAIBoxStateReady && state != ApolloAIBoxStateError;
+    textNode.maximumNumberOfLines = clampToOneLine ? 1 : 0;
 
     // VoiceOver: read the title + current body (summary / status / error) and
     // announce the collapsed/expanded state. Setting the label on the view
@@ -1842,7 +1856,10 @@ static void ApolloAISetBoxState(id headerNode, BOOL isPost, ApolloAIBoxState sta
     // loading), so the text doesn't visibly stream into an already-open card. Two
     // triggers: the global "Open summaries automatically" setting, or a per-header
     // expand-on-ready intent set when the user tapped this idle card to generate it.
-    BOOL wantAutoOpen = sEnableAIAutoExpandSummaries ||
+    // "Open automatically" and "Tap to Summarize" are mutually exclusive in
+    // settings; guard here too so tap mode always wins (a tapped card still opens
+    // via the per-header expand-on-ready flag below).
+    BOOL wantAutoOpen = (sEnableAIAutoExpandSummaries && !sEnableTapToSummarize) ||
         [objc_getAssociatedObject(headerNode, expandOnReadyKey) boolValue];
     BOOL autoExpandedNow = NO;
     if (state == ApolloAIBoxStateReady && wantAutoOpen &&
