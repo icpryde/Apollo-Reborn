@@ -22,7 +22,12 @@ static CGFloat const ApolloProfileHeaderHeight = 206.0;
 static CGFloat const ApolloProfileAvatarDiameter = 96.0;
 static CGFloat const ApolloProfileSnoovatarWidth = 156.0;
 static CGFloat const ApolloProfileSnoovatarHeight = 178.0;
-static NSUInteger const ApolloInlineAvatarMaxActiveInfoRequests = 6;
+// Governs how many about.json info fetches are in flight at once. Kept a touch above
+// the info session's per-host socket cap (8) so NSURLSession — not this app-level
+// gate — manages the queue, while still bounding wasted fetches when fast-scrolling a
+// huge thread. (Was 6, which exactly duplicated the old socket cap and only added
+// queueing latency.)
+static NSUInteger const ApolloInlineAvatarMaxActiveInfoRequests = 10;
 static NSUInteger const ApolloInlineAvatarMaxBindAttempts = 4;
 static NSUInteger const ApolloInlineAvatarLogLimit = 16;
 
@@ -2113,11 +2118,86 @@ static void ApolloProfileOpenRedditProfileEditor(void) {
 
 %end
 
+// ---- Batch prefetch (#4/#5): collect comment authors' t2_ fullnames from their cells
+// (as they enter Texture's preload range, ahead of display) and coalesce them into ONE
+// user_data_by_account_ids request — so a thread's avatars are cached in a few batched
+// requests, ahead of scroll, instead of one about.json per author as each cell appears.
+// (Reading the Swift CommentTree / IGListKit objects array directly is not ObjC-safe, so
+// the per-cell `comment` ivar — the same one the avatar binding already reads — is used.)
+static NSMutableSet<NSString *> *sApolloPendingBatchFullNames = nil;
+static BOOL sApolloBatchFireScheduled = NO;
+
+static NSString *ApolloCommentAuthorFullName(id comment) {
+    if (!comment || ![comment respondsToSelector:@selector(authorFullName)]) return nil;
+    @try {
+        NSString *(*msgSend)(id, SEL) = (NSString *(*)(id, SEL))objc_msgSend;
+        NSString *fullName = msgSend(comment, @selector(authorFullName));
+        return [fullName isKindOfClass:[NSString class]] ? fullName : nil;
+    } @catch (__unused NSException *exception) {
+        return nil;
+    }
+}
+
+// Fire whatever fullnames have accumulated as one batched request. Main-thread only.
+static void ApolloInlineAvatarFireBatchNow(void) {
+    sApolloBatchFireScheduled = NO;
+    if (sApolloPendingBatchFullNames.count == 0) return;
+    NSArray<NSString *> *batch = [sApolloPendingBatchFullNames allObjects];
+    [sApolloPendingBatchFullNames removeAllObjects];
+    [[ApolloUserProfileCache sharedCache] batchPrefetchProfilesForFullNames:batch];
+}
+
+// Coalesce authors into batches. A thread open (or fast scroll) floods cells into the
+// preload range at once → fire promptly once a burst accumulates; a slow trickle of
+// cells is gathered over a short window so it still collapses into one request rather
+// than many 1-id calls. Main-thread only, so the statics need no locking.
+static void ApolloInlineAvatarEnqueueFullNameForBatch(NSString *fullName) {
+    if (!sShowUserAvatars) return;
+    if (![fullName isKindOfClass:[NSString class]] || ![fullName hasPrefix:@"t2_"]) return;
+    if (!sApolloPendingBatchFullNames) sApolloPendingBatchFullNames = [NSMutableSet set];
+    [sApolloPendingBatchFullNames addObject:fullName];
+    if (sApolloPendingBatchFullNames.count >= 25) {
+        ApolloInlineAvatarFireBatchNow();
+        return;
+    }
+    if (sApolloBatchFireScheduled) return;
+    sApolloBatchFireScheduled = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        ApolloInlineAvatarFireBatchNow();
+    });
+}
+
+// Read the comment cell's own RDKComment (the same safe ivar path the avatar binding
+// uses) to get the author's t2_ fullname, and enqueue it for the batch — unless we
+// already have that user's avatar cached (memory is hydrated from disk at launch, so
+// this is a cheap check that stops return visits from re-batching known users).
+static void ApolloInlineAvatarBatchEnqueueFromCommentCell(id cell) {
+    if (!cell) return;
+    id comment = ApolloObjectIvarValue(cell, @"comment");
+    if (!comment) return;
+    NSString *fullName = ApolloCommentAuthorFullName(comment);
+    if (fullName.length == 0) return;
+    NSString *username = ApolloUsernameFromModelObject(comment);
+    if (username.length > 0 && [[ApolloUserProfileCache sharedCache] cachedInfoForUsername:username].iconURL) return;
+    ApolloInlineAvatarEnqueueFullNameForBatch(fullName);
+}
+
 %hook _TtC6Apollo15CommentCellNode
+
+// didEnterPreloadState fires while a cell is still in Texture's preload range (AHEAD of
+// display), so enqueuing the author here lets the coalesced batch cache their avatar
+// before the cell actually appears — turning ~N per-author about.json calls into a
+// handful of batched requests, and making the avatar already-present on scroll.
+- (void)didEnterPreloadState {
+    %orig;
+    if (!sShowUserAvatars) return;
+    ApolloInlineAvatarBatchEnqueueFromCommentCell(self);
+}
 
 - (void)didLoad {
     %orig;
     if (!sShowUserAvatars) return;
+    ApolloInlineAvatarBatchEnqueueFromCommentCell(self);
     ApolloApplyAvatarToCellWithDiameter(self, ApolloUsernameFromCell(self, @"comment"), ApolloCommentInlineAvatarDiameter);
 }
 
