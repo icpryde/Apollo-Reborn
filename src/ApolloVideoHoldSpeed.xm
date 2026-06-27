@@ -64,6 +64,11 @@ static const NSTimeInterval kHoldActivationDelay = 0.18;
 // scrub / swipe-to-dismiss instead of a speed-up.
 static const CGFloat kHoldMoveTolerance = 12.0;
 
+// Haptic tap fired the instant 2× engages, mirroring the press-and-hold speed
+// cue in YouTube/Instagram — a clear-but-gentle "it's on" tick. Medium impact;
+// the Taptic Engine is pre-warmed on touch-down so the tap lands with no lag.
+static const UIImpactFeedbackStyle kHoldHapticStyle = UIImpactFeedbackStyleMedium;
+
 #pragma mark - Player access (mirrors ApolloVideoPlaybackSpeed.xm)
 
 static AVPlayer *PlayerFromLayer(CALayer *layer) {
@@ -264,6 +269,8 @@ static void CollectContextMenuInteractions(UIView *view,
 @property (nonatomic, assign) BOOL inZone;     // current touch began in the right third
 @property (nonatomic, assign) BOOL active;     // 2× currently engaged
 @property (nonatomic, assign) float preHoldRate;
+// Fires a single confirmation tap when 2× engages. Pre-warmed on touch-down.
+@property (nonatomic, strong) UIImpactFeedbackGenerator *hapticGenerator;
 // The exact AVPlayer we sped up, held strongly so we restore *that* instance on
 // release — not one re-resolved from the (possibly torn-down) media viewer. For
 // shared v.redd.it players, re-resolving could miss the restore and leave the
@@ -351,7 +358,15 @@ static void CollectContextMenuInteractions(UIView *view,
     // Remove the context-menu interaction the instant a right-zone touch lands, so
     // the menu can never appear for this press. Left/center is left alone → normal
     // menu. Restored on release.
-    if (self.inZone) [self suppressMenu];
+    if (self.inZone) {
+        [self suppressMenu];
+        // Warm up the Taptic Engine now (the press is still ~0.18s from engaging)
+        // so the confirmation tap fires with no perceptible latency.
+        if (!self.hapticGenerator) {
+            self.hapticGenerator = [[UIImpactFeedbackGenerator alloc] initWithStyle:kHoldHapticStyle];
+        }
+        [self.hapticGenerator prepare];
+    }
 }
 
 - (void)holdElapsedAt:(CGPoint)windowPoint {
@@ -364,6 +379,15 @@ static void CollectContextMenuInteractions(UIView *view,
     self.active = YES;
     [player setRate:kHoldSpeed];
     [self showOverlay];
+
+    // A single confirmation tap the moment 2× kicks in — the tactile equivalent
+    // of the "2× ⏵⏵" overlay, like YouTube/Instagram. No-op on devices without a
+    // Taptic Engine. (Created/prepared on touch-down; create defensively in case.)
+    if (!self.hapticGenerator) {
+        self.hapticGenerator = [[UIImpactFeedbackGenerator alloc] initWithStyle:kHoldHapticStyle];
+    }
+    [self.hapticGenerator impactOccurred];
+
     ApolloLog(@"VideoHoldSpeed: engaged 2x (prevRate=%.2f)", self.preHoldRate);
 }
 
