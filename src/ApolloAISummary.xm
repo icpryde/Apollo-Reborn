@@ -162,7 +162,9 @@ static const NSTimeInterval kApolloAIGenerationTimeout = 90.0;
 #else
 static const NSTimeInterval kApolloAIGenerationTimeout = 30.0;
 #endif
-static NSString *const kApolloAICacheVersion = @"2";
+// Bumped to 3 for the cache-entry timestamp format (age-based expiry). Older
+// caches lack timestamps and are simply dropped on first launch (regenerable).
+static NSString *const kApolloAICacheVersion = @"3";
 
 static NSString *const kApolloAIPostInstructions =
     @"Summarize this Reddit post in 2 short plain sentences. State the main point "
@@ -199,6 +201,11 @@ static NSString *const kApolloAIBothInstructions =
 // fullName -> generated summary text. Survives re-opening the same thread.
 static NSMutableDictionary<NSString *, NSString *> *sPostSummaryCache;
 static NSMutableDictionary<NSString *, NSString *> *sCommentSummaryCache;
+// fullName -> unix time (seconds) the post/comment summary was last generated.
+// Drives age-based cache expiry so old (and stale-discussion) summaries are
+// dropped rather than kept forever. One stamp per thread (refreshed when either
+// of its summaries is regenerated).
+static NSMutableDictionary<NSString *, NSNumber *> *sSummaryTimestamps;
 // Link/article summaries reuse the post box. sLinkSummaryPosts marks which posts
 // are currently showing a LINK summary (vs a self-text post summary) so the title
 // and layout position differ. sArticleTextCache memoises fetched+extracted
@@ -273,6 +280,11 @@ static NSMutableSet<NSString *> *sTapRequested;
 // Caches (regenerable; the OS may purge it under storage pressure, which simply
 // means those threads re-summarize once).
 static const NSUInteger kApolloAIPersistMaxEntries = 600;
+// Cached summaries older than this are dropped on launch. A discussion summary
+// goes stale as a thread keeps getting replies, and a forever-cache only grows;
+// a week keeps "reopen a thread I read recently" instant while bounding both.
+// (Manual "Clear AI Cache" in settings still wipes everything immediately.)
+static const NSTimeInterval kApolloAICacheMaxAge = 7 * 24 * 60 * 60;  // 7 days
 
 static NSString *ApolloAISummariesCachePath(void) {
     NSString *caches = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject];
@@ -289,6 +301,53 @@ static dispatch_queue_t ApolloAIPersistQueue(void) {
     return queue;
 }
 
+// Stamp a thread as freshly summarized (for age-based expiry). Called wherever a
+// post or comment summary is written into the in-memory cache.
+static void ApolloAIStampSummary(NSString *fullName) {
+    if (fullName.length == 0 || !sSummaryTimestamps) return;
+    sSummaryTimestamps[fullName] = @([[NSDate date] timeIntervalSince1970]);
+}
+
+// Drop in-memory cache entries whose summary is older than kApolloAICacheMaxAge
+// (or has no timestamp). Operates on the live dictionaries; run once after load.
+static void ApolloAIPruneExpiredSummaries(void) {
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    NSMutableSet<NSString *> *names = [NSMutableSet setWithArray:sPostSummaryCache.allKeys];
+    [names addObjectsFromArray:sCommentSummaryCache.allKeys];
+    NSUInteger pruned = 0;
+    for (NSString *name in names) {
+        NSNumber *ts = sSummaryTimestamps[name];
+        if (ts && (now - ts.doubleValue) <= kApolloAICacheMaxAge) continue;
+        [sPostSummaryCache removeObjectForKey:name];
+        [sCommentSummaryCache removeObjectForKey:name];
+        [sPostSummaryMode removeObjectForKey:name];
+        [sCommentSummarySourceCounts removeObjectForKey:name];
+        [sCommentSummarySignatures removeObjectForKey:name];
+        [sSummaryTimestamps removeObjectForKey:name];
+        pruned++;
+    }
+    if (pruned > 0) {
+        ApolloLog(@"[AISummary] pruned %lu summaries older than %.0f days",
+                  (unsigned long)pruned, kApolloAICacheMaxAge / 86400.0);
+    }
+}
+
+// Drop the oldest entries (by sSummaryTimestamps; missing = oldest) from `cache`
+// until it is within `cap`. Replaces arbitrary allKeys.firstObject eviction.
+static void ApolloAIEvictOldestEntries(NSMutableDictionary *cache, NSDictionary *timestamps, NSUInteger cap) {
+    if (cache.count <= cap) return;
+    NSArray<NSString *> *oldestFirst = [cache.allKeys sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+        double ta = [timestamps[a] doubleValue], tb = [timestamps[b] doubleValue];
+        if (ta < tb) return NSOrderedAscending;
+        if (ta > tb) return NSOrderedDescending;
+        return NSOrderedSame;
+    }];
+    NSUInteger toRemove = cache.count - cap;
+    for (NSUInteger i = 0; i < toRemove && i < oldestFirst.count; i++) {
+        [cache removeObjectForKey:oldestFirst[i]];
+    }
+}
+
 // Reads the persisted summaries into the in-memory caches. Caller must hold the
 // once-guard (we only ever populate these dictionaries on the main thread).
 static void ApolloAILoadPersistedSummaries(void) {
@@ -303,11 +362,15 @@ static void ApolloAILoadPersistedSummaries(void) {
     NSDictionary *sourceCounts = root[@"commentSourceCounts"];
     NSDictionary *signatures = root[@"commentSignatures"];
     NSDictionary *postModes = root[@"postModes"];
+    NSDictionary *timestamps = root[@"timestamps"];
     if ([post isKindOfClass:[NSDictionary class]]) [sPostSummaryCache addEntriesFromDictionary:post];
     if ([comment isKindOfClass:[NSDictionary class]]) [sCommentSummaryCache addEntriesFromDictionary:comment];
     if ([postModes isKindOfClass:[NSDictionary class]]) [sPostSummaryMode addEntriesFromDictionary:postModes];
     if ([sourceCounts isKindOfClass:[NSDictionary class]]) [sCommentSummarySourceCounts addEntriesFromDictionary:sourceCounts];
     if ([signatures isKindOfClass:[NSDictionary class]]) [sCommentSummarySignatures addEntriesFromDictionary:signatures];
+    if ([timestamps isKindOfClass:[NSDictionary class]]) [sSummaryTimestamps addEntriesFromDictionary:timestamps];
+    // Drop anything past its expiry before it's ever shown.
+    ApolloAIPruneExpiredSummaries();
     ApolloLog(@"[AISummary] loaded %lu post / %lu comment summaries from disk",
               (unsigned long)sPostSummaryCache.count, (unsigned long)sCommentSummaryCache.count);
 }
@@ -320,12 +383,21 @@ static void ApolloAIPersistSummaries(void) {
     NSDictionary *sourceCountSnapshot = [sCommentSummarySourceCounts copy];
     NSDictionary *signatureSnapshot = [sCommentSummarySignatures copy];
     NSDictionary *postModeSnapshot = [sPostSummaryMode copy];
+    NSDictionary *timestampSnapshot = [sSummaryTimestamps copy];
     dispatch_async(ApolloAIPersistQueue(), ^{
         NSMutableDictionary *post = [postSnapshot mutableCopy];
         NSMutableDictionary *comment = [commentSnapshot mutableCopy];
-        // Bound pathological growth; summaries are ~a few hundred bytes each.
-        while (post.count > kApolloAIPersistMaxEntries) [post removeObjectForKey:post.allKeys.firstObject];
-        while (comment.count > kApolloAIPersistMaxEntries) [comment removeObjectForKey:comment.allKeys.firstObject];
+        NSMutableDictionary *timestamps = [timestampSnapshot mutableCopy];
+        // Bound pathological growth, dropping the OLDEST summaries first (summaries
+        // are ~a few hundred bytes each).
+        ApolloAIEvictOldestEntries(post, timestamps, kApolloAIPersistMaxEntries);
+        ApolloAIEvictOldestEntries(comment, timestamps, kApolloAIPersistMaxEntries);
+        // Don't persist timestamps for threads no longer in either cache.
+        NSMutableSet<NSString *> *live = [NSMutableSet setWithArray:post.allKeys];
+        [live addObjectsFromArray:comment.allKeys];
+        for (NSString *k in timestamps.allKeys) {
+            if (![live containsObject:k]) [timestamps removeObjectForKey:k];
+        }
         NSDictionary *root = @{
             @"version": kApolloAICacheVersion,
             @"post": post,
@@ -333,6 +405,7 @@ static void ApolloAIPersistSummaries(void) {
             @"commentSourceCounts": sourceCountSnapshot,
             @"commentSignatures": signatureSnapshot,
             @"postModes": postModeSnapshot ?: @{},
+            @"timestamps": timestamps,
         };
         [root writeToFile:ApolloAISummariesCachePath() atomically:YES];
     });
@@ -343,6 +416,7 @@ static void ApolloAIEnsureState(void) {
     dispatch_once(&once, ^{
         sPostSummaryCache = [NSMutableDictionary dictionary];
         sCommentSummaryCache = [NSMutableDictionary dictionary];
+        sSummaryTimestamps = [NSMutableDictionary dictionary];
         sLinkSummaryPosts = [NSMutableSet set];
         sBothSummaryPosts = [NSMutableSet set];
         sPostSummaryMode = [NSMutableDictionary dictionary];
@@ -383,6 +457,7 @@ NSUInteger ApolloAIClearSummaryCache(void) {
 
     [sPostSummaryCache removeAllObjects];
     [sCommentSummaryCache removeAllObjects];
+    [sSummaryTimestamps removeAllObjects];
     [sPostSummaryMode removeAllObjects];
     [sArticleTextCache removeAllObjects];
     [sCommentSummarySourceCounts removeAllObjects];
@@ -2339,6 +2414,7 @@ maximumResponseTokens:responseTokens
                 }
                 sPostSummaryCache[fullName] = final;
                 sPostSummaryMode[fullName] = @(ApolloAIDesiredPostMode(fullName));
+                ApolloAIStampSummary(fullName);
                 ApolloAISetBoxStateOnMatchingHeaders(fullName, YES, ApolloAIBoxStateReady, final);
                 if (ApolloAIAnyHeaderExpanded(fullName, YES)) {
                     ApolloAIForceHeaderRemeasure(fullName);
@@ -2590,6 +2666,7 @@ static void ApolloAIGenerateForController(UIViewController *vc) {
                         }
                         sPostSummaryCache[fullName] = final;
                         sPostSummaryMode[fullName] = @(ApolloAIDesiredPostMode(fullName));
+                        ApolloAIStampSummary(fullName);
                         ApolloAISetBoxStateOnMatchingHeaders(fullName, YES, ApolloAIBoxStateReady, final);
                         if (ApolloAIAnyHeaderExpanded(fullName, YES)) {
                             ApolloAIForceHeaderRemeasure(fullName);
@@ -2700,6 +2777,7 @@ static void ApolloAIGenerateForController(UIViewController *vc) {
                             return;
                         }
                         sCommentSummaryCache[fullName] = final;
+                        ApolloAIStampSummary(fullName);
                         sCommentSummarySourceCounts[fullName] = @(commentCount);
                         if (commentSignature.length > 0) {
                             sCommentSummarySignatures[fullName] = commentSignature;
