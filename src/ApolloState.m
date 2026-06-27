@@ -40,6 +40,7 @@ BOOL sEnableAISummaries = NO;
 BOOL sEnableAIPostSummaries = YES;
 BOOL sEnableAICommentSummaries = YES;
 BOOL sEnableTapToSummarize = NO;
+BOOL sEnableAIAutoExpandSummaries = NO;
 NSInteger sInlineImageAlignment = ApolloInlineImageAlignmentCenter;
 NSInteger sAutoplayInlineGIFMode = ApolloAutoplayInlineGIFModeDefault;
 NSInteger sLinkPreviewBodyMode = ApolloLinkPreviewModeOff;

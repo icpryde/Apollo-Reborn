@@ -1492,6 +1492,7 @@ static void initializeRandomSources() {
                                     UDKeyEnableAIPostSummaries: @YES,
                                     UDKeyEnableAICommentSummaries: @YES,
                                     UDKeyEnableTapToSummarize: @NO,
+                                    UDKeyEnableAIAutoExpandSummaries: @NO,
                                     UDKeyPictureInPictureEnabled: @NO,
                                     UDKeyPictureInPictureActivation: @(ApolloPiPActivationModeUnmutedOnly),
                                     UDKeyPictureInPictureStartPosition: @(ApolloPiPStartPositionTopRight),
@@ -1538,6 +1539,7 @@ static void initializeRandomSources() {
     sEnableAIPostSummaries = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyEnableAIPostSummaries];
     sEnableAICommentSummaries = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyEnableAICommentSummaries];
     sEnableTapToSummarize = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyEnableTapToSummarize];
+    sEnableAIAutoExpandSummaries = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyEnableAIAutoExpandSummaries];
     sInlineImageAlignment = [[NSUserDefaults standardUserDefaults] integerForKey:UDKeyInlineImageAlignment];
     if (sInlineImageAlignment < ApolloInlineImageAlignmentCenter || sInlineImageAlignment > ApolloInlineImageAlignmentRight) {
         sInlineImageAlignment = ApolloInlineImageAlignmentCenter;

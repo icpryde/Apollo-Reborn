@@ -86,7 +86,7 @@ typedef NS_ENUM(NSInteger, ApolloAISettingsSection) {
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     switch (section) {
         case ApolloAISettingsSectionGeneral: return 1;
-        case ApolloAISettingsSectionSummaries: return 3;
+        case ApolloAISettingsSectionSummaries: return 4;
         case ApolloAISettingsSectionAvailability: return 1;
         case ApolloAISettingsSectionMaintenance: return 2;
         default: return 0;
@@ -108,7 +108,7 @@ typedef NS_ENUM(NSInteger, ApolloAISettingsSection) {
         return @"Summaries are generated entirely on-device using Apple Intelligence — no post or comment text is sent to an external AI service. Summarizing a linked article does fetch that page from its source website, which happens automatically when you open a thread unless Tap to Summarize is on.";
     }
     if (section == ApolloAISettingsSectionSummaries) {
-        return @"Tap to Summarize generates only the card you request. Leave it off to generate enabled summaries automatically when opening a thread.";
+        return @"Tap to Summarize generates only the card you request. Leave it off to generate enabled summaries automatically when opening a thread. Open Summaries Automatically expands a card on its own once its summary is ready, instead of waiting for you to tap it open (cards you tap to generate always open once ready).";
     }
     if (section == ApolloAISettingsSectionAvailability) {
         return @"Availability is diagnostic. On some iOS versions, sideloaded apps may report Apple Intelligence as disabled even when generation still works.";
@@ -147,6 +147,11 @@ typedef NS_ENUM(NSInteger, ApolloAISettingsSection) {
                                               on:[defaults boolForKey:UDKeyEnableTapToSummarize]
                                          enabled:enabled
                                           action:@selector(tapToSummarizeSwitchChanged:)];
+            case 3:
+                return [self switchCellWithLabel:@"Open Summaries Automatically"
+                                              on:[defaults boolForKey:UDKeyEnableAIAutoExpandSummaries]
+                                         enabled:enabled
+                                          action:@selector(autoExpandSwitchChanged:)];
             default:
                 break;
         }
@@ -237,6 +242,11 @@ typedef NS_ENUM(NSInteger, ApolloAISettingsSection) {
 - (void)tapToSummarizeSwitchChanged:(UISwitch *)sender {
     sEnableTapToSummarize = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:sEnableTapToSummarize forKey:UDKeyEnableTapToSummarize];
+}
+
+- (void)autoExpandSwitchChanged:(UISwitch *)sender {
+    sEnableAIAutoExpandSummaries = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sEnableAIAutoExpandSummaries forKey:UDKeyEnableAIAutoExpandSummaries];
 }
 
 @end

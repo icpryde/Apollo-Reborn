@@ -95,6 +95,11 @@ static NSString *const UDKeyEnableAICommentSummaries = @"EnableAICommentSummarie
 // When on, summaries are generated only when the user taps the card (rather than
 // automatically on open). Off by default. Cached summaries still show instantly.
 static NSString *const UDKeyEnableTapToSummarize = @"EnableTapToSummarize";
+// When on, a summary card opens (expands) by itself as soon as its summary is
+// ready, instead of staying collapsed until the user taps it. Off by default
+// (current behaviour: cards open on tap). Tapping an idle "Tap to summarize"
+// card always opens it once loaded, regardless of this setting.
+static NSString *const UDKeyEnableAIAutoExpandSummaries = @"EnableAIAutoExpandSummaries";
 
 // Picture-in-Picture: floating in-app mini-player for comments-page videos.
 static NSString *const UDKeyPictureInPictureEnabled = @"PictureInPictureEnabled";       // master switch
