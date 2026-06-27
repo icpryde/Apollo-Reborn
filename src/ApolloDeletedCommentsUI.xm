@@ -1632,13 +1632,17 @@ static NSAttributedString *__attribute__((unused)) ApolloDeletedCommentsAttribut
 
     id cellNode = ApolloDeletedCommentsCommentCellNodeForTextNode(textNode);
     RDKComment *comment = ApolloDeletedCommentsCommentFromCellNode(cellNode);
+    // Only a node that belongs to a comment cell whose comment is ACTUALLY
+    // recovered/removed/deleted may receive a chip. A node that merely reads a
+    // reason-label string — or normalizes to one because it is blank — with no
+    // removed comment behind it (feed-post bylines, empty author-flair slots on
+    // flair-enabled subreddits, transient UI labels) is NOT a deleted comment and
+    // must be left untouched. This mirrors the sibling reason-prefix injector, which
+    // bails on the identical condition. Previously this branch STAMPED a chip, which
+    // is what made every non-removed post and comment on subs like r/personalfinance
+    // show "REMOVED BY MOD" in the byline (#522).
     if (!comment || !ApolloDeletedCommentsCellNodeShouldShowDeletedTreatment(cellNode)) {
-        NSDictionary *baseAttributes = ApolloDeletedCommentsReasonChipBaseAttributes(attributedText, cellNode);
-        NSAttributedString *chip = ApolloDeletedCommentsReasonChipAttributedText(text,
-                                                                                 baseAttributes,
-                                                                                 sTapToRevealDeletedComments);
-        if (sTapToRevealDeletedComments) ApolloDeletedCommentsEnsureRevealAttributeIsTappable(textNode);
-        return chip;
+        return attributedText;
     }
 
     NSString *label = ApolloDeletedCommentsReasonLabelForComment(comment);
