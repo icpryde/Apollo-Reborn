@@ -883,6 +883,9 @@ static NSTimeInterval ApolloUserProfileRetryBackoffForAttempt(NSInteger attempt)
         [self.diskInfo removeAllObjects];
         [self.infoCache removeAllObjects];
         [self.imageCache removeAllObjects];
+        // Reset the batch-prefetch dedupe set so already-seen users get re-warmed
+        // through the fast user_data_by_account_ids path after a clear.
+        [self.batchRequestedFullNames removeAllObjects];
 
         // Wipe HTTP cache entries so subsequent fetches go to the network.
         NSURLCache *httpCache = self.session.configuration.URLCache ?: [NSURLCache sharedURLCache];
