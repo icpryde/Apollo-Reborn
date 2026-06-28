@@ -29,21 +29,24 @@
 //   On iOS 26 the tweak's own ApolloNativeActionMenus module converts Apollo's
 //   ActionController action sheets into native UIKit context menus
 //   (UIMenu/UIAction) — so the "Notify user via…" sheet renders as a UIMenu.
-//   `ApolloNativeActionMenuBuildMenu` builds that menu from the controller's
-//   `textActions`; it calls ApolloInjectPublicStickyAsSubredditIfNeeded() (this
-//   file) just before constructing the UIMenu. For the "Notify user via…" menu
-//   we append a 4th UIAction that clones the "Public Sticky"/"Public Reply"
-//   action's title (+ " from Subreddit") and, on tap, arms a one-shot flag and
-//   runs the ORIGINAL action's handler — so the entire native compose flow runs
-//   unchanged. (Injecting at the single build site avoids a second
-//   -[UIMenu children] hook, which would collide with the video-speed one.)
+//   `ApolloNativeActionMenuBuildMenu` calls
+//   ApolloInjectPublicStickyAsSubredditIfNeeded() (this file) as it builds that
+//   menu; for the "Notify user via…" menu we append a 4th UIAction that clones
+//   the "Public Sticky"/"Public Reply" action (inheriting its styling) and, on
+//   tap, arms a one-shot flag and runs the ORIGINAL action's handler — so the
+//   entire native compose flow runs unchanged.
 //
-//   The RDKClient hook below is UI-independent — every notify path funnels
-//   through it — and rewrites type "public" → "public_as_subreddit" while the
+//   The RDKClient hook below is UI-independent (every notify path funnels
+//   through it) and rewrites type "public" → "public_as_subreddit" while the
 //   flag is set, then consumes it. Every other option/path is untouched.
 //
+//   NOTE: this covers the Liquid-Glass path (the native UIMenu). Without Liquid
+//   Glass, Apollo presents its original ActionController table sheet, which
+//   self-sizes from its own row count — injecting a visible row there needs the
+//   sheet's height/layout handled too, tracked as a follow-up.
+//
 // Mod-only and additive: non-mods never see this menu; untouched options behave
-// exactly like stock Apollo. No settings toggle in v1.
+// exactly like stock Apollo. No settings toggle.
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -83,22 +86,6 @@ static id PSObjectIvar(id obj, const char *name) {
         cls = class_getSuperclass(cls);
     }
     return nil;
-}
-
-// Is this ActionController the removal "Notify user via…" action sheet? Its own
-// `tableView:titleForHeaderInSection:` returns the header String (and ignores
-// both arguments), so it's a safe probe. Used for the non-Liquid-Glass path,
-// where Apollo presents the real ActionController sheet instead of a UIMenu.
-static BOOL PSIsNotifyActionSheet(id actionController) {
-    if (![actionController respondsToSelector:@selector(tableView:titleForHeaderInSection:)]) return NO;
-    UITableView *tv = (UITableView *)PSObjectIvar(actionController, "tableView");
-    NSString *header = nil;
-    @try {
-        header = [(id<UITableViewDataSource>)actionController tableView:tv titleForHeaderInSection:0];
-    } @catch (__unused NSException *e) {
-        return NO;
-    }
-    return [header isKindOfClass:[NSString class]] && [header hasPrefix:kNotifyMenuTitlePrefix];
 }
 
 #pragma mark - Menu injection (called from ApolloNativeActionMenuBuildMenu)
@@ -183,86 +170,6 @@ void ApolloInjectPublicStickyAsSubredditIfNeeded(NSMutableArray *children, NSStr
     ApolloLog(@"[PublicStickyAsSub] injected '%@' into Notify menu (now %lu items)",
               newTitle, (unsigned long)children.count);
 }
-
-#pragma mark - Action-sheet injection (non-Liquid-Glass path)
-
-// Without Liquid Glass, ApolloNativeActionMenus does NOT convert the sheet to a
-// UIMenu, so the menu injection above never runs — Apollo shows its real
-// `ActionController` table-based sheet. Here we add the 4th row directly to that
-// table: one extra row cloned from row 0 ("Public Sticky"/"Public Reply",
-// always first in this sheet), retitled, that arms the flag and triggers row 0's
-// native handler. We only ever touch the "Notify user via…" sheet; every other
-// ActionController and the Liquid-Glass UIMenu path are untouched (in LG the
-// sheet isn't shown, so these hooks no-op there).
-//
-// NOTE: ApolloNativeActionMenus already hooks this class's viewWillAppear:, so we
-// must not — we reset the one-shot flag in numberOfRowsInSection: (called each
-// time the sheet's table loads) instead.
-%hook _TtC6Apollo16ActionController
-
-- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    NSInteger n = %orig;
-    if (PSIsNotifyActionSheet(self)) {
-        sSendNextRemovalAsSubreddit = NO; // fresh sheet display -> disarm
-        n += 1;
-    }
-    return n;
-}
-
-- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    if (!PSIsNotifyActionSheet(self)) return %orig;
-
-    NSInteger r = indexPath.row;
-    if (r == 0) return %orig; // row 0 = the "Public Sticky"/"Public Reply" option
-
-    if (r == 1) {
-        // Our injected row: clone row 0's cell (inherits styling) and retitle.
-        NSIndexPath *zero = [NSIndexPath indexPathForRow:0 inSection:indexPath.section];
-        UITableViewCell *cell = %orig(tableView, zero);
-        UILabel *label = (UILabel *)PSObjectIvar(cell, "actionTitleLabel");
-        if ([label isKindOfClass:[UILabel class]]) {
-            NSString *base = label.text ?: @"Public Sticky";
-            if (![base hasSuffix:kAsSubredditSuffix]) {
-                label.text = [base stringByAppendingString:kAsSubredditSuffix];
-            }
-        }
-        return cell;
-    }
-
-    NSIndexPath *mapped = [NSIndexPath indexPathForRow:(r - 1) inSection:indexPath.section];
-    return %orig(tableView, mapped);
-}
-
-- (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
-    if (!PSIsNotifyActionSheet(self)) return %orig;
-    NSInteger r = indexPath.row;
-    NSInteger src = (r <= 1) ? 0 : (r - 1); // our row (1) clones row 0's height
-    if (r == 0) src = 0;
-    NSIndexPath *clone = [NSIndexPath indexPathForRow:src inSection:indexPath.section];
-    return %orig(tableView, clone);
-}
-
-- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
-    if (!PSIsNotifyActionSheet(self)) { %orig; return; }
-
-    NSInteger r = indexPath.row;
-    if (r == 0) { %orig; return; }
-
-    if (r == 1) {
-        // Our injected row: arm the flag, then run row 0's native handler.
-        sSendNextRemovalAsSubreddit = YES;
-        ApolloLog(@"[PublicStickyAsSub] (sheet) 'from Subreddit' tapped; arming + running row-0 flow");
-        [tableView deselectRowAtIndexPath:indexPath animated:YES];
-        NSIndexPath *zero = [NSIndexPath indexPathForRow:0 inSection:indexPath.section];
-        %orig(tableView, zero);
-        return;
-    }
-
-    NSIndexPath *mapped = [NSIndexPath indexPathForRow:(r - 1) inSection:indexPath.section];
-    %orig(tableView, mapped);
-}
-
-%end
 
 #pragma mark - Type rewrite at the API boundary
 
