@@ -1257,7 +1257,38 @@ static void ApolloHLInstallCarousel(UIViewController *vc, UITableView *tableView
 
     BOOL sameContent = [storedSubreddit isEqualToString:subreddit] && [storedSignature isEqualToString:signature];
     if (sameContent && wrapper && tableView.tableHeaderView == wrapper) {
-        return; // already installed and current
+        // Already installed and current — UNLESS the wrapper has been detached from the window while the
+        // table is on-screen. Apollo's in-place feed search removes the tableHeaderView from the view
+        // hierarchy to show results, but leaves the `tableHeaderView` PROPERTY pointing at our wrapper, so
+        // on dismiss every re-install short-circuits here and the carousel never comes back (it's set but
+        // unrendered → a blank gap). Detect that and force a re-attach: nil then re-set under the rewrap
+        // guard so the table re-adds + lays out the header. STANDALONE carousel only (Subreddit Headers
+        // off): when headers are on, the carousel is hosted inside the headers wrapper and the search
+        // module owns that chrome, so re-seating + scrolling here would scroll the banner off.
+        if (sShowSubredditHeaders || !(tableView.window && !wrapper.window)) {
+            return; // headers-hosted, or attached / off-screen → nothing to do
+        }
+        objc_setAssociatedObject(tableView, kApolloHLRewrapInProgressKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        tableView.tableHeaderView = nil;
+        tableView.tableHeaderView = wrapper;
+        objc_setAssociatedObject(tableView, kApolloHLRewrapInProgressKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        // The feed is still scrolled where the search results were, so the just-re-attached carousel sits
+        // above the viewport (behind the field). Scroll back to the top so it's visible again — but defer
+        // it: the search-dismiss is still animating the content inset back to its resting value, so reading
+        // it now would over-scroll (hiding the field). Re-read on the next runloop turns until it settles.
+        __weak UITableView *weakTV = tableView;
+        for (int i = 1; i <= 3; i++) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                UITableView *tv = weakTV;
+                if (!tv || tv.tracking || tv.dragging) return;
+                CGFloat top = -tv.adjustedContentInset.top;
+                if (tv.contentOffset.y > top + 0.5) {
+                    [tv setContentOffset:CGPointMake(tv.contentOffset.x, top) animated:(i == 3)];
+                }
+            });
+        }
+        ApolloLog(@"[Highlights] re-attached detached carousel r/%@", subreddit);
+        return;
     }
 
     CGFloat width = tableView.bounds.size.width > 0 ? tableView.bounds.size.width : UIScreen.mainScreen.bounds.size.width;

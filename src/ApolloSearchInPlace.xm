@@ -638,8 +638,8 @@ static void recenterCancelButton(void) {
 
 - (void)setContentOffset:(CGPoint)offset {
     // Only when a FULL subreddit header is present (the managed case). Without it — Home, or just the small
-    // Community Highlights carousel (Subreddit Headers off) — leave the feed's geometry stock, so dismissing
-    // a search can't strand the rebuilt carousel header behind the chrome (blank space).
+    // Community Highlights carousel (Subreddit Headers off) — leave the feed's geometry stock; Apollo
+    // surfaces results there natively, and the Highlights module re-attaches its carousel on dismiss.
     if ((UIScrollView *)self == sFeedSearchTable &&
         (sFeedSearchActive || sFeedSearchDismissing) &&
         ApolloFeedSearchManagedHeader((UIScrollView *)self)) {
@@ -665,13 +665,9 @@ static void recenterCancelButton(void) {
             }
         }
 
-        // While holding the surfaced position, hide the header so the scrolled-up chrome doesn't bleed
-        // through the translucent field/nav; otherwise (empty query, dismissing, or the user scrolling to
-        // browse) keep it visible.
         BOOL surfaced = hasQuery && sFeedSearchActive && !sFeedSearchDismissing &&
                         !sFeedSearchScrolledByUser && (target > rest + 1.0);
         ApolloFeedSearchSetHeaderHidden(sv, surfaced);
-
         %orig(offset);
         return;
     }
