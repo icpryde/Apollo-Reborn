@@ -50,21 +50,53 @@
 // MARK: - tunables
 
 static const NSTimeInterval kLCFPollInterval = 0.4;   // poll cadence while a live thread is on screen
-static const CGFloat kLCFEdgeThreshold  = 24.0;       // within this of the live edge == "at the top"
 static const CGFloat kLCFDriftThreshold = 4.0;        // only re-pin when offset drifts this far from edge
+// Re-engaging FOLLOW after the user has scrolled away happens ONLY at a scroll-settle, and only
+// when they've come to rest at/near the live edge. Asymmetric so a small scroll DOWN to peek/read
+// keeps your place (stays READ), while scrolling back UP to the top resumes following.
+static const CGFloat kLCFReentryDown    = 8.0;        // at most this far BELOW the comment top still resumes
+static const CGFloat kLCFReentryUp      = 140.0;      // ...or this far above it (back-to-top), but not deep in the post header
 static const NSInteger kLCFCountCap     = 50;         // display "50+" past this
 static const CGFloat kLCFPillTopMargin  = 8.0;        // gap below the nav bar / toolbar
+// The post (title/body/action bar/"Discussion so far" card) is ONE header cell; the first comment
+// is the next row. Pinning the first comment to the very top scrolls the post's action bar
+// (upvote/reply/share) off. Reveal this many points of the header cell's BOTTOM above the first
+// comment so that action bar stays visible/tappable at the live edge.
+static const CGFloat kLCFEdgeReveal     = 132.0;
+// Enabling Live Update REORDERS + re-fetches the list over a few seconds (the old top comment
+// shows first, then the real newest comments load above it). Only lock the count baseline once
+// the top comment has stopped changing for this long, so we don't anchor to a comment that then
+// gets buried (which showed a bogus "50+ new comments" on enable).
+static const NSTimeInterval kLCFSettleTime = 3.0;
+// After a new comment lands (contentSize grows), hold the offset at the live edge for this long so
+// it flows in at the top smoothly (counteracting Apollo's reading-position compensation) instead of
+// the newest piling up off-screen above. The hold runs from a CADisplayLink (per-frame), because
+// Apollo's ASTableNode does NOT forward UIScrollViewDelegate callbacks to the VC — scrollViewDidScroll:
+// never fires here (proven by on-device diag logging), so all detection must read contentOffset directly.
+static const NSTimeInterval kLCFCompWindow = 0.45;
+// While locked, an offset move beyond this that ISN'T a fresh comment means the user scrolled away
+// (works for finger AND indirect trackpad/wheel scrolls — neither reaches the scroll delegate here).
+static const CGFloat kLCFExitThreshold = 24.0;
+// During a direct finger drag, this little movement is enough to unlock (so we never "force you back").
+static const CGFloat kLCFUnlockMove = 10.0;
 
 // MARK: - per-VC state (associated objects) + generation token
 
 static const void *kLCFGenKey       = &kLCFGenKey;       // NSNumber long: bumped each appear/disappear
-static const void *kLCFFollowKey    = &kLCFFollowKey;    // NSNumber bool: follow mode (pin to edge)
-static const void *kLCFEvalKey      = &kLCFEvalKey;      // NSNumber bool: did the first-live eval
+static const void *kLCFFollowKey    = &kLCFFollowKey;    // NSNumber bool: LOCKED (at the live edge, following)
+static const void *kLCFEvalKey      = &kLCFEvalKey;      // NSNumber bool: did the first-live eval (enable jump)
 static const void *kLCFAnchorKey    = &kLCFAnchorKey;    // NSString: fullName baseline (top comment when read began)
-static const void *kLCFLastHKey     = &kLCFLastHKey;     // NSNumber double: contentSize.height last poll (stability)
+static const void *kLCFEvalTimeKey  = &kLCFEvalTimeKey;  // NSNumber double: CACurrentMediaTime Live Update was enabled (count grace)
 static const void *kLCFCountKey     = &kLCFCountKey;     // NSNumber long: last displayed N (-2 == hidden)
 static const void *kLCFWrapKey      = &kLCFWrapKey;      // UIView: pill shadow wrapper (reused)
 static const void *kLCFButtonKey    = &kLCFButtonKey;    // UIButton: pill button (reused)
+static const void *kLCFSDSHKey       = &kLCFSDSHKey;       // NSNumber double: contentSize.height last display-link frame (grew detection)
+static const void *kLCFCachedEdgeKey = &kLCFCachedEdgeKey; // NSNumber double: cached live-edge offset (display link reads this each frame)
+static const void *kLCFCompTimeKey   = &kLCFCompTimeKey;   // NSNumber double: time content last grew (smooth-hold window)
+static const void *kLCFDisplayLinkKey = &kLCFDisplayLinkKey; // CADisplayLink: per-frame follow holder
+static const void *kLCFLastOffKey    = &kLCFLastOffKey;    // NSNumber double: contentOffset.y last poll (re-lock stability)
+static const void *kLCFReadAnchorFNKey = &kLCFReadAnchorFNKey; // NSString: comment to keep stable while reading (unlocked)
+static const void *kLCFReadDeltaKey  = &kLCFReadDeltaKey;  // NSNumber double: that comment's (contentY - offset) screen position
 
 static long gLCFGen = 0;
 
@@ -148,12 +180,6 @@ static UITableView *LCFTableView(UIViewController *vc) {
     return nil;
 }
 
-static BOOL LCFScrollable(UITableView *tv) {
-    CGFloat h = tv.contentSize.height;
-    CGFloat insets = tv.adjustedContentInset.top + tv.adjustedContentInset.bottom;
-    return (h + insets) > (tv.bounds.size.height + 1.0);
-}
-
 // fullName ("t1_xxx") of a comment cell node, or nil for header/footer/spinner/load-more rows.
 static NSString *LCFNodeCommentFullName(id node) {
     id comment = LCFObjectIvar(node, "comment");   // RDKComment on _TtC6Apollo15CommentCellNode
@@ -192,27 +218,54 @@ static NSString *LCFTopCommentFullName(UIViewController *vc) {
     return LCFNodeCommentFullName(node);
 }
 
-// The "live edge" content offset: puts the FIRST comment row at the top of the viewport
-// (just under the nav bar), so the newest comment is visible and the post header scrolls
-// off above. Falls back to the absolute top when there are no comments yet. Clamped to
-// the scrollable range.
+// Content-Y of the post's action bar (the "quick bar": upvote/downvote/save/reply/share). The
+// whole post is one header cell (_TtC6Apollo22CommentsHeaderCellNode) whose `quickBarNode` child
+// is that bar; we convert its rect into the table's content space. Returns NO if unavailable.
+static BOOL LCFQuickBarTopContentY(UIViewController *vc, UITableView *tv, CGFloat *outY) {
+    id tableNode = LCFTableNode(vc);
+    SEL nodeSel = NSSelectorFromString(@"nodeForRowAtIndexPath:");
+    if (!tableNode || ![tableNode respondsToSelector:nodeSel]) return NO;
+    if ([tv numberOfSections] < 1 || [tv numberOfRowsInSection:0] < 1) return NO;
+    NSIndexPath *ip0 = [NSIndexPath indexPathForRow:0 inSection:0];
+    id header = ((id (*)(id, SEL, id))objc_msgSend)(tableNode, nodeSel, ip0);
+    if (![header isKindOfClass:NSClassFromString(@"_TtC6Apollo22CommentsHeaderCellNode")]) return NO;
+    id qb = LCFObjectIvar(header, "quickBarNode");
+    SEL boundsSel = NSSelectorFromString(@"bounds");
+    SEL convSel = NSSelectorFromString(@"convertRect:toNode:");
+    if (!qb || ![qb respondsToSelector:boundsSel] || ![qb respondsToSelector:convSel]) return NO;
+    CGRect b = ((CGRect (*)(id, SEL))objc_msgSend)(qb, boundsSel);
+    CGRect inCell = ((CGRect (*)(id, SEL, CGRect, id))objc_msgSend)(qb, convSel, b, header);
+    if (inCell.origin.y <= 0 || inCell.size.height <= 0) return NO;   // not laid out yet
+    CGRect cellRect = [tv rectForRowAtIndexPath:ip0];
+    *outY = cellRect.origin.y + inCell.origin.y;
+    return YES;
+}
+
+// The "live edge" content offset: pins the post's action bar (quick bar) just under the nav bar,
+// so in the locked/FOLLOW state the upvote/reply/share row stays visible while new comments flow
+// in below it. Falls back to revealing a fixed slice of the header bottom if the quick bar can't
+// be located, and to the absolute top when there are no comments yet. Clamped to the scrollable
+// range.
 static CGFloat LCFLiveEdgeOffset(UIViewController *vc, UITableView *tv) {
     CGFloat insetTop = tv.adjustedContentInset.top;
     CGFloat insetBottom = tv.adjustedContentInset.bottom;
     CGFloat viewportH = tv.bounds.size.height;
     CGFloat maxOff = MAX(-insetTop, tv.contentSize.height - viewportH + insetBottom);
 
+    CGFloat qbY;
+    if (LCFQuickBarTopContentY(vc, tv, &qbY)) {
+        CGFloat desired = qbY - insetTop;                  // quick bar top at the nav-bar bottom
+        return MIN(MAX(desired, -insetTop), maxOff);
+    }
+
     id tableNode = LCFTableNode(vc);
     NSIndexPath *ip = LCFFirstCommentIndexPath(tableNode, tv);
     if (!ip) return -insetTop;   // no comments yet
     CGRect rr = [tv rectForRowAtIndexPath:ip];
-    CGFloat desired = rr.origin.y - insetTop;
+    CGFloat desired = rr.origin.y - insetTop - kLCFEdgeReveal;   // fallback: reveal header bottom
     return MIN(MAX(desired, -insetTop), maxOff);
 }
 
-static BOOL LCFAtEdge(UIViewController *vc, UITableView *tv) {
-    return fabs(tv.contentOffset.y - LCFLiveEdgeOffset(vc, tv)) <= kLCFEdgeThreshold;
-}
 
 // Count comment rows currently ABOVE the anchored comment. Returns the count, or -1 if the
 // anchor can't be found. Only rows with a `comment` ivar are counted, so the post header /
@@ -238,6 +291,43 @@ static NSInteger LCFCountAboveAnchor(UIViewController *vc, NSString *anchor) {
         }
     }
     return -1;                                    // anchor gone
+}
+
+// MARK: - reading anchor (scroll anchoring while unlocked)
+
+// The first VISIBLE comment whose bottom is below the viewport top — i.e. the comment the user is
+// reading at the top of the screen. Returns its fullName + content-Y. Cheap: only walks the handful
+// of currently-visible rows (UITableView tracks them), not the whole thread.
+static BOOL LCFFirstVisibleCommentInfo(UIViewController *vc, UITableView *tv, NSString **outFN, CGFloat *outY) {
+    id tableNode = LCFTableNode(vc);
+    SEL nodeSel = NSSelectorFromString(@"nodeForRowAtIndexPath:");
+    if (!tableNode || ![tableNode respondsToSelector:nodeSel]) return NO;
+    NSArray<NSIndexPath *> *vis = [[tv indexPathsForVisibleRows] sortedArrayUsingSelector:@selector(compare:)];
+    CGFloat top = tv.contentOffset.y;
+    for (NSIndexPath *ip in vis) {
+        id node = ((id (*)(id, SEL, id))objc_msgSend)(tableNode, nodeSel, ip);
+        NSString *fn = LCFNodeCommentFullName(node);
+        if (!fn) continue;
+        CGRect r = [tv rectForRowAtIndexPath:ip];
+        if (CGRectGetMaxY(r) <= top + 1.0) continue;   // fully scrolled past the top — skip
+        *outFN = fn; *outY = r.origin.y; return YES;
+    }
+    return NO;
+}
+
+// Current content-Y of a specific comment, found among the visible rows (where it stays after an
+// insert, because Apollo keeps it ~on screen). NO if it isn't currently visible.
+static BOOL LCFContentYForVisibleComment(UIViewController *vc, UITableView *tv, NSString *fn, CGFloat *outY) {
+    if (fn.length == 0) return NO;
+    id tableNode = LCFTableNode(vc);
+    SEL nodeSel = NSSelectorFromString(@"nodeForRowAtIndexPath:");
+    if (!tableNode || ![tableNode respondsToSelector:nodeSel]) return NO;
+    for (NSIndexPath *ip in [tv indexPathsForVisibleRows]) {
+        id node = ((id (*)(id, SEL, id))objc_msgSend)(tableNode, nodeSel, ip);
+        NSString *cfn = LCFNodeCommentFullName(node);
+        if (cfn && [cfn isEqualToString:fn]) { *outY = [tv rectForRowAtIndexPath:ip].origin.y; return YES; }
+    }
+    return NO;
 }
 
 // MARK: - chrome geometry (ported from ApolloCommentsCollapse, same hooked VC)
@@ -427,16 +517,18 @@ static void LCFShowPill(UIViewController *vc, NSString *text, long countKey) {
     }
 }
 
-// Recount and show/hide the pill (READ mode). `hStable` == the comment list isn't mid-rebuild
-// this poll (contentSize unchanged since last). Quiet unless the displayed value changes.
-//
-// The anchor baseline (the top comment when the user left the live edge) is the count origin.
-// Selecting Live Update rebuilds the comment list, so a baseline captured during that churn is
-// stale — we only (re)establish it when the list is stable, and re-establish if it falls out of
-// the live window (n == -1).
-static void LCFUpdatePill(UIViewController *vc, BOOL hStable) {
+// Recount and show/hide the pill (READ mode). The anchor baseline is the top comment when the
+// user left the live edge; new comments above it are the count. We suppress counting for a short
+// grace after Live Update is enabled, because the enable-time reorder/fetch briefly churns the
+// order — counting then would show a bogus number. After the grace, if no baseline exists yet we
+// establish it from the current top, and re-establish if it falls out of the live window (n == -1).
+static void LCFUpdatePill(UIViewController *vc) {
     UITableView *tv = LCFTableView(vc);
     if (!tv) return;
+
+    // Grace: don't count while the list is still settling right after enable.
+    double evalT = [LCFNum(vc, kLCFEvalTimeKey) doubleValue];
+    if (evalT > 0 && (CACurrentMediaTime() - evalT) < kLCFSettleTime) { LCFHidePill(vc); return; }
 
     NSString *anchor = objc_getAssociatedObject(vc, kLCFAnchorKey);
     NSInteger n = anchor.length ? LCFCountAboveAnchor(vc, anchor) : -1;
@@ -450,47 +542,169 @@ static void LCFUpdatePill(UIViewController *vc, BOOL hStable) {
         return;
     }
 
-    if (n < 0 && hStable) {
-        // Baseline missing or fell out of the live window — re-establish from the current
-        // (stable) top comment so subsequent arrivals count from here.
+    if (n < 0) {
+        // No baseline yet (or it fell out of the live window) — establish from the current top so
+        // subsequent arrivals count from here. Safe now: the grace above has passed.
         NSString *top = LCFTopCommentFullName(vc);
         if (top) {
             LCFSet(vc, kLCFAnchorKey, top);
-            ApolloLog(@"[LiveFollow] baseline (re)established anchor=%@ h=%.0f", top, tv.contentSize.height);
+            ApolloLog(@"[LiveFollow] baseline (re)established anchor=%@", top);
         }
     }
     LCFHidePill(vc);   // n == 0 (caught up), or baseline just (re)set
 }
 
-// Pin the newest to the live edge (FOLLOW mode). Instant, drift-guarded.
-static void LCFPinToEdge(UIViewController *vc) {
-    UITableView *tv = LCFTableView(vc);
-    if (!tv || !LCFScrollable(tv)) return;
-    CGFloat edge = LCFLiveEdgeOffset(vc, tv);
-    CGFloat cur = tv.contentOffset.y;
-    if (fabs(cur - edge) > kLCFDriftThreshold) {
+// Set the table offset to the live edge (post action bar at the top, newest comment just below).
+// Used by the per-frame holder and the enable jump. Drift-guarded to avoid redundant sets.
+static void LCFClampToEdge(UIViewController *vc, UITableView *tv, CGFloat edge) {
+    if (!tv) return;
+    if (fabs(tv.contentOffset.y - edge) > kLCFDriftThreshold) {
         [tv setContentOffset:CGPointMake(tv.contentOffset.x, edge) animated:NO];
-        ApolloLog(@"[LiveFollow] pinned to edge %.0f -> %.0f", cur, edge);
     }
 }
 
-// Snapshot the anchor (first comment fullName) at the follow->read transition.
+// Snapshot the anchor (first comment fullName) when the user leaves the live edge (LOCKED->unlocked).
+// During the post-enable settle grace the order is still churning, so clear it and let READ-mode
+// (re)establish the baseline once the grace passes — avoids a bogus count from the enable reorder.
 static void LCFSnapshotAnchor(UIViewController *vc) {
-    NSString *top = LCFTopCommentFullName(vc);
-    LCFSet(vc, kLCFAnchorKey, top);
-    ApolloLog(@"[LiveFollow] FOLLOW->READ, anchor=%@", top);
+    double evalT = [LCFNum(vc, kLCFEvalTimeKey) doubleValue];
+    if (evalT > 0 && (CACurrentMediaTime() - evalT) < kLCFSettleTime) {
+        LCFSet(vc, kLCFAnchorKey, nil);
+        return;
+    }
+    LCFSet(vc, kLCFAnchorKey, LCFTopCommentFullName(vc));
 }
 
-// Re-arm follow mode (user reached / jumped to the live edge).
+// Lock (re-arm follow): the user is at / jumped back to the live edge. The display link takes over
+// holding the newest at the top.
 static void LCFEnterFollow(UIViewController *vc) {
     BOOL was = LCFBool(vc, kLCFFollowKey);
     LCFSet(vc, kLCFFollowKey, @YES);
     LCFSet(vc, kLCFAnchorKey, nil);
+    UITableView *tv = LCFTableView(vc);
+    if (tv) LCFSet(vc, kLCFSDSHKey, @(tv.contentSize.height));   // reset grew baseline
     LCFHidePill(vc);
-    if (!was) ApolloLog(@"[LiveFollow] entered FOLLOW (at live edge)");
+    if (!was) ApolloLog(@"[LiveFollow] LOCKED (at live edge)");
 }
 
-// MARK: - poll loop (drives detection; the host VC's layout doesn't fire on node changes)
+// Unlock: the user scrolled away from the live edge. Keep their place untouched and start counting
+// new arrivals for the badge (baseline = where they left).
+static void LCFUnlock(UIViewController *vc, const char *why) {
+    if (!LCFBool(vc, kLCFFollowKey)) return;
+    LCFSet(vc, kLCFFollowKey, @NO);
+    LCFSnapshotAnchor(vc);
+    LCFSet(vc, kLCFReadAnchorFNKey, nil);   // re-seed the reading anchor on the next frame
+    ApolloLog(@"[LiveFollow] UNLOCKED (%s)", why);
+}
+
+// Scroll anchoring while UNLOCKED (reading older comments). New comments insert ABOVE the viewport,
+// growing the content; Apollo's own reading-position compensation is imperfect AND the insert settles
+// over several frames of animation, so the comment you're reading bounces. Fix: keep a reference to
+// the first visible comment and its on-screen position, and for the whole hold window after a comment
+// lands, restore the offset every frame so that comment stays exactly where it was — killing the
+// bounce across the entire animation, not just the one frame contentSize first changed. While the
+// user is actively scrolling (or at rest between inserts) we re-seed the reference to track wherever
+// they are, so we never fight their scroll.
+static void LCFStabilizeReading(UIViewController *vc, UITableView *tv) {
+    CGFloat off = tv.contentOffset.y;
+    BOOL interacting = tv.isDragging || tv.isTracking || tv.isDecelerating;
+    double compT = [LCFNum(vc, kLCFCompTimeKey) doubleValue];
+    BOOL stabilizing = (compT > 0 && (CACurrentMediaTime() - compT) < kLCFCompWindow);
+
+    if (!interacting && stabilizing) {
+        // A comment landed recently — pin the reading anchor to its captured screen position for the
+        // whole window. NEVER re-seed here, even if the anchor is momentarily not found (re-seeding
+        // mid-animation would bake in the bounce); the next non-stabilizing frame recovers it.
+        NSString *fn = objc_getAssociatedObject(vc, kLCFReadAnchorFNKey);
+        NSNumber *deltaN = LCFNum(vc, kLCFReadDeltaKey);
+        CGFloat cy;
+        if (fn && deltaN && LCFContentYForVisibleComment(vc, tv, fn, &cy)) {
+            CGFloat desired = cy - deltaN.doubleValue;    // keep (contentY - offset) constant
+            if (fabs(off - desired) > kLCFDriftThreshold) {
+                [tv setContentOffset:CGPointMake(tv.contentOffset.x, desired) animated:NO];
+            }
+        }
+        return;
+    }
+    // Actively scrolling, or at rest between inserts: re-seed the reference to the user's position.
+    NSString *fn; CGFloat cy;
+    if (LCFFirstVisibleCommentInfo(vc, tv, &fn, &cy)) {
+        LCFSet(vc, kLCFReadAnchorFNKey, fn);
+        LCFSet(vc, kLCFReadDeltaKey, @(cy - off));
+    }
+}
+
+// MARK: - per-frame follow holder (CADisplayLink)
+//
+// Apollo's comments table is an ASTableNode and does NOT forward UIScrollViewDelegate callbacks to
+// the VC — scrollViewDidScroll: / scrollViewWillBeginDragging: never fire here (proven on device).
+// So the smooth "hold the newest at the top" + "unlock when the user scrolls away" logic runs from
+// a display link, reading tv.contentOffset / isDragging directly every frame. Only acts while LOCKED.
+//
+// "Bar = lock" model (the user's design): at the live edge (action bar visible at top) you are LOCKED
+// and the newest stays pinned to the top as comments flow in (no bounce). Any real scroll away —
+// direct finger drag OR an indirect trackpad/wheel scroll — UNLOCKS so you keep your place and the
+// "N new comments" badge takes over; we never force you back. Re-lock by scrolling back to the edge
+// (handled in the poll) or tapping the badge.
+static void LCFFollowFrame(UIViewController *vc) {
+    if (!vc || !sLiveCommentsFollow) return;
+    if (vc.presentedViewController) return;              // compose/share sheet up — stand down
+    if (!LCFIsLive(vc) || LCFIsIsolatedThread(vc)) return;
+    if (!LCFBool(vc, kLCFEvalKey)) return;               // wait for the poll's enable jump before judging
+    UITableView *tv = LCFTableView(vc);
+    if (!tv) return;
+
+    double now = CACurrentMediaTime();
+    double h = tv.contentSize.height;
+    BOOL grew = h > [LCFNum(vc, kLCFSDSHKey) doubleValue] + 1.0;   // a comment landed (content grew)
+    LCFSet(vc, kLCFSDSHKey, @(h));
+    if (grew) LCFSet(vc, kLCFCompTimeKey, @(now));       // open the smooth-hold window (both modes)
+
+    if (!LCFBool(vc, kLCFFollowKey)) {                   // UNLOCKED: hold the reading position steady
+        LCFStabilizeReading(vc, tv);
+        return;
+    }
+
+    // Recompute the edge every frame so it tracks header relayout / nav-bar+toolbar inset changes;
+    // since UIKit shifts contentOffset with the inset, edge and off move together and |off-edge|
+    // stays steady (no false unlock from chrome hide/show).
+    CGFloat edge = LCFLiveEdgeOffset(vc, tv);
+    LCFSet(vc, kLCFCachedEdgeKey, @(edge));
+    CGFloat off = tv.contentOffset.y;
+
+    double compT = [LCFNum(vc, kLCFCompTimeKey) doubleValue];
+    BOOL holding = (compT > 0 && (now - compT) < kLCFCompWindow);  // absorbing a fresh comment (batch)
+    // Right after enabling, Apollo refetches/reorders the whole list and can reset scroll to the top.
+    double evalT = [LCFNum(vc, kLCFEvalTimeKey) doubleValue];
+    BOOL withinSettle = (evalT > 0 && (now - evalT) < kLCFSettleTime);
+    BOOL interacting = tv.isDragging || tv.isTracking || tv.isDecelerating;  // direct touch or its momentum
+
+    if (interacting) {
+        // A real finger drag/flick of any meaningful size means "let me move" — unlock, never clamp.
+        if (fabs(off - edge) > kLCFUnlockMove) LCFUnlock(vc, "touch");
+        return;
+    }
+    if (withinSettle) {
+        // Enable reflow: hold at the edge no matter HOW far off drifts (Apollo often resets scroll to
+        // the very top, or a big reorder moves it). Clamp both directions so the lock sticks through it.
+        if (fabs(off - edge) > kLCFDriftThreshold) LCFClampToEdge(vc, tv, edge);
+        return;
+    }
+    if (holding) {
+        // A comment — or a whole batch of them — just landed; Apollo compensates the offset upward,
+        // which would push the newest off the top. Even a 12-comment batch (a large jump) is a comment
+        // arrival, NOT a user scroll, so counteract it with no size cap: pin to the edge so the newest
+        // flows in at the top and older slide down.
+        if (off > edge + kLCFDriftThreshold) LCFClampToEdge(vc, tv, edge);
+        return;
+    }
+    // Settled, no fresh comment, not touching: any offset move is an indirect (trackpad/wheel) user
+    // scroll — unlock and let the badge take over. (A size cap here is wrong: a big jump with no
+    // content growth is still a user scroll, and a big jump WITH growth was handled above.)
+    if (fabs(off - edge) > kLCFExitThreshold) LCFUnlock(vc, "scroll");
+}
+
+// MARK: - poll loop (state machine: enable jump, edge cache, badge, re-lock)
 
 static void LCFScheduleTick(__weak UIViewController *weakVC, long gen);
 
@@ -501,9 +715,8 @@ static void LCFTick(__weak UIViewController *weakVC, long gen) {
     if (!curGen || curGen.longValue != gen) return;     // superseded by a newer appear/disappear
     if (!sLiveCommentsFollow) return;                   // toggled off — stop the loop
 
-    // A compose/edit/share sheet (or any modal) is presented over the comments view — it stays
-    // alive underneath, but we must not pin/scroll it or touch the pill while the user is typing.
-    // Stand down and resume when the sheet dismisses (viewDidAppear restarts a fresh poll then).
+    // A compose/edit/share sheet (or any modal) is presented over the comments view — stand down so
+    // we don't touch the pill while the user is typing. Resume when it dismisses.
     if (vc.presentedViewController) {
         LCFScheduleTick(weakVC, gen);
         return;
@@ -521,52 +734,79 @@ static void LCFTick(__weak UIViewController *weakVC, long gen) {
         return;
     }
 
-    // First time we see live mode for this appearance: pick follow/read by real proximity to
-    // the live edge (Apollo opens a thread already scrolled to the comment list top).
+    // First time live for this appearance: JUMP to the live edge (newest comment + action bar) and
+    // LOCK. Enabling Live Update should take you straight to the newest.
     if (!LCFBool(vc, kLCFEvalKey)) {
         LCFSet(vc, kLCFEvalKey, @YES);
-        // Compute the live edge offset once and reuse it for both the proximity check and the
-        // log line below — each LCFLiveEdgeOffset call enumerates ASTableNode rows.
-        CGFloat edge = LCFLiveEdgeOffset(vc, tv);
-        BOOL atEdge = fabs(tv.contentOffset.y - edge) <= kLCFEdgeThreshold;
-        LCFSet(vc, kLCFFollowKey, @(atEdge));
-        // Don't snapshot an anchor here: selecting Live Update rebuilds the comment list, so
-        // any baseline captured now is stale. READ mode establishes it lazily once stable.
+        LCFSet(vc, kLCFFollowKey, @YES);
         LCFSet(vc, kLCFAnchorKey, nil);
-        ApolloLog(@"[LiveFollow] live detected — initial mode=%@ (offset=%.0f edge=%.0f)",
-                  atEdge ? @"FOLLOW" : @"READ", tv.contentOffset.y, edge);
-    }
-
-    // Never act while the user is touching/scrolling. Read the scroll view's own authoritative
-    // state rather than a self-managed flag (which could get stuck if an end-callback is missed).
-    if (tv.isTracking || tv.isDragging || tv.isDecelerating) {
+        LCFSet(vc, kLCFEvalTimeKey, @(CACurrentMediaTime()));
+        LCFSet(vc, kLCFSDSHKey, @(tv.contentSize.height));
+        CGFloat edge = LCFLiveEdgeOffset(vc, tv);
+        LCFSet(vc, kLCFCachedEdgeKey, @(edge));
+        LCFClampToEdge(vc, tv, edge);                   // jump to the latest + action bar now
+        ApolloLog(@"[LiveFollow] live detected — jump to edge + LOCK (edge=%.0f)", edge);
         LCFScheduleTick(weakVC, gen);
         return;
     }
 
-    // Track contentSize stability so READ mode only (re)establishes its baseline when the
-    // list isn't mid-rebuild.
-    double h = tv.contentSize.height;
-    NSNumber *lastHN = LCFNum(vc, kLCFLastHKey);
-    BOOL hStable = (lastHN != nil) && (fabs(h - lastHN.doubleValue) < 1.0);
-    LCFSet(vc, kLCFLastHKey, @(h));
+    CGFloat edge = LCFLiveEdgeOffset(vc, tv);
+    LCFSet(vc, kLCFCachedEdgeKey, @(edge));             // keep the cache warm for the pill tap
 
     if (LCFBool(vc, kLCFFollowKey)) {
-        LCFPinToEdge(vc);                               // keep newest at the top
-    } else if (LCFAtEdge(vc, tv)) {
-        LCFEnterFollow(vc);                             // user scrolled back up to the live edge
+        // LOCKED: the display link holds the offset; just keep any stale pill hidden.
+        if (!LCFWrap(vc).hidden) LCFHidePill(vc);
     } else {
-        LCFUpdatePill(vc, hStable);                     // recount new arrivals, show/hide pill
+        // UNLOCKED (READ). Re-lock if the user has come to rest back at the live edge, else update
+        // the badge. "At rest" can't use isDragging (indirect scrolls never set it), so detect a
+        // stable offset between ticks instead.
+        CGFloat off = tv.contentOffset.y;
+        CGFloat lastOff = [LCFNum(vc, kLCFLastOffKey) doubleValue];
+        BOOL stable = fabs(off - lastOff) < 2.0;
+        LCFSet(vc, kLCFLastOffKey, @(off));
+        CGFloat d = off - edge;                          // <0 above the comment top, >0 below it
+        if (stable && d <= kLCFReentryDown && d >= -kLCFReentryUp) {
+            LCFEnterFollow(vc);                          // back at the top → resume follow
+        } else {
+            LCFUpdatePill(vc);                           // count new arrivals, show/hide badge
+        }
     }
 
     LCFScheduleTick(weakVC, gen);
 }
 
 static void LCFScheduleTick(__weak UIViewController *weakVC, long gen) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kLCFPollInterval * NSEC_PER_SEC)),
+    // Poll faster during the post-enable settle window so the jump-to-live-edge snaps in promptly
+    // as the list loads; relax to the normal cadence once settled.
+    NSTimeInterval interval = kLCFPollInterval;
+    UIViewController *vc = weakVC;
+    if (vc) {
+        double evalT = [LCFNum(vc, kLCFEvalTimeKey) doubleValue];
+        if (evalT > 0 && (CACurrentMediaTime() - evalT) < kLCFSettleTime) interval = 0.12;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(interval * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         LCFTick(weakVC, gen);
     });
+}
+
+// MARK: - display link lifecycle
+
+static void LCFStopDisplayLink(UIViewController *vc) {
+    CADisplayLink *link = objc_getAssociatedObject(vc, kLCFDisplayLinkKey);
+    if (link) {
+        [link invalidate];   // also releases the link's retain on vc (breaks the retain cycle)
+        objc_setAssociatedObject(vc, kLCFDisplayLinkKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
+static void LCFStartDisplayLink(UIViewController *vc) {
+    LCFStopDisplayLink(vc);
+    CADisplayLink *link = [CADisplayLink displayLinkWithTarget:vc selector:@selector(apolloLCFDisplayTick:)];
+    // Common modes so it keeps firing during scroll tracking (UITrackingRunLoopMode), where we must
+    // still be able to hold the offset / detect a scroll-away.
+    [link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+    objc_setAssociatedObject(vc, kLCFDisplayLinkKey, link, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 // MARK: - hooks
@@ -582,18 +822,24 @@ static void LCFScheduleTick(__weak UIViewController *weakVC, long gen) {
     LCFSet(self, kLCFFollowKey, @YES);
     LCFSet(self, kLCFEvalKey, @NO);
     LCFSet(self, kLCFAnchorKey, nil);
-    LCFSet(self, kLCFLastHKey, nil);
+    LCFSet(self, kLCFEvalTimeKey, nil);
     LCFSet(self, kLCFCountKey, @(-2));
+    LCFSet(self, kLCFSDSHKey, @(0));
+    LCFSet(self, kLCFCachedEdgeKey, nil);
+    LCFSet(self, kLCFCompTimeKey, @(0));
+    LCFSet(self, kLCFLastOffKey, @(0));
     UIView *wrap = LCFWrap((UIViewController *)self);
     if (wrap) wrap.hidden = YES;
 
     LCFScheduleTick((UIViewController *)self, gen);
+    LCFStartDisplayLink((UIViewController *)self);   // per-frame follow holder
 }
 
 - (void)viewDidDisappear:(BOOL)animated {
     %orig;
     if (!sLiveCommentsFollow) return;
     LCFSet(self, kLCFGenKey, @(++gLCFGen));   // supersede the poll loop
+    LCFStopDisplayLink((UIViewController *)self);
     LCFHidePill((UIViewController *)self);
     LCFSet(self, kLCFAnchorKey, nil);
 }
@@ -608,17 +854,12 @@ static void LCFScheduleTick(__weak UIViewController *weakVC, long gen) {
     if (!LCFWrap((UIViewController *)self).hidden) LCFLayoutPill((UIViewController *)self);
 }
 
-- (void)scrollViewWillBeginDragging:(id)scrollView {
-    %orig;
-    if (!sLiveCommentsFollow) return;
-    UIViewController *vc = (UIViewController *)self;
-    // Snapshot the anchor only on the follow->read transition, so dragging again while already
-    // reading keeps the original "new since I left" baseline. (The poll skips pinning whenever
-    // the scroll view reports it's tracking/dragging/decelerating, so no interacting flag here.)
-    if (LCFIsLive(vc) && !LCFIsIsolatedThread(vc) && LCFBool(vc, kLCFFollowKey)) {
-        LCFSet(vc, kLCFFollowKey, @NO);
-        LCFSnapshotAnchor(vc);
-    }
+// Per-frame follow holder. (Apollo's ASTableNode does NOT forward UIScrollViewDelegate methods to
+// this VC — scrollViewDidScroll: / scrollViewWillBeginDragging: never fire — so we drive the hold
+// and the scroll-away detection from a CADisplayLink instead. See LCFFollowFrame.)
+%new
+- (void)apolloLCFDisplayTick:(CADisplayLink *)link {
+    LCFFollowFrame((UIViewController *)self);
 }
 
 - (void)tintColorDidChange {
