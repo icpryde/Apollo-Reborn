@@ -22,6 +22,9 @@ NSInteger sReadPostMaxCount = 0;
 
 NSInteger sUnmuteCommentsVideos = 0; // 0=Default, 1=Remember from Full Screen, 2=Always
 
+BOOL sVideoHoldSpeedEnabled = YES;   // effective default ON via registerDefaults (UDKeyVideoHoldSpeedEnabled)
+float sVideoHoldSpeed = 2.0f;        // effective default 2.0× via registerDefaults (UDKeyVideoHoldSpeed)
+
 BOOL sProxyImgurDDG = NO;
 BOOL sShowUserAvatars = NO;
 BOOL sUseProfileAvatarTabIcon = NO;
@@ -82,3 +85,13 @@ NSDictionary<NSString *, NSDictionary *> *sTagFilterSubredditOverrides = nil;
 
 NSDictionary<NSString *, NSDictionary *> *sPostFilterSubreddits = nil;
 NSArray<NSString *> *sPostFilterNameSubstrings = nil;
+
+float ApolloSanitizedHoldSpeed(float value) {
+    // The exact speeds offered by the picker (mirrors the video player's menu,
+    // minus 1.0× — holding at normal speed would be a no-op).
+    static const float kSupported[] = { 0.25f, 0.5f, 0.75f, 1.25f, 1.5f, 2.0f };
+    for (size_t i = 0; i < sizeof(kSupported) / sizeof(kSupported[0]); i++) {
+        if (fabsf(value - kSupported[i]) < 0.001f) return kSupported[i];
+    }
+    return 2.0f;   // unset (0) / corrupt / unsupported → default boost
+}

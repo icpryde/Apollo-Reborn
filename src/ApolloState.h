@@ -23,6 +23,27 @@ extern NSInteger sReadPostMaxCount;
 // 0 = Default (off), 1 = Remember from Full Screen, 2 = Always
 extern NSInteger sUnmuteCommentsVideos;
 
+// "Hold for Video Speed": when ON (default), press-and-hold the right side of a
+// fullscreen video to play it at sVideoHoldSpeed while held; release restores the
+// prior rate. When OFF the right side behaves like the rest of the player (normal
+// long-press menu). sVideoHoldSpeed is one of 0.25/0.5/0.75/1.25/1.5/2.0 (default
+// 2.0×). Both default via registerDefaults. See ApolloVideoHoldSpeed.xm.
+extern BOOL sVideoHoldSpeedEnabled;
+extern float sVideoHoldSpeed;
+// Snap an arbitrary stored value to the nearest supported hold speed; falls back
+// to 2.0× for an unset/corrupt/out-of-set value. Keeps the runtime, the load
+// paths, and the picker agreeing on exactly the six offered speeds. Wrapped in
+// extern "C" so the ObjC++ (.xm) callers and the ObjC (.m) definition agree on the
+// unmangled symbol name (the extern *variables* above need no guard — global
+// variable names aren't C++-mangled).
+#ifdef __cplusplus
+extern "C" {
+#endif
+float ApolloSanitizedHoldSpeed(float value);
+#ifdef __cplusplus
+}
+#endif
+
 extern BOOL sProxyImgurDDG;
 extern BOOL sShowUserAvatars;
 extern BOOL sUseProfileAvatarTabIcon;

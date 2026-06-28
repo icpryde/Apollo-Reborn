@@ -38,6 +38,13 @@ static NSString *const UDKeyReadPostMaxCount = @"ReadPostMaxCount";
 static NSString *const UDKeyShowRecentlyReadThumbnails = @"ShowRecentlyReadThumbnails";
 static NSString *const UDKeyPreferredGIFFallbackFormat = @"PreferredGIFFallbackFormat";
 static NSString *const UDKeyUnmuteCommentsVideos = @"UnmuteCommentsVideos";
+// "Hold for Video Speed": press-and-hold the right side of a fullscreen video to
+// play at a chosen speed while held. Master toggle (default YES via
+// registerDefaults — preserves the original always-on behaviour) and the speed
+// applied while held (one of 0.25/0.5/0.75/1.25/1.5/2.0; default 2.0×). See
+// ApolloVideoHoldSpeed.xm.
+static NSString *const UDKeyVideoHoldSpeedEnabled = @"VideoHoldSpeedEnabled";
+static NSString *const UDKeyVideoHoldSpeed = @"VideoHoldSpeed";
 static NSString *const UDKeyOpenLinksInSteamApp = @"OpenLinksInSteamApp";
 static NSString *const UDKeyCollapsePinnedComments = @"CollapsePinnedComments";
 static NSString *const UDKeyShowDeletedComments = @"ShowDeletedComments";

@@ -59,6 +59,24 @@ static NSInteger ApolloMediaPhysicalRow(NSInteger logicalRow) {
     return logicalRow;
 }
 
+// The six speeds the "Hold for Video Speed" picker offers, in display order. They
+// mirror the video player's own speed menu minus 1.0× (holding at normal speed
+// would be a no-op). ApolloSanitizedHoldSpeed() guards the stored value to this set.
+static const float kVideoHoldSpeeds[] = { 0.25f, 0.5f, 0.75f, 1.25f, 1.5f, 2.0f };
+
+// "0.25×" / "0.5×" / … / "2×", using the U+00D7 multiplication sign Apollo uses.
+static NSString *ApolloVideoHoldSpeedTitle(float speed) {
+    NSString *num;
+    if (fabsf(speed - 0.25f) < 0.001f)      num = @"0.25";
+    else if (fabsf(speed - 0.5f)  < 0.001f) num = @"0.5";
+    else if (fabsf(speed - 0.75f) < 0.001f) num = @"0.75";
+    else if (fabsf(speed - 1.25f) < 0.001f) num = @"1.25";
+    else if (fabsf(speed - 1.5f)  < 0.001f) num = @"1.5";
+    else if (fabsf(speed - 2.0f)  < 0.001f) num = @"2";
+    else                                    num = [NSString stringWithFormat:@"%g", speed];
+    return [num stringByAppendingFormat:@"%C", (unichar)0x00D7];
+}
+
 // Canonical (mode-on) row indices within SectionAPIKeys. The Web Session Login
 // row only exists while API-Key-Free Mode is on; with it off, that row is absent
 // and every row at or below it slides up one slot. Mirrors the Media-section
@@ -540,9 +558,10 @@ typedef NS_ENUM(NSInteger, Tag) {
         case SectionApolloAI: return 1;
         case SectionLinkPreviews: return 1;
         // Media base rows (the three "Rich Link Previews" rows moved out to their
-        // own SectionLinkPreviews) plus the chat inline-media toggle, minus the two
-        // inline-dependent rows when off.
-        case SectionMedia: return 12 + (sEnableInlineImages ? 0 : -kApolloMediaInlineDependentRows);
+        // own SectionLinkPreviews) plus the chat inline-media toggle and the
+        // "Hold for Video Speed" toggle, minus the two inline-dependent rows when
+        // off, plus the hold-speed picker (logical row 13) when that toggle is on.
+        case SectionMedia: return 13 + (sEnableInlineImages ? 0 : -kApolloMediaInlineDependentRows) + (sVideoHoldSpeedEnabled ? 1 : 0);
         case SectionSubreddits: return 10 - (sSubredditListEnhancements ? 0 : 1) - (sCommunityHighlights ? 0 : 1);
         case SectionNotificationBackend: return 3; // URL + Registration Token + Test Connection
         case SectionAbout: return 5; // GitHub + Reddit + Thanks To + Export Logs + Version
@@ -1133,6 +1152,28 @@ typedef NS_ENUM(NSInteger, Tag) {
                                             label:@"Inline Media in Chat"
                                                on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyEnableChatMedia]
                                            action:@selector(chatMediaSwitchToggled:)];
+        case 12:
+            // Master toggle for "Hold for Video Speed". When on, the hold-speed
+            // picker (logical row 13) is shown below; when off, the right side of a
+            // fullscreen video keeps Apollo's normal long-press menu. The gesture is
+            // explained in the section footer, matching the sibling Media toggles
+            // (which are plain switches with no inline subtitle).
+            return [self switchCellWithIdentifier:@"Cell_Media_HoldSpeed"
+                                            label:@"Hold for Video Speed"
+                                               on:sVideoHoldSpeedEnabled
+                                           action:@selector(videoHoldSpeedSwitchToggled:)];
+        case 13: {
+            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_Media_HoldSpeedValue"];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:@"Cell_Media_HoldSpeedValue"];
+                cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+                cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+            }
+            cell.textLabel.text = @"Hold Speed";
+            cell.detailTextLabel.text = [self videoHoldSpeedText];
+            cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+            return cell;
+        }
         default: return [[UITableViewCell alloc] init];
     }
 }
@@ -1585,6 +1626,8 @@ typedef NS_ENUM(NSInteger, Tag) {
             [self presentInlineImageAlignmentSheetFromSourceView:cell];
         } else if (row == 6) {
             [self presentAutoplayInlineGIFModeSheetFromSourceView:cell];
+        } else if (row == 13) {
+            [self presentVideoHoldSpeedSheetFromSourceView:cell];
         }
     } else if (indexPath.section == SectionNotificationBackend && indexPath.row == 2) {
         [self testNotificationBackendConnection];
@@ -1660,7 +1703,7 @@ typedef NS_ENUM(NSInteger, Tag) {
     if (indexPath.section == SectionLinkPreviews) return YES;
     if (indexPath.section == SectionMedia) {
         NSInteger row = ApolloMediaLogicalRow(indexPath.row);
-        return (row == 0 || row == 1 || row == 2 || row == 5 || row == 6);
+        return (row == 0 || row == 1 || row == 2 || row == 5 || row == 6 || row == 13);
     }
     if (indexPath.section == SectionAbout && (indexPath.row == 0 || indexPath.row == 1 || indexPath.row == 2 || indexPath.row == 3)) return YES;
     if (indexPath.section == SectionNotificationBackend && indexPath.row == 2) return YES;
@@ -2330,6 +2373,62 @@ typedef NS_ENUM(NSInteger, Tag) {
     [self.tableView reloadRowsAtIndexPaths:@[autoplayRow] withRowAnimation:UITableViewRowAnimationNone];
 }
 
+#pragma mark - Hold for Video Speed
+
+- (void)videoHoldSpeedSwitchToggled:(UISwitch *)sender {
+    BOOL wasOn = sVideoHoldSpeedEnabled;
+    sVideoHoldSpeedEnabled = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sVideoHoldSpeedEnabled forKey:UDKeyVideoHoldSpeedEnabled];
+    if (sVideoHoldSpeedEnabled == wasOn) return;
+    // The "Hold Speed" picker (logical row 13) is the last Media row and is shown
+    // only while this toggle is on. Insert/delete it so the row counts stay
+    // consistent. ApolloMediaPhysicalRow(13) accounts for the inline-dependent gap.
+    NSIndexPath *pickerPath = [NSIndexPath indexPathForRow:ApolloMediaPhysicalRow(13) inSection:SectionMedia];
+    if (sVideoHoldSpeedEnabled) {
+        [self.tableView insertRowsAtIndexPaths:@[pickerPath] withRowAnimation:UITableViewRowAnimationFade];
+    } else {
+        [self.tableView deleteRowsAtIndexPaths:@[pickerPath] withRowAnimation:UITableViewRowAnimationFade];
+    }
+}
+
+- (NSString *)videoHoldSpeedText {
+    return ApolloVideoHoldSpeedTitle(sVideoHoldSpeed);
+}
+
+- (void)setVideoHoldSpeed:(float)speed {
+    sVideoHoldSpeed = ApolloSanitizedHoldSpeed(speed);
+    [[NSUserDefaults standardUserDefaults] setFloat:sVideoHoldSpeed forKey:UDKeyVideoHoldSpeed];
+    NSIndexPath *pickerPath = [NSIndexPath indexPathForRow:ApolloMediaPhysicalRow(13) inSection:SectionMedia];
+    if ([[self.tableView indexPathsForVisibleRows] containsObject:pickerPath]) {
+        [self.tableView reloadRowsAtIndexPaths:@[pickerPath] withRowAnimation:UITableViewRowAnimationNone];
+    }
+}
+
+- (void)presentVideoHoldSpeedSheetFromSourceView:(UIView *)sourceView {
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Hold Speed"
+                                                                   message:@"Speed applied while you hold the right side of a fullscreen video."
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+
+    for (size_t i = 0; i < sizeof(kVideoHoldSpeeds) / sizeof(kVideoHoldSpeeds[0]); i++) {
+        float speed = kVideoHoldSpeeds[i];
+        BOOL isCurrent = fabsf(sVideoHoldSpeed - speed) < 0.001f;
+        NSString *title = isCurrent ? [ApolloVideoHoldSpeedTitle(speed) stringByAppendingString:@" (Current)"]
+                                    : ApolloVideoHoldSpeedTitle(speed);
+        [sheet addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+            [self setVideoHoldSpeed:speed];
+        }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+
+    UIPopoverPresentationController *popover = sheet.popoverPresentationController;
+    if (popover && sourceView) {
+        popover.sourceView = sourceView;
+        popover.sourceRect = sourceView.bounds;
+    }
+
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
 - (void)promptClearCustomSubredditBannersFromSourceView:(__unused UIView *)sourceView {
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Clear Custom Banners & Icons?"
                                                                    message:@"Locally saved custom subreddit banner and icon images will be removed. Official Reddit art will show again where available."
@@ -2622,6 +2721,8 @@ static void ApolloReplayValetKeychainItems(NSArray<NSDictionary *> *items) {
     sEnableFlairColors = [defaults boolForKey:UDKeyEnableFlairColors];
     sPreferredGIFFallbackFormat = ([defaults integerForKey:UDKeyPreferredGIFFallbackFormat] == 0) ? 0 : 1;
     sUnmuteCommentsVideos = [defaults integerForKey:UDKeyUnmuteCommentsVideos];
+    sVideoHoldSpeedEnabled = [defaults boolForKey:UDKeyVideoHoldSpeedEnabled];
+    sVideoHoldSpeed = ApolloSanitizedHoldSpeed([defaults floatForKey:UDKeyVideoHoldSpeed]);
     sImageUploadProvider = [defaults integerForKey:UDKeyImageUploadProvider];
     sLinkPreviewCardColor = [defaults integerForKey:UDKeyLinkPreviewCardColor];
     if (sLinkPreviewCardColor < ApolloLinkPreviewCardColorNeutral || sLinkPreviewCardColor > ApolloLinkPreviewCardColorSlate) {
