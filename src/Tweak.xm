@@ -1474,7 +1474,7 @@ static void initializeRandomSources() {
                                     UDKeyImageUploadProvider: @(ImageUploadProviderImgur),
                                     UDKeyShowUserAvatars: @NO,
                                     UDKeyUseProfileAvatarTabIcon: @NO,
-                                    UDKeySocialLinksInProfile: @YES,
+                                    UDKeyShowDetailedProfiles: @YES,
                                     UDKeyShowSubredditHeaders: @NO,
                                     UDKeyCommunityHighlights: @NO,
                                     UDKeyCommunityHighlightsWeb: @NO,
@@ -1578,7 +1578,7 @@ static void initializeRandomSources() {
     sImageUploadProvider = [[NSUserDefaults standardUserDefaults] integerForKey:UDKeyImageUploadProvider];
     sShowUserAvatars = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowUserAvatars];
     sUseProfileAvatarTabIcon = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyUseProfileAvatarTabIcon];
-    sSocialLinksInProfile = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeySocialLinksInProfile];
+    sShowDetailedProfiles = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowDetailedProfiles];
     sShowSubredditHeaders = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowSubredditHeaders];
     sCommunityHighlights = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyCommunityHighlights];
     sCommunityHighlightsWeb = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyCommunityHighlightsWeb];

@@ -26,12 +26,14 @@ extern NSInteger sUnmuteCommentsVideos;
 extern BOOL sProxyImgurDDG;
 extern BOOL sShowUserAvatars;
 extern BOOL sUseProfileAvatarTabIcon;
-// When ON, a redditor's profile social links (Buy Me a Coffee, Instagram, X, …) are
-// shown in the profile header between the username and bio: a tappable pill for a
-// single link, or a row of brand badges that opens a slide-up sheet for several.
-// Rendered inside the tweak's custom profile header, so it needs sShowUserAvatars ON.
-// See ApolloProfileSocialLinks.{h,m}.
-extern BOOL sSocialLinksInProfile;
+// When ON (default), profile pages show Reborn's detailed profile — the banner,
+// large avatar/snoovatar, display name, bio, and the Social Links band (Buy Me a
+// Coffee, Instagram, X, …). When OFF, profiles revert to Apollo's compact stock
+// layout — the detailed header is not installed and any existing one is torn down.
+// Independent of sShowUserAvatars (inline avatars). The Social Links band lives
+// inside this header, so it is gated on this same flag. Default ON via
+// registerDefaults. See ApolloUserAvatars.xm and ApolloProfileSocialLinks.{h,m}.
+extern BOOL sShowDetailedProfiles;
 extern BOOL sShowSubredditHeaders;
 // When ON, a horizontally-scrolling "Community Highlights" carousel of the
 // subreddit's pinned/stickied posts is shown at the top of the feed (mirrors

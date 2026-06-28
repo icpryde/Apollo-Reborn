@@ -25,7 +25,7 @@ NSInteger sUnmuteCommentsVideos = 0; // 0=Default, 1=Remember from Full Screen, 
 BOOL sProxyImgurDDG = NO;
 BOOL sShowUserAvatars = NO;
 BOOL sUseProfileAvatarTabIcon = NO;
-BOOL sSocialLinksInProfile = YES;
+BOOL sShowDetailedProfiles = YES;   // effective default ON via registerDefaults (UDKeyShowDetailedProfiles)
 BOOL sShowSubredditHeaders = NO;
 BOOL sCommunityHighlights = NO;
 BOOL sCommunityHighlightsWeb = NO;

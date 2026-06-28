@@ -1121,10 +1121,13 @@ typedef NS_ENUM(NSInteger, Tag) {
                                                on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyUseProfileAvatarTabIcon]
                                            action:@selector(profileTabAvatarSwitchToggled:)];
         case 10:
-            return [self switchCellWithIdentifier:@"Cell_Media_SocialLinks"
-                                            label:@"Social Links in Profile"
-                                               on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeySocialLinksInProfile]
-                                           action:@selector(socialLinksInProfileSwitchToggled:)];
+            // Single toggle for Reborn's detailed profile page: banner, large
+            // avatar/snoovatar, display name, bio, and the Social Links band (all of
+            // which live in the custom header). Off → Apollo's compact stock profile.
+            return [self switchCellWithIdentifier:@"Cell_Media_DetailedProfiles"
+                                            label:@"Show Detailed Profiles"
+                                               on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowDetailedProfiles]
+                                           action:@selector(showDetailedProfilesSwitchToggled:)];
         case 11:
             return [self switchCellWithIdentifier:@"Cell_Media_ChatMedia"
                                             label:@"Inline Media in Chat"
@@ -2171,9 +2174,15 @@ typedef NS_ENUM(NSInteger, Tag) {
     [[NSNotificationCenter defaultCenter] postNotificationName:@"ApolloProfileTabAvatarIconChangedNotification" object:nil];
 }
 
-- (void)socialLinksInProfileSwitchToggled:(UISwitch *)sender {
-    sSocialLinksInProfile = sender.isOn;
-    [[NSUserDefaults standardUserDefaults] setBool:sSocialLinksInProfile forKey:UDKeySocialLinksInProfile];
+- (void)showDetailedProfilesSwitchToggled:(UISwitch *)sender {
+    // One toggle for the whole detailed profile (header + banner + avatar + bio +
+    // social links). The avatars-toggle notification is observed in ApolloUserAvatars.xm
+    // and re-walks visible profile controllers, installing or tearing down the header
+    // per the new value; the social-links notification refreshes the band (gated on the
+    // same flag). Both apply live, no relaunch.
+    sShowDetailedProfiles = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sShowDetailedProfiles forKey:UDKeyShowDetailedProfiles];
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"ApolloUserAvatarsToggleChangedNotification" object:nil];
     [[NSNotificationCenter defaultCenter] postNotificationName:ApolloSocialLinksToggleChangedNotification object:nil];
 }
 

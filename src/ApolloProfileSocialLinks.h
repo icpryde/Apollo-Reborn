@@ -44,7 +44,8 @@
 - (void)refresh;
 @end
 
-// YES when the "Social Links in Profile" toggle is on (reads sSocialLinksInProfile).
+// YES when "Show Detailed Profiles" is on (reads sShowDetailedProfiles) — the Social
+// Links band is part of the detailed profile, so it shares that toggle.
 FOUNDATION_EXPORT BOOL ApolloProfileSocialLinksEnabled(void);
 
 // Posted by Settings when the toggle flips; the band observes it to reload.

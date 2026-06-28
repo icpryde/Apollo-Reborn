@@ -83,6 +83,7 @@ static BOOL ApolloProfileUsernameIsLoggedInAccount(NSString *username);
 static void ApolloProfileOpenRedditProfileEditor(void);
 static void ApolloProfileSetSnoovatarMode(ApolloProfileHeaderView *header, BOOL showSnoovatar);
 static void ApolloProfileLoadImages(ApolloProfileHeaderView *header, NSString *username, BOOL forceRefresh);
+static void ApolloProfileRemoveHeader(id viewControllerObject, UITableView *tableView);
 static void ApolloProfileRefreshControllersForUsername(NSString *username);
 static void ApolloProfileApplyTabAvatarForController(UITabBarController *tabBarController);
 static void ApolloProfileApplyTabAvatarForVisibleWindows(void);
@@ -1569,6 +1570,46 @@ static void ApolloProfileInstallUsernameCopyInteraction(UIViewController *viewCo
     }
 }
 
+// Tear down the custom profile header and restore Apollo's native table header.
+// Used when "Show Detailed Profiles" is OFF (either toggled off live, or already
+// off when a profile page appears) so the page falls back to Apollo's stock layout.
+// Safe to call repeatedly: once the wrapper is removed and the per-VC state cleared,
+// subsequent calls are a cheap no-op.
+static void ApolloProfileRemoveHeader(id viewControllerObject, UITableView *tableView) {
+    if (!viewControllerObject) return;
+
+    UIView *wrappedHeader = objc_getAssociatedObject(viewControllerObject, kApolloProfileWrappedHeaderKey);
+    UIView *originalHeader = objc_getAssociatedObject(viewControllerObject, kApolloProfileOriginalHeaderKey);
+
+    // The table may currently host our wrapper even if our per-VC refs went stale
+    // (fresh controller, reused VC, etc.) — detect it via the wrapper marker.
+    UIView *currentTableHeader = tableView.tableHeaderView;
+    if (currentTableHeader && objc_getAssociatedObject(currentTableHeader, kApolloProfileWrapperMarkerKey)) {
+        wrappedHeader = currentTableHeader;
+        originalHeader = objc_getAssociatedObject(currentTableHeader, kApolloProfileOriginalHeaderKey) ?: originalHeader;
+    }
+
+    if (wrappedHeader && tableView.tableHeaderView == wrappedHeader) {
+        // Pull Apollo's native header back out of our wrapper, reset its frame to the
+        // origin, and reinstate it as the table header (nil if Apollo had none — that
+        // is the stock look for AsyncDisplayKit profiles whose stats live in cells).
+        if (originalHeader) {
+            CGFloat width = tableView.bounds.size.width > 0 ? tableView.bounds.size.width : originalHeader.frame.size.width;
+            [originalHeader removeFromSuperview];
+            originalHeader.frame = CGRectMake(0.0, 0.0, width, originalHeader.frame.size.height);
+        }
+        tableView.tableHeaderView = originalHeader;  // nil is valid — clears the header
+        NSString *className = NSStringFromClass([(UIViewController *)viewControllerObject class]);
+        ApolloLog(@"[UserAvatars] Removed profile header (toggle off) class=%@ vc=%p native=%@", className, viewControllerObject, originalHeader ? NSStringFromClass([originalHeader class]) : @"nil");
+    }
+
+    // Clear all per-VC state so a later re-enable installs a fresh header cleanly.
+    objc_setAssociatedObject(viewControllerObject, kApolloProfileHeaderViewKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(viewControllerObject, kApolloProfileWrappedHeaderKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(viewControllerObject, kApolloProfileOriginalHeaderKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(viewControllerObject, kApolloProfileUsernameKey, nil, OBJC_ASSOCIATION_COPY_NONATOMIC);
+}
+
 static void ApolloProfileInstallOrUpdateHeader(id viewControllerObject) {
     if (![viewControllerObject isKindOfClass:[UIViewController class]]) return;
     UIViewController *viewController = (UIViewController *)viewControllerObject;
@@ -1578,6 +1619,14 @@ static void ApolloProfileInstallOrUpdateHeader(id viewControllerObject) {
         if (ApolloViewControllerLooksProfileRelated(viewController)) {
             ApolloLog(@"[UserAvatars] Profile header skipped class=%@ vc=%p reason=no-table", className, viewControllerObject);
         }
+        return;
+    }
+
+    // "Show Detailed Profiles" OFF → revert to Apollo's stock profile layout. Tear
+    // down anything we previously installed and bail before building/refreshing it.
+    // (Independent of sShowUserAvatars, which only governs the inline username avatars.)
+    if (!sShowDetailedProfiles) {
+        ApolloProfileRemoveHeader(viewControllerObject, tableView);
         return;
     }
 

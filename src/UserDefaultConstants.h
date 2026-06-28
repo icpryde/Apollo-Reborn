@@ -48,7 +48,14 @@ static NSString *const UDKeyProxyImgurDDG = @"ProxyImgurDDG";
 static NSString *const UDKeyImageUploadProvider = @"ImageUploadProvider";
 static NSString *const UDKeyShowUserAvatars = @"ShowUserAvatars";
 static NSString *const UDKeyUseProfileAvatarTabIcon = @"UseProfileAvatarTabIcon";
-static NSString *const UDKeySocialLinksInProfile = @"SocialLinksInProfile";
+// When ON (default), profile pages show Reborn's detailed profile — the banner,
+// large avatar/snoovatar, display name, bio, and the Social Links band. When OFF,
+// the profile page reverts to Apollo's compact stock layout: the detailed header is
+// not installed, and any header already on screen is torn down (restoring Apollo's
+// native table header). Independent of "Show User Profile Pictures"
+// (UDKeyShowUserAvatars), which governs the inline avatars next to usernames.
+// See ApolloUserAvatars.xm and ApolloProfileSocialLinks.m. Default YES.
+static NSString *const UDKeyShowDetailedProfiles = @"ShowDetailedProfiles";
 static NSString *const UDKeyShowSubredditHeaders = @"ShowSubredditHeaders";
 static NSString *const UDKeyCommunityHighlights = @"CommunityHighlights";
 static NSString *const UDKeyCommunityHighlightsWeb = @"CommunityHighlightsWeb";
