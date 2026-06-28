@@ -22,6 +22,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import "ApolloCommon.h"
+#import "ApolloHostedVideo.h"
 
 // ASSizeRange is { CGSize min; CGSize max; }. The rest of the repo matches the
 // -layoutSpecThatFits: selector ABI with `struct CDStruct_90e057aa` from the
@@ -550,6 +551,68 @@ static void ApolloShareGalleryPrepareSingle(id previewNode, id link) {
         objc_setAssociatedObject(previewNode, &kApolloShareGalleryStateKey,
                                  @(ApolloShareGalleryStateApplied),
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return;
+    }
+
+    // External hosted video (Streamable / Redgifs): these carry no RDKVideo, so
+    // ApolloShareLinkHasVideo is NO and Apollo shows its compact link card with the
+    // host's scraped title (e.g. "Watch ssstwitter…"). Resolve the poster + true
+    // size from the host API and install it full-width — dropping the link card —
+    // so the share card matches the post. ApolloShareAsVideo then composites the
+    // clip over this correctly-sized still (no crop). Resolution is async (an API
+    // call), unlike the native poster path below, so it has its own flow.
+    NSURL *linkURL = (NSURL *)ApolloShareCall(link, @selector(URL));
+    if (ApolloHostedVideoKindForURL(linkURL) != ApolloHostedVideoNone) {
+        // Re-entrancy guard: flip to Placeholder synchronously before async work, so
+        // repeated background layout passes don't launch duplicate resolves.
+        objc_setAssociatedObject(previewNode, &kApolloShareGalleryStateKey,
+                                 @(ApolloShareGalleryStatePlaceholder),
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+        // Smooth the first frame: drop the compact link card IMMEDIATELY with a
+        // neutral placeholder, BEFORE the async host-API poster resolve, so the
+        // junk-titled link card never flashes. Size it from Reddit's own scraped
+        // preview aspect when available (previewMedia/thumbnail) so there's no
+        // reflow; the host API then confirms the exact aspect + supplies the still.
+        CGSize syncAspect = ApolloShareResolvePosterAspect(link);
+        UIImage *immediate = ApolloShareGalleryRenderSingle(nil, syncAspect);
+        if (immediate) ApolloShareGalleryInstallImageOnMain(previewNode, immediate, NO);
+        ApolloLog(@"[ShareGallery] hosted video node=%p url=%@ syncAspect=%@ — placeholder + resolve",
+                  previewNode, linkURL.absoluteString, NSStringFromCGSize(syncAspect));
+        __weak id weakNode = previewNode;
+        ApolloHostedVideoResolve(linkURL, ^(__unused NSURL *mp4, NSURL *posterURL,
+                                            CGSize pixelSize, __unused BOOL hasAudio) {
+            id strongNode = weakNode;
+            if (!strongNode) return;
+            if (!posterURL) {
+                // No poster resolvable — leave Apollo's native card untouched.
+                objc_setAssociatedObject(strongNode, &kApolloShareGalleryStateKey,
+                                         @(ApolloShareGalleryStateApplied),
+                                         OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                return;
+            }
+            CGSize aspect = (pixelSize.width > 0 && pixelSize.height > 0) ? pixelSize : CGSizeZero;
+            // Placeholder immediately (correct aspect) so the link card doesn't linger.
+            UIImage *placeholder = ApolloShareGalleryRenderSingle(nil, aspect);
+            if (placeholder) ApolloShareGalleryInstallImageOnMain(strongNode, placeholder, NO);
+            ApolloShareGalleryFetchImages(@[posterURL], ^(NSArray *images) {
+                id n2 = weakNode;
+                if (!n2) return;
+                UIImage *fetched = nil;
+                for (id img in images) {
+                    if ([img isKindOfClass:[UIImage class]]) { fetched = (UIImage *)img; break; }
+                }
+                UIImage *single = fetched ? ApolloShareGalleryRenderSingle(fetched, aspect) : nil;
+                ApolloLog(@"[ShareGallery] hosted poster fetch node=%p ok=%d", n2, fetched != nil);
+                if (single) {
+                    ApolloShareGalleryInstallImageOnMain(n2, single, YES);
+                } else {
+                    objc_setAssociatedObject(n2, &kApolloShareGalleryStateKey,
+                                             @(ApolloShareGalleryStateApplied),
+                                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                }
+            });
+        });
         return;
     }
 

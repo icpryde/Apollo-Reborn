@@ -64,6 +64,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import "ApolloCommon.h"
+#import "ApolloHostedVideo.h"
 
 #pragma mark - Tunables
 
@@ -179,22 +180,40 @@ static NSURL *ApolloSVToExportableMP4(NSURL *url) {
     return nil;
 }
 
+#pragma mark - External hosted video (Streamable / Redgifs)
+
+// Some external video posts (Streamable, Redgifs) carry NO RDKVideo — Apollo plays
+// them inline by resolving the host's own API at runtime, but exposes them to the
+// share sheet only as a link card whose external page URL sits on -[RDKLink URL].
+// Apollo's resolved URL is never written back to the link and its resolvers are
+// pure-Swift (no @objc entry point), so we resolve the progressive mp4 ourselves
+// from the host's public API at export time. Host classification + resolution live
+// in the shared ApolloHostedVideo helper (also used by ApolloShareAsImageGallery to
+// replace the link card with the video poster). Both hosts serve a single combined
+// mp4 with embedded audio, so no separate audio track is needed.
+
 // SYNCHRONOUS feasibility check (decides whether the toggle is shown). True when
 // the post has a video we can produce a progressive, exportable file for:
 //   * a v.redd.it video (we'll resolve its DASH MP4 + audio at export time), or
-//   * a direct .mp4 URL.
-// HLS-only sources (Streamable / redgifs with no progressive form) return NO, so
-// the toggle simply never appears for them.
+//   * a direct .mp4 URL, or
+//   * a Streamable / Redgifs link post (resolved via the host API at export time).
 static BOOL ApolloSVPostIsExportableVideo(id link) {
+    // Preferred fast paths: a real RDKVideo we can export with no extra network —
+    // v.redd.it (DASH) or a direct .mp4. Reddit also synthesizes a v.redd.it
+    // previewVideo for some external link posts, which is covered here too.
     id video = ApolloSVBestVideo(link);
-    if (!video) return NO;
-
-    NSURL *url   = (NSURL *)ApolloSVCall(video, @selector(URL));
-    NSURL *fb    = (NSURL *)ApolloSVCall(video, @selector(fallbackURL));
-    NSURL *small = (NSURL *)ApolloSVCall(video, @selector(smallerURL));
-
-    if (ApolloSVHostContains(url, @"v.redd.it") || ApolloSVHostContains(fb, @"v.redd.it")) return YES;
-    if (ApolloSVIsMP4(url) || ApolloSVIsMP4(fb) || ApolloSVIsMP4(small)) return YES;
+    if (video) {
+        NSURL *url   = (NSURL *)ApolloSVCall(video, @selector(URL));
+        NSURL *fb    = (NSURL *)ApolloSVCall(video, @selector(fallbackURL));
+        NSURL *small = (NSURL *)ApolloSVCall(video, @selector(smallerURL));
+        if (ApolloSVHostContains(url, @"v.redd.it") || ApolloSVHostContains(fb, @"v.redd.it")) return YES;
+        if (ApolloSVIsMP4(url) || ApolloSVIsMP4(fb) || ApolloSVIsMP4(small)) return YES;
+    }
+    // External hosts Apollo plays inline but exposes only as a link card (no
+    // RDKVideo): Streamable / Redgifs. Their progressive mp4 is resolved from the
+    // link's page URL at export time, so offer the toggle here.
+    NSURL *pageURL = (NSURL *)ApolloSVCall(link, @selector(URL));
+    if (ApolloHostedVideoKindForURL(pageURL) != ApolloHostedVideoNone) return YES;
     return NO;
 }
 
@@ -282,8 +301,26 @@ static void ApolloSVResolveSources(id link, void (^completion)(NSURL *videoURL, 
         dispatch_async(dispatch_get_main_queue(), ^{ completion(v, a, s); });
     };
 
+    // Hosted-source fallback (Streamable / Redgifs) from the link's external page
+    // URL. Used when there's no exportable RDKVideo — captured here so both the
+    // "no RDKVideo" and "RDKVideo but nothing exportable" paths can reach it.
+    NSURL *pageURL = (NSURL *)ApolloSVCall(link, @selector(URL));
+    void (^tryHosted)(CGSize) = ^(CGSize natural) {
+        if (ApolloHostedVideoKindForURL(pageURL) != ApolloHostedVideoNone) {
+            ApolloHostedVideoResolve(pageURL, ^(NSURL *mp4, __unused NSURL *poster,
+                                                CGSize pixelSize, __unused BOOL hasAudio) {
+                // Single combined mp4 (audio embedded) -> audioURL nil. Use the
+                // API's true pixel size for natural when the link gave us none.
+                CGSize sz = (natural.width > 0 && natural.height > 0) ? natural : pixelSize;
+                done(mp4, nil, sz);
+            });
+        } else {
+            done(nil, nil, natural);
+        }
+    };
+
     id video = ApolloSVBestVideo(link);
-    if (!video) { done(nil, nil, CGSizeZero); return; }
+    if (!video) { tryHosted(CGSizeZero); return; }
 
     NSURL *url   = (NSURL *)ApolloSVCall(video, @selector(URL));
     NSURL *fb    = (NSURL *)ApolloSVCall(video, @selector(fallbackURL));
@@ -326,8 +363,16 @@ static void ApolloSVResolveSources(id link, void (^completion)(NSURL *videoURL, 
     // Direct progressive MP4 (e.g. imgur). No separate audio track to fetch; if
     // the file itself carries audio the composition picks it up from this asset.
     NSURL *direct = ApolloSVIsMP4(url) ? url : (ApolloSVIsMP4(fb) ? fb : (ApolloSVIsMP4(small) ? small : nil));
-    ApolloLog(@"[ShareVideo] direct mp4 resolved=%@", direct ? @"yes" : @"no");
-    done(direct, nil, natural);
+    if (direct) {
+        ApolloLog(@"[ShareVideo] direct mp4 resolved=yes");
+        done(direct, nil, natural);
+        return;
+    }
+
+    // RDKVideo present but nothing AVFoundation can export (e.g. an HLS-only
+    // smallerURL): fall back to the hosted page URL (Streamable / Redgifs).
+    ApolloLog(@"[ShareVideo] no exportable RDKVideo url — trying hosted page url");
+    tryHosted(natural);
 }
 
 #pragma mark - Card image + media rect
@@ -397,7 +442,18 @@ static BOOL ApolloSVMediaRectNormalized(id vc, CGRect *outNorm) {
         id baseCommentNode = ApolloSVIvarObject(previewNode, "baseCommentNode");
         mediaNode = ApolloSVLargestMediaNode(baseCommentNode ?: previewNode);
     } else {
-        mediaNode = ApolloSVIvarObject(previewNode, "imageNode");
+        // Native media posts expose the preview's imageNode directly. External
+        // video link posts (Streamable / Redgifs) render a link-preview card whose
+        // thumbnail isn't `imageNode`, so target the largest image/video node in
+        // the card — that thumbnail is what we composite the video over. Each path
+        // cross-falls-back to the other for robustness.
+        NSURL *pageURL = (NSURL *)ApolloSVCall(ApolloSVIvarObject(vc, "link"), @selector(URL));
+        if (ApolloHostedVideoKindForURL(pageURL) != ApolloHostedVideoNone) {
+            mediaNode = ApolloSVLargestMediaNode(previewNode) ?: ApolloSVIvarObject(previewNode, "imageNode");
+            ApolloLog(@"[ShareVideo] hosted-link post media node=%@", mediaNode ? @"largest" : @"none");
+        } else {
+            mediaNode = ApolloSVIvarObject(previewNode, "imageNode") ?: ApolloSVLargestMediaNode(previewNode);
+        }
     }
     if (!mediaNode) return NO;
 
