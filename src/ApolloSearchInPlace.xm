@@ -158,6 +158,7 @@ static BOOL sFeedSearchDismissing     = NO;  // YES briefly during dismiss (rela
 static BOOL sFeedSearchScrolledByUser = NO;  // armed once the user drags → stop clamping so they can browse
 static NSUInteger sFeedSearchDismissGen = 0; // bumps each dismiss / focus / disappear; the release timer ignores stale gens
 static __weak UIView *sFeedSearchField    = nil; // captured searchTextField
+static CGFloat sFeedSearchStandaloneRestInset = 0.0; // feed's resting top inset (Headers OFF), captured while NOT searching
 
 // Stable content-top rest for the feed search table: the docked toolbar's window-space bottom (where the
 // first results row sits). Falls back to window safe-area top + 45 until the toolbar is docked.
@@ -637,17 +638,48 @@ static void recenterCancelButton(void) {
 %hook ASTableView
 
 - (void)setContentInset:(UIEdgeInsets)inset {
-    if (sFeedSearchActive && (UIScrollView *)self == sFeedSearchTable &&
-        ApolloFeedSearchManagedHeader((UIScrollView *)self)) {
-        CGFloat want = ApolloFeedSearchActiveRestTop();
-        if (inset.top < want) inset.top = want; // FLOOR only — never lower (allow pull-to-refresh growth)
-        %orig(inset);
-        return;
+    if ((UIScrollView *)self == sFeedSearchTable) {
+        BOOL managed = ApolloFeedSearchManagedHeader((UIScrollView *)self);
+        if (!sFeedSearchActive && !sFeedSearchDismissing) {
+            // Remember the feed's resting top inset (standalone / Headers OFF) so we can hold the chrome in
+            // place when the field is focused with no query yet.
+            if (!managed && inset.top > 1.0) sFeedSearchStandaloneRestInset = inset.top;
+        } else if (sFeedSearchActive && managed) {
+            CGFloat want = ApolloFeedSearchActiveRestTop();
+            if (inset.top < want) inset.top = want; // FLOOR only — never lower (allow pull-to-refresh growth)
+        } else if (sFeedSearchActive && !sFeedSearchDismissing && !managed &&
+                   sFeedSearchStandaloneRestInset > 1.0) {
+            // Standalone (Subreddit Headers OFF), focused: Apollo shrinks the top inset (~161->99) for the
+            // docked-field layout, which pulls the small Community Highlights carousel up behind the field.
+            // The carousel is short enough that it doesn't bury the results, so we keep it in place for the
+            // WHOLE search (empty AND while typing) — Apollo's native per-query surfacing is inconsistent
+            // (some letters push it up, some don't); the user wants it to always stay, results below it.
+            // Hold the resting inset; releases only on dismiss (which has its own restore).
+            if (inset.top < sFeedSearchStandaloneRestInset) inset.top = sFeedSearchStandaloneRestInset;
+        }
     }
-    %orig;
+    %orig(inset);
 }
 
 - (void)setContentOffset:(CGPoint)offset {
+    // Standalone (Headers OFF) + focused: pair with the inset hold above to keep the small Community
+    // Highlights carousel at its resting position throughout the search (tap AND while typing) so it stays
+    // in place with results below it, instead of Apollo inconsistently pushing it up behind the field on
+    // some queries. NOT during dismiss (which has its own restore). Released the instant the user drags
+    // (so they can scroll down through the results), and re-armed when they settle back at the top.
+    if ((UIScrollView *)self == sFeedSearchTable && sFeedSearchActive && !sFeedSearchDismissing &&
+        sFeedSearchStandaloneRestInset > 1.0 &&
+        !ApolloFeedSearchManagedHeader((UIScrollView *)self)) {
+        UIScrollView *sv2 = (UIScrollView *)self;
+        CGFloat rest = -sFeedSearchStandaloneRestInset;
+        if (sv2.isDragging) sFeedSearchScrolledByUser = YES;
+        else if (offset.y <= rest + 1.0) sFeedSearchScrolledByUser = NO;
+        if (!sv2.isDragging && !sv2.isDecelerating && !sFeedSearchScrolledByUser) {
+            if (offset.y > rest) offset.y = rest; // hold the carousel at rest
+        }
+        %orig(offset);
+        return;
+    }
     // Only when a FULL subreddit header is present (the managed case). Without it — Home, or just the small
     // Community Highlights carousel (Subreddit Headers off) — leave the feed's geometry stock; Apollo
     // surfaces results there natively, and the Highlights module re-attaches its carousel on dismiss.
