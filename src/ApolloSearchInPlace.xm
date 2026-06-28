@@ -260,6 +260,17 @@ static BOOL ApolloFeedSearchIsSurfaced(UIScrollView *sv) {
            (ApolloFeedSearchDesiredOffsetY(sv) > rest + 1.0);
 }
 
+// Exposed (non-static) to the Community Highlights module: YES while THIS feed table is mid-search with a
+// non-empty query — i.e. results are showing and the standalone carousel should stay scrolled off, NOT be
+// re-attached + scrolled back to the top. Excludes the dismiss window (dismissing == YES) and an empty
+// query, which are exactly when the carousel SHOULD be restored. Lets the Highlights re-attach skip its
+// scroll-to-top during active typing/scrolling so it can never yank the results.
+BOOL ApolloFeedSearchIsActiveQuery(UIScrollView *tv) {
+    return sFeedSearchActive && !sFeedSearchDismissing &&
+           (UIScrollView *)tv == sFeedSearchTable &&
+           ApolloFeedSearchQueryText().length > 0;
+}
+
 // MARK: - Round "X" cancel button
 //
 // Replaces the "Cancel" text with a neutral-gray xmark in a circle matching the search-field pill. In
