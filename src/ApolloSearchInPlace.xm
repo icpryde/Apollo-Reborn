@@ -209,12 +209,24 @@ static NSString *ApolloFeedSearchQueryText(void) {
 //
 // Scoped to "Keep Search Bar In Place" mode: with the toggle off, the feed keeps its original
 // rest-pinned behavior (results below the chrome), so that mode is unchanged from stock Apollo.
+// The surfacing only engages when the feed has a FULL subreddit header — Reborn's
+// ApolloSubredditHeaderWrapperView (Subreddit Headers ON: banner + description + Community Highlights,
+// ~400pt of chrome that genuinely buries the search row). When that's off, the header is either nothing
+// (Home) or just the small Community Highlights carousel, which the highlights module rebuilds + re-nests
+// across reloads; surfacing it both isn't worth it (little chrome to clear) and mis-positions / strands
+// that rebuilt header. So those cases keep stock behavior (results below the chrome).
+static BOOL ApolloFeedSearchManagedHeader(UIScrollView *sv) {
+    UIView *hdr = [sv respondsToSelector:@selector(tableHeaderView)] ? [(UITableView *)sv tableHeaderView] : nil;
+    return hdr && [hdr isKindOfClass:objc_getClass("ApolloSubredditHeaderWrapperView")];
+}
+
 static CGFloat ApolloFeedSearchDesiredOffsetY(UIScrollView *sv) {
     CGFloat rest = -ApolloFeedSearchActiveRestTop();
     if (!sKeepSearchBarInPlace) return rest;          // OFF mode: original, no surfacing
+    if (!ApolloFeedSearchManagedHeader(sv)) return rest; // no full header to clear → stock
     if (ApolloFeedSearchQueryText().length == 0) return rest;
-    UIView *hdr = [sv respondsToSelector:@selector(tableHeaderView)] ? [(UITableView *)sv tableHeaderView] : nil;
-    CGFloat H = hdr ? CGRectGetHeight(hdr.frame) : 0.0;
+    UIView *hdr = [(UITableView *)sv tableHeaderView];
+    CGFloat H = CGRectGetHeight(hdr.frame);
     if (H <= 1.0) return rest;
     CGFloat surfaced = H - sv.contentInset.top; // first results row just under the docked field
     return surfaced > rest ? surfaced : rest;
@@ -223,11 +235,13 @@ static CGFloat ApolloFeedSearchDesiredOffsetY(UIScrollView *sv) {
 // When the chrome is surfaced off the top, its tail still sits in the band behind the translucent
 // field/nav and bleeds through the Liquid Glass. Hide the header view while surfaced so the glass blurs
 // the plain feed background instead of the scrolled-up Community Highlights; show it again otherwise.
-// Alpha-only (no layout/offset change). `surfaced` callers MUST pair every hide with a restore — the
-// teardown / disappear paths below force it back to visible so the banner can never get stuck hidden.
+// Alpha-only (no layout/offset change). Only ever runs for the managed wrapper (the only thing that
+// surfaces); its setAlpha: is hooked below so the wrapper's per-pass anti-flash can't re-show it.
 static void ApolloFeedSearchSetHeaderHidden(UIScrollView *sv, BOOL hidden) {
-    UIView *hdr = [sv respondsToSelector:@selector(tableHeaderView)] ? [(UITableView *)sv tableHeaderView] : nil;
-    if (hdr && hdr.alpha != (hidden ? 0.0 : 1.0)) hdr.alpha = hidden ? 0.0 : 1.0;
+    if (!ApolloFeedSearchManagedHeader(sv)) return;
+    UIView *hdr = [(UITableView *)sv tableHeaderView];
+    CGFloat a = hidden ? 0.0 : 1.0;
+    if (hdr.alpha != a) hdr.alpha = a;
 }
 
 // Force the captured feed's header back to visible (teardown / leaving — belt-and-suspenders against a
@@ -612,7 +626,8 @@ static void recenterCancelButton(void) {
 %hook ASTableView
 
 - (void)setContentInset:(UIEdgeInsets)inset {
-    if (sFeedSearchActive && (UIScrollView *)self == sFeedSearchTable) {
+    if (sFeedSearchActive && (UIScrollView *)self == sFeedSearchTable &&
+        ApolloFeedSearchManagedHeader((UIScrollView *)self)) {
         CGFloat want = ApolloFeedSearchActiveRestTop();
         if (inset.top < want) inset.top = want; // FLOOR only — never lower (allow pull-to-refresh growth)
         %orig(inset);
@@ -622,8 +637,12 @@ static void recenterCancelButton(void) {
 }
 
 - (void)setContentOffset:(CGPoint)offset {
+    // Only when a FULL subreddit header is present (the managed case). Without it — Home, or just the small
+    // Community Highlights carousel (Subreddit Headers off) — leave the feed's geometry stock, so dismissing
+    // a search can't strand the rebuilt carousel header behind the chrome (blank space).
     if ((UIScrollView *)self == sFeedSearchTable &&
-        (sFeedSearchActive || sFeedSearchDismissing)) {
+        (sFeedSearchActive || sFeedSearchDismissing) &&
+        ApolloFeedSearchManagedHeader((UIScrollView *)self)) {
         UIScrollView *sv = (UIScrollView *)self;
         CGFloat rest = -ApolloFeedSearchActiveRestTop();
         BOOL userScrolling = sv.isDragging || sv.isDecelerating;
@@ -682,7 +701,7 @@ static void recenterCancelButton(void) {
 - (void)setTableHeaderView:(UIView *)header {
     %orig;
     if ((UIScrollView *)self == sFeedSearchTable && header && ApolloFeedSearchIsSurfaced((UIScrollView *)self)) {
-        header.alpha = 0.0;
+        ApolloFeedSearchSetHeaderHidden((UIScrollView *)self, YES);
     }
 }
 
