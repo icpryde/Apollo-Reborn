@@ -70,6 +70,12 @@ static const void *kApolloProfileTabAvatarImageMarkerKey = &kApolloProfileTabAva
 @property(nonatomic, strong) ApolloProfileSocialLinksView *socialLinksView;
 @property(nonatomic, weak) UIViewController *hostViewController;
 @property(nonatomic, copy) NSString *username;
+// The avatar/snoovatar and banner URLs the most recent profile info applied to this
+// header wanted. The header view is reused across usernames (and re-fetched for the
+// same user), so async image completions compare against these to detect that a newer
+// load has superseded the URL they were fetching before stamping a stale image.
+@property(nonatomic, copy) NSURL *currentProfileImageURL;
+@property(nonatomic, copy) NSURL *currentBannerURL;
 @property(nonatomic, copy) void (^heightInvalidationBlock)(void);
 - (void)applyProfileInfo:(ApolloUserProfileInfo *)info fallbackUsername:(NSString *)username;
 - (CGFloat)preferredHeightForWidth:(CGFloat)width;
@@ -1399,13 +1405,35 @@ static ApolloProfileHeaderView *ApolloProfileCreateHeader(CGFloat width) {
     return header;
 }
 
+static BOOL ApolloProfileURLsMatch(NSURL *left, NSURL *right) {
+    if (left == right) return YES;
+    if (!left || !right) return NO;
+    return [left.absoluteString isEqualToString:right.absoluteString];
+}
+
 static void ApolloProfileLoadImages(ApolloProfileHeaderView *header, NSString *username, BOOL forceRefresh) {
     if (!header || username.length == 0) return;
     ApolloUserProfileCache *cache = [ApolloUserProfileCache sharedCache];
     ApolloUserProfileInfo *cachedInfo = [cache cachedInfoForUsername:username];
 
+    // The header view is cached on the profile/account-manager VC and repointed to a
+    // new username by ApolloProfileInstallOrUpdateHeader (account switch, reused
+    // persistent ProfileViewController, etc.). These info/image fetches are async and
+    // land on the main queue, so by the time a completion fires the header may already
+    // belong to a different user — stamping a late result would bleed user A's
+    // avatar/snoovatar/banner/name/bio onto user B and never self-heal. Capture the
+    // target identity up front and bail from every completion whose header no longer
+    // matches it (mirrors the social-links band's `username == want` guard).
+    NSString *targetUsername = ApolloAvatarNormalizedUsername(username);
+    if (targetUsername.length == 0) return;
+
     void (^applyInfo)(ApolloUserProfileInfo *) = ^(ApolloUserProfileInfo *info) {
         if (!info) return;
+        // Dropped if the header was repointed to another user while this was in flight.
+        if (!ApolloAvatarUsernameMatches(header.username, targetUsername)) {
+            ApolloLog(@"[UserAvatars] Dropping stale profile info for u/%@ (header now u/%@)", targetUsername, header.username ?: @"nil");
+            return;
+        }
         [header applyProfileInfo:info fallbackUsername:username];
 
         if (header.hostViewController) {
@@ -1416,6 +1444,10 @@ static void ApolloProfileLoadImages(ApolloProfileHeaderView *header, NSString *u
         ApolloProfileSetSnoovatarMode(header, showSnoovatar);
 
         NSURL *profileImageURL = showSnoovatar ? info.snoovatarURL : info.iconURL;
+        // Record what this (now-current) info wants so a later async image completion
+        // can tell whether it has been superseded by a newer load for the same user.
+        header.currentProfileImageURL = profileImageURL;
+        header.currentBannerURL = info.bannerURL;
         if (profileImageURL) {
             UIImage *image = [cache cachedImageForURL:profileImageURL];
             if (image) {
@@ -1424,6 +1456,10 @@ static void ApolloProfileLoadImages(ApolloProfileHeaderView *header, NSString *u
             } else {
                 [cache requestImageForURL:profileImageURL completion:^(UIImage *loadedImage) {
                     if (!loadedImage) return;
+                    // Re-validate: the header may have switched users, or a newer fetch
+                    // for this same user may have chosen a different avatar/snoovatar URL.
+                    if (!ApolloAvatarUsernameMatches(header.username, targetUsername)) return;
+                    if (!ApolloProfileURLsMatch(header.currentProfileImageURL, profileImageURL)) return;
                     if (showSnoovatar) header.snoovatarImageView.image = loadedImage;
                     else header.avatarImageView.image = loadedImage;
                 }];
@@ -1434,8 +1470,12 @@ static void ApolloProfileLoadImages(ApolloProfileHeaderView *header, NSString *u
             if (banner) {
                 header.bannerImageView.image = banner;
             } else {
-                [cache requestImageForURL:info.bannerURL completion:^(UIImage *loadedImage) {
-                    if (loadedImage) header.bannerImageView.image = loadedImage;
+                NSURL *bannerURL = info.bannerURL;
+                [cache requestImageForURL:bannerURL completion:^(UIImage *loadedImage) {
+                    if (!loadedImage) return;
+                    if (!ApolloAvatarUsernameMatches(header.username, targetUsername)) return;
+                    if (!ApolloProfileURLsMatch(header.currentBannerURL, bannerURL)) return;
+                    header.bannerImageView.image = loadedImage;
                 }];
             }
         }
@@ -1713,6 +1753,10 @@ static void ApolloProfileInstallOrUpdateHeader(id viewControllerObject) {
         header.avatarImageView.image = ApolloProfilePlaceholderAvatar();
         header.snoovatarImageView.image = nil;
         header.bannerImageView.image = nil;
+        // Forget the previous user's expected image URLs so an in-flight completion
+        // from that user can't match and stamp onto the freshly-repointed header.
+        header.currentProfileImageURL = nil;
+        header.currentBannerURL = nil;
         [header applyProfileInfo:nil fallbackUsername:username];
         ApolloProfileSetSnoovatarMode(header, NO);
         ApolloProfileLoadImages(header, username, NO);
