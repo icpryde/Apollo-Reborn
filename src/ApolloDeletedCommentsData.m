@@ -483,7 +483,39 @@ NSString *ApolloDeletedCommentsDisplayLabelForReason(NSString *reason) {
     return @"REMOVED BY MOD";
 }
 
-static NSString *ApolloDeletedCommentsRedditBodyHTML(NSString *body) {
+// Convert the common inline Markdown that recovered comment bodies carry into the
+// real HTML tags Reddit's body_html would contain, so Apollo's renderer shows links
+// and bold instead of the literal "[text](url)" / "**text**" source. Runs on text that
+// is ALREADY HTML-escaped, so the markers ([](), **) are intact while the content is
+// safe; the tags we emit are re-encoded by RedditBodyHTML's final escape (Apollo
+// unescapes once and parses). Scoped to http(s) links to avoid false matches.
+static NSString *ApolloDeletedCommentsApplyInlineMarkdownHTML(NSString *escaped) {
+    if (escaped.length == 0) return escaped;
+    NSString *result = escaped;
+
+    static NSRegularExpression *linkRe = nil;
+    static dispatch_once_t linkOnce;
+    dispatch_once(&linkOnce, ^{
+        linkRe = [NSRegularExpression regularExpressionWithPattern:@"\\[([^\\]\\n]+)\\]\\((https?://[^)\\s]+)\\)"
+                                                           options:0 error:nil];
+    });
+    result = [linkRe stringByReplacingMatchesInString:result options:0
+                                                range:NSMakeRange(0, result.length)
+                                         withTemplate:@"<a href=\"$2\">$1</a>"];
+
+    static NSRegularExpression *boldRe = nil;
+    static dispatch_once_t boldOnce;
+    dispatch_once(&boldOnce, ^{
+        boldRe = [NSRegularExpression regularExpressionWithPattern:@"\\*\\*([^*\\n]+)\\*\\*"
+                                                           options:0 error:nil];
+    });
+    result = [boldRe stringByReplacingMatchesInString:result options:0
+                                                range:NSMakeRange(0, result.length)
+                                         withTemplate:@"<strong>$1</strong>"];
+    return result;
+}
+
+NSString *ApolloDeletedCommentsRedditBodyHTML(NSString *body) {
     NSString *trimmed = ApolloDeletedCommentsTrimmedString(body);
     if (trimmed.length == 0) return nil;
 
@@ -493,6 +525,7 @@ static NSString *ApolloDeletedCommentsRedditBodyHTML(NSString *body) {
         if (p.length == 0) continue;
         NSString *escaped = ApolloDeletedCommentsEscapeHTML(p);
         escaped = [escaped stringByReplacingOccurrencesOfString:@"\n" withString:@"<br/>"];
+        escaped = ApolloDeletedCommentsApplyInlineMarkdownHTML(escaped);
         [htmlParagraphs addObject:[NSString stringWithFormat:@"<p>%@</p>", escaped]];
     }
     if (htmlParagraphs.count == 0) return nil;

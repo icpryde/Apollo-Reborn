@@ -55,6 +55,13 @@ static const void *kApolloDeletedCommentsRevealTapGestureKey = &kApolloDeletedCo
 static NSMutableDictionary<NSString *, NSHashTable *> *sApolloDeletedCommentsVisibleCellsByFullName = nil;
 static NSObject *sApolloDeletedCommentsVisibleCellsLock = nil;
 static NSDictionary<NSAttributedStringKey, id> *sApolloDeletedCommentsBodyAttributesTemplate = nil;
+// Apollo's ACTUAL comment-body font, captured live from a normally-rendered comment.
+// Deriving the size ourselves (preferredFontForTextStyle:Subheadline at a resolved
+// content-size category) was off by ~one Dynamic Type step vs Apollo's real font, so
+// deleted comments rendered larger than normal ones — and worse when we own the layout
+// (tap-to-reveal), where there is no native node left to read. Capturing the real font
+// makes deleted bodies match exactly and track in-app/system text-size changes.
+static UIFont *sApolloDeletedCommentsLiveCommentBodyFont = nil;
 static BOOL sApolloDeletedCommentsBodyAttributesRefreshScheduled = NO;
 static NSString *const ApolloDeletedCommentsRevealURLString = @"apollo-deleted-comments://reveal";
 static NSString *const ApolloDeletedCommentsRevealAttributeName = @"ApolloDeletedCommentsRevealAttribute";
@@ -169,13 +176,12 @@ static UIFont *ApolloDeletedCommentsReasonChipFontForBaseAttributes(NSDictionary
 }
 
 static UIFont *ApolloDeletedCommentsRecoveredBodyFont(void) {
-    // Apollo's comment body is UIFontTextStyleSubheadline (15pt @ .large), NOT Body
-    // (17pt). This is the universal fallback font for DefaultBodyAttributes (used by
-    // BodyAttributedText, the reason-chip base attributes, and the chip-size
-    // derivation) and is what renders on the FIRST display of a deleted/recovered
-    // body, before the per-node Subheadline template is populated. Returning Body here
-    // made deleted-comment text render two points larger than normal comments
-    // (the "deleted text looks bigger" report). Match Apollo's real comment body.
+    // Prefer Apollo's real captured comment font when we've seen one.
+    if ([sApolloDeletedCommentsLiveCommentBodyFont isKindOfClass:[UIFont class]]) {
+        return sApolloDeletedCommentsLiveCommentBodyFont;
+    }
+    // Last-resort fallback: Apollo's comment body is UIFontTextStyleSubheadline
+    // (15pt @ .large), NOT Body (17pt).
     return [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline];
 }
 
@@ -351,6 +357,11 @@ static NSString *ApolloDeletedCommentsEscapedHTMLText(NSString *text) {
 static NSString *ApolloDeletedCommentsPlainBodyHTML(NSString *text) {
     NSString *trimmed = ApolloDeletedCommentsTrimmedString(text);
     if (trimmed.length == 0) return @"";
+    // Route through the shared markdown-aware generator so the saved/restored body_html
+    // (returned by the bodyHTML getter hook and Apollo's native renderer) shows links and
+    // bold instead of literal "[text](url)"/"**text**". Falls back to escaped plain text.
+    NSString *html = ApolloDeletedCommentsRedditBodyHTML(trimmed);
+    if (html.length > 0) return html;
     NSString *escaped = ApolloDeletedCommentsEscapedHTMLText(trimmed);
     return [NSString stringWithFormat:@"&lt;div class=&quot;md&quot;&gt;&lt;p&gt;%@&lt;/p&gt;\n&lt;/div&gt;", escaped];
 }
@@ -894,6 +905,12 @@ static NSString *ApolloDeletedCommentsEffectiveContentSizeCategory(id node, BOOL
 // content size category above. Apollo's comment body is UIFontTextStyleSubheadline
 // scaled by that category (verified: .large=15pt, .xxxLarge=21pt), regular weight.
 static UIFont *ApolloDeletedCommentsAppCommentBodyFontForNode(id node) {
+    // Prefer Apollo's real captured comment font (always matches normal comments and
+    // tracks text-size changes). Fall back to the derived size only before we've seen
+    // a normal comment render.
+    if ([sApolloDeletedCommentsLiveCommentBodyFont isKindOfClass:[UIFont class]]) {
+        return sApolloDeletedCommentsLiveCommentBodyFont;
+    }
     NSString *category = ApolloDeletedCommentsEffectiveContentSizeCategory(node, NULL);
     if (![category isKindOfClass:[NSString class]] || category.length == 0) {
         category = UIContentSizeCategoryLarge;
@@ -2977,10 +2994,62 @@ static NSAttributedString *__attribute__((unused)) ApolloDeletedCommentsRenameRe
     return renamed;
 }
 
+static Class ApolloDeletedCommentsMarkdownNodeClass(void) {
+    static Class cls = Nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        cls = objc_getClass("_TtC6Apollo12MarkdownNode");
+    });
+    return cls;
+}
+
+// Capture Apollo's real comment-body font from a normally-rendered comment body, so
+// deleted comments render at the exact same size (see sApolloDeletedCommentsLiveCommentBodyFont).
+// Runs from the global setAttributedText: hook, so the steady-state path is kept cheap:
+// the supernode walk only runs when the captured font actually changes (first capture
+// or a text-size change).
+static void ApolloDeletedCommentsCaptureLiveCommentBodyFont(id textNode, NSAttributedString *attributedText) {
+    if (![attributedText isKindOfClass:[NSAttributedString class]] || attributedText.length < 2) return;
+    // Only comment/post *body* nodes carry a MarkdownNode delegate — gate on it cheaply.
+    Class mdClass = ApolloDeletedCommentsMarkdownNodeClass();
+    if (!mdClass || ![textNode respondsToSelector:@selector(delegate)]) return;
+    id delegate = nil;
+    @try { delegate = ((id (*)(id, SEL))objc_msgSend)(textNode, @selector(delegate)); } @catch (__unused NSException *e) {}
+    if (![delegate isKindOfClass:mdClass]) return;
+    // Skip our own injected chip/body text (it carries the reason-prefix marker).
+    if (ApolloDeletedCommentsAttributedTextHasReasonPrefix(attributedText)) return;
+
+    __block UIFont *candidate = nil;
+    [attributedText enumerateAttribute:NSFontAttributeName inRange:NSMakeRange(0, attributedText.length) options:0
+                            usingBlock:^(id value, __unused NSRange range, BOOL *stop) {
+        if (![value isKindOfClass:[UIFont class]]) return;
+        UIFont *f = (UIFont *)value;
+        if (f.pointSize < 8.0 || f.pointSize > 40.0) return;
+        if ((f.fontDescriptor.symbolicTraits & (UIFontDescriptorTraitBold | UIFontDescriptorTraitItalic)) != 0) return;
+        candidate = f;
+        *stop = YES;
+    }];
+    if (![candidate isKindOfClass:[UIFont class]]) return;
+    if ([sApolloDeletedCommentsLiveCommentBodyFont isKindOfClass:[UIFont class]] &&
+        fabs(sApolloDeletedCommentsLiveCommentBodyFont.pointSize - candidate.pointSize) <= 0.5 &&
+        [sApolloDeletedCommentsLiveCommentBodyFont.fontName isEqualToString:candidate.fontName]) {
+        return; // unchanged — cheap steady-state exit
+    }
+    // Capture from any markdown body (comment or post self-text — Apollo renders both
+    // at the same text-size setting). The cell hierarchy isn't wired up yet at
+    // setAttributedText: time, so we can't reliably scope to comment cells here.
+    sApolloDeletedCommentsLiveCommentBodyFont = candidate;
+    // Drop the cached body template so deleted cells re-resolve at the new size, and
+    // refresh the visible ones (this is what makes a text-size change propagate).
+    sApolloDeletedCommentsBodyAttributesTemplate = nil;
+    if (sShowDeletedComments) ApolloDeletedCommentsScheduleBodyAttributesRefresh();
+}
+
 %hook ASTextNode
 
 - (void)setAttributedText:(NSAttributedString *)attributedText {
     NSAttributedString *displayText = attributedText;
+    ApolloDeletedCommentsCaptureLiveCommentBodyFont((id)self, displayText);
     displayText = ApolloDeletedCommentsAttributedTextWithTapToRevealPlaceholder((id)self, displayText);
     displayText = ApolloDeletedCommentsRenameRecoveredSpoilerLabel((id)self, displayText);
     displayText = ApolloDeletedCommentsAttributedTextWithReasonChipIfNeeded((id)self, displayText);

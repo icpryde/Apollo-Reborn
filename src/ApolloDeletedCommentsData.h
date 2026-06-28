@@ -23,6 +23,9 @@ BOOL ApolloDeletedCommentsApplyRecoveredArchivedCommentToObject(id comment, NSDi
 BOOL ApolloDeletedCommentsIsRecoveredCommentBody(NSString *author, NSString *body);
 NSString *ApolloDeletedCommentsRecoveredReasonForCommentBody(NSString *author, NSString *body);
 NSString *ApolloDeletedCommentsDisplayLabelForReason(NSString *reason);
+// Markdown-aware Reddit body_html generator (renders links/bold). Shared so every
+// recovered-body HTML path produces the same rendered output. Returns nil if empty.
+NSString *ApolloDeletedCommentsRedditBodyHTML(NSString *body);
 BOOL ApolloDeletedCommentsIsCommentRevealed(NSString *fullName);
 BOOL ApolloDeletedCommentsIsCommentBodyRevealed(NSString *author, NSString *body);
 void ApolloDeletedCommentsMarkCommentRevealed(NSString *fullName);
