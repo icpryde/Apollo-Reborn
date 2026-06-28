@@ -132,10 +132,13 @@ static ApolloFoundationModels *ApolloAIBridge(void) {
 
 // Keep prompts well within the on-device model's context window.
 static const NSUInteger kApolloAIMaxPostChars = 1400;
-// Below this many words a post body isn't worth summarizing: the 2-sentence
-// summary would be nearly as long as the post itself. Gates the post summary so
-// one- or two-sentence posts get no card at all.
-static const NSUInteger kApolloAIMinPostWords = 50;
+// Below this many words a post body isn't worth summarizing: the generated
+// summary (capped at kApolloAIPostResponseTokens, ~60 words) would be nearly as
+// long as the post itself, defeating the purpose. Gating well above the summary
+// length means a post summary is only offered when it actually condenses the
+// post (~300 words -> roughly a fifth the length). Short posts and boilerplate
+// megathreads get no card at all.
+static const NSUInteger kApolloAIMinPostWords = 300;
 static const NSUInteger kApolloAIMinComments = 5;
 static const NSUInteger kApolloAIMinCommentChars = 500;
 // The discussion summary is generated ONCE per page open, so we can afford to
@@ -1813,7 +1816,7 @@ static void ApolloAIRenderSummaryNode(id headerNode, BOOL isPost) {
         // The post box shows one of three titles depending on what was summarized:
         // the post body, an external article, or both together.
         if (fullName.length > 0 && [sBothSummaryPosts containsObject:fullName]) {
-            title = @"Post & link summary";
+            title = @"Post/Link summary";
         } else if (fullName.length > 0 && [sLinkSummaryPosts containsObject:fullName]) {
             title = @"Link summary";
         } else {

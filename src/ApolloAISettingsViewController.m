@@ -133,7 +133,7 @@ typedef NS_ENUM(NSInteger, ApolloAISettingsSection) {
         BOOL enabled = sEnableAISummaries;
         switch (indexPath.row) {
             case 0:
-                return [self switchCellWithLabel:@"Post & Link Summaries"
+                return [self switchCellWithLabel:@"Post/Link Summaries"
                                               on:[defaults boolForKey:UDKeyEnableAIPostSummaries]
                                          enabled:enabled
                                           action:@selector(postSummariesSwitchChanged:)];
