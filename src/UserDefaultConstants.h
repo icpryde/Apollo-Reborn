@@ -39,6 +39,16 @@ static NSString *const UDKeyShowRecentlyReadThumbnails = @"ShowRecentlyReadThumb
 static NSString *const UDKeyPreferredGIFFallbackFormat = @"PreferredGIFFallbackFormat";
 static NSString *const UDKeyUnmuteCommentsVideos = @"UnmuteCommentsVideos";
 static NSString *const UDKeyOpenLinksInSteamApp = @"OpenLinksInSteamApp";
+// Apollo NATIVE key, mirrored by Reborn's "Open in App" settings screen
+// (ApolloOpenInAppViewController) so the scattered native "open in app" rows can
+// be gathered in one place and hidden from Apollo's own General settings. We
+// read/write the same key Apollo uses, so the two stay in sync.
+static NSString *const UDKeyOpenVideosInYouTubeApp = @"OpenVideosInYouTubeApp";
+// Reborn "Open in App" deep-link toggles — open these services' links in their
+// app via Universal Links (see ApolloShareLinks.xm). Default OFF (opt-in). The
+// key string literals are duplicated in ApolloShareLinks.xm; keep them in sync.
+static NSString *const UDKeyOpenLinksInGitHubApp  = @"OpenLinksInGitHubApp";
+static NSString *const UDKeyOpenLinksInBlueskyApp = @"OpenLinksInBlueskyApp";
 static NSString *const UDKeyCollapsePinnedComments = @"CollapsePinnedComments";
 static NSString *const UDKeyShowDeletedComments = @"ShowDeletedComments";
 static NSString *const UDKeyTapToRevealDeletedComments = @"TapToRevealDeletedComments";

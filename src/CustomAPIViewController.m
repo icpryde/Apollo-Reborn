@@ -9,6 +9,7 @@
 #import "ApolloUserProfileCache.h"
 #import "ApolloLinkPreviewCache.h"
 #import "ApolloLinkPreviewSettingsViewController.h"
+#import "ApolloOpenInAppViewController.h"
 #import "ApolloSubredditCustomBannerCache.h"
 #import "ApolloSubredditCustomIconCache.h"
 #import "ApolloSubredditInfoCache.h"
@@ -442,6 +443,18 @@ typedef NS_ENUM(NSInteger, Tag) {
     vc.settingsDidChange = ^(NSString *area) {
         [weakSelf noteLinkPreviewChangeForArea:area];
     };
+    if (self.navigationController) {
+        [self.navigationController pushViewController:vc animated:YES];
+    } else {
+        UINavigationController *navigation =
+            [[UINavigationController alloc] initWithRootViewController:vc];
+        [self presentViewController:navigation animated:YES completion:nil];
+    }
+}
+
+- (void)openOpenInAppSettings {
+    ApolloOpenInAppViewController *vc =
+        [[ApolloOpenInAppViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
     if (self.navigationController) {
         [self.navigationController pushViewController:vc animated:YES];
     } else {
@@ -971,11 +984,24 @@ typedef NS_ENUM(NSInteger, Tag) {
                                             label:@"Hide NSFW in Recently Read"
                                                on:[defaults boolForKey:UDKeyFilterNSFWRecentlyRead]
                                            action:@selector(filterNSFWRecentlyReadSwitchToggled:)];
-        case 8:
-            return [self switchCellWithIdentifier:@"Cell_Gen_SteamApp"
-                                            label:@"Open Steam Links in App"
-                                               on:[defaults boolForKey:UDKeyOpenLinksInSteamApp]
-                                           action:@selector(steamAppSwitchToggled:)];
+        case 8: {
+            // "Open in App" disclosure row — pushes ApolloOpenInAppViewController,
+            // which gathers the Steam / YouTube / Twitter / Default Browser
+            // "open in app" settings that used to be scattered between here and
+            // Apollo's native settings. (The Steam toggle used to live on this row.)
+            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_Gen_OpenInApp"];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle
+                                              reuseIdentifier:@"Cell_Gen_OpenInApp"];
+                cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+                cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+            }
+            cell.textLabel.text = @"Open in App";
+            cell.detailTextLabel.text = @"Open Steam, YouTube, GitHub, X and Bluesky links in their apps, and pick your default browser.";
+            cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+            cell.detailTextLabel.numberOfLines = 0;
+            return cell;
+        }
         case 9: {
             BOOL idleSupported = [self apollo_supportsAutoHideTabBarIdleSetting];
             UITableViewCell *cell = [self switchCellWithIdentifier:@"Cell_Gen_TabBarIdle"
@@ -1533,6 +1559,17 @@ typedef NS_ENUM(NSInteger, Tag) {
         return;
     }
 
+    if (indexPath.section == SectionGeneral) {
+        // Mirror generalCellForRow's physical->effective row mapping so the
+        // "Open in App" disclosure row is recognized regardless of whether the
+        // conditional "Tap to Show Deleted Comments" row is present.
+        NSInteger effectiveRow = (!sShowDeletedComments && indexPath.row >= 4) ? indexPath.row + 1 : indexPath.row;
+        if (effectiveRow == 8) {
+            [self openOpenInAppSettings];
+        }
+        return;
+    }
+
     if (indexPath.section == SectionBackupRestore) {
         UITableViewCell *cell = [tableView cellForRowAtIndexPath:indexPath];
         if (indexPath.row == 0) {
@@ -1658,6 +1695,11 @@ typedef NS_ENUM(NSInteger, Tag) {
     }
     if (indexPath.section == SectionApolloAI) return YES;
     if (indexPath.section == SectionLinkPreviews) return YES;
+    if (indexPath.section == SectionGeneral) {
+        // Only the "Open in App" disclosure row is tappable; the rest are switches/fields.
+        NSInteger effectiveRow = (!sShowDeletedComments && indexPath.row >= 4) ? indexPath.row + 1 : indexPath.row;
+        return effectiveRow == 8;
+    }
     if (indexPath.section == SectionMedia) {
         NSInteger row = ApolloMediaLogicalRow(indexPath.row);
         return (row == 0 || row == 1 || row == 2 || row == 5 || row == 6);
@@ -2068,10 +2110,6 @@ typedef NS_ENUM(NSInteger, Tag) {
 - (void)showRecentlyReadThumbnailsSwitchToggled:(UISwitch *)sender {
     sShowRecentlyReadThumbnails = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:sShowRecentlyReadThumbnails forKey:UDKeyShowRecentlyReadThumbnails];
-}
-
-- (void)steamAppSwitchToggled:(UISwitch *)sender {
-    [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyOpenLinksInSteamApp];
 }
 
 - (void)collapsePinnedCommentsSwitchToggled:(UISwitch *)sender {

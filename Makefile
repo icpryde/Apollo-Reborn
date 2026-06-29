@@ -111,6 +111,8 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/CustomAPIViewController.m \
     $(SRC_DIR)/ApolloAISettingsViewController.m \
     $(SRC_DIR)/ApolloLinkPreviewSettingsViewController.m \
+    $(SRC_DIR)/ApolloOpenInAppViewController.m \
+    $(SRC_DIR)/ApolloHideNativeOpenInAppRows.xm \
     $(SRC_DIR)/TranslationSettingsViewController.m \
     $(SRC_DIR)/SavedCategoriesViewController.m \
     $(SRC_DIR)/TagFiltersViewController.m \
