@@ -1482,7 +1482,7 @@ static void initializeRandomSources() {
                                     UDKeyCommunityHighlightsWeb: @NO,
                                     UDKeyAutoHideTabBarShowOnIdle: @NO,
                                     UDKeyKeepSearchBarInPlace: @NO,
-                                    UDKeyIPadTabBarBottom: @YES,
+                                    UDKeyIPadTabBarBottom: @NO,
                                     UDKeyLiveCommentsFollow: @YES,
                                     UDKeyEnableBulkTranslation: @NO,
                                     UDKeyAutoTranslateOnAppear: @YES,

@@ -15,11 +15,10 @@
 // insets consistently, so nothing overlaps (unlike hand-repositioning the pill).
 //
 // Gated to iPad + Liquid Glass + the "Move Tab Bar to Bottom" toggle
-// (sIPadTabBarBottom, default ON). iPhone is never touched: the %ctor bails on
-// non-iPad and the override returns %orig unless all gates pass.
+// (sIPadTabBarBottom, opt-in, default OFF). iPhone is never touched: the %ctor
+// bails on non-iPad and the override returns %orig unless all gates pass.
 //
-// This is a stopgap until the real iPad build of Apollo lands. Remove when that
-// ships (see also the temporary src/ApolloTabBarDiag.xm hierarchy dumper).
+// This is a stopgap until the real iPad build of Apollo lands.
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>

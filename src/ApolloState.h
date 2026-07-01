@@ -67,8 +67,8 @@ extern BOOL sCommunityHighlights;
 extern BOOL sCommunityHighlightsWeb;
 extern BOOL sAutoHideTabBarShowOnIdle;
 // iPad + Liquid Glass only. When ON, docks the iOS 26 floating tab bar at the
-// bottom (classic) instead of the top-center pill. Default ON via registerDefaults.
-// Temporary stopgap for issue #387. See ApolloIPadTabBarBottom.xm.
+// bottom (classic) instead of the top-center pill. Opt-in; default OFF via
+// registerDefaults. Temporary stopgap for issue #387. See ApolloIPadTabBarBottom.xm.
 extern BOOL sIPadTabBarBottom;
 // When ON, neutralizes Apollo's feed/subreddit search takeover (nav-hide + fade + toolbar
 // dock/grow); the field stays put and results populate the feed in place. Liquid Glass only;
