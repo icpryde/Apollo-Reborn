@@ -2137,8 +2137,8 @@ typedef NS_ENUM(NSInteger, Tag) {
     NSArray<NSIndexPath *> *paths = @[[NSIndexPath indexPathForRow:4 inSection:SectionGeneral]];
     if (sShowDeletedComments) {
         [self.tableView insertRowsAtIndexPaths:paths withRowAnimation:UITableViewRowAnimationFade];
-        [self showAlertWithTitle:@"Show Deleted Comments"
-                          message:@"This feature uses Arctic Shift to recover deleted comments. When Arctic Shift is slow or rate-limited, comments may load more slowly or recovered comments may not appear."];
+        [self showAlertWithTitle:@"⚠️ WARNING"
+                          message:@"This feature can slow down comment loading. If you notice comments loading slowly, turn this feature off."];
     } else {
         [self.tableView deleteRowsAtIndexPaths:paths withRowAnimation:UITableViewRowAnimationFade];
     }
