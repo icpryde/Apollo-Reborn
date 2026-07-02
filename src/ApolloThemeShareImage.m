@@ -272,6 +272,24 @@ static void ATSDrawPill(CGRect rect, UIColor *bg, NSString *text, UIColor *textC
     ATSDrawText(text, tr, font, textColor, NSTextAlignmentCenter, NSLineBreakByClipping);
 }
 
+// Draw a tinted SF symbol centered in rect (same glyphs the editor preview
+// uses, so the card mirrors it). No-op if the symbol is unavailable.
+static void ATSDrawSymbol(NSString *name, CGRect rect, UIColor *tint, CGFloat pointSize) {
+    UIImageSymbolConfiguration *cfg =
+        [UIImageSymbolConfiguration configurationWithPointSize:pointSize weight:UIImageSymbolWeightSemibold];
+    UIImage *img = [[UIImage systemImageNamed:name withConfiguration:cfg]
+                    imageWithTintColor:(tint ?: UIColor.grayColor)
+                         renderingMode:UIImageRenderingModeAlwaysOriginal];
+    if (!img) return;
+    CGSize s = img.size;
+    // Fit inside rect preserving aspect, centered.
+    CGFloat k = MIN(rect.size.width / MAX(s.width, 1), rect.size.height / MAX(s.height, 1));
+    CGSize d = CGSizeMake(s.width * k, s.height * k);
+    [img drawInRect:CGRectMake(rect.origin.x + (rect.size.width - d.width) / 2.0,
+                               rect.origin.y + (rect.size.height - d.height) / 2.0,
+                               d.width, d.height)];
+}
+
 // Render the share card: a mock Apollo post painted in the theme's compiled
 // token colours (mirroring the editor's Preview section) with the theme name as
 // the post title, a Dark/Light-mode badge, the palette, and the QR. The QR
@@ -318,7 +336,7 @@ UIImage *ApolloThemeShareRenderCard(NSDictionary *theme, ApolloThemeMode mode) {
     UIColor *raised      = tok(ApolloThemeTokenTertiaryBackground); // the "Raised" input surface
     UIColor *gray        = tok(ApolloThemeTokenSecondaryLabel);
     UIColor *primaryText = tok(ApolloThemeTokenLabel);
-    UIColor *accentText  = tok(ApolloThemeTokenAccentText);
+    UIColor *selection   = tok(ApolloThemeTokenSelection);
     UIColor *muted       = tok(ApolloThemeTokenTertiaryLabel); // label faded toward the page
 
     // Palette swatches: the user's actual input colours for this mode — the 5
@@ -368,44 +386,85 @@ UIImage *ApolloThemeShareRenderCard(NSDictionary *theme, ApolloThemeMode mode) {
         CGFloat badgeW = [badge sizeWithAttributes:@{NSFontAttributeName: badgeFont}].width + 44;
         ATSDrawPill(CGRectMake(W - 52 - badgeW, 36, badgeW, 50), raised, badge, primaryText, badgeFont);
 
-        // --- mock Apollo post card painted in the theme's colours ---
-        CGFloat cx = 48, cy = 116, cw = W - 96, ch = 452, in = 36;
+        // --- mock Apollo screen painted in the theme's colours, mirroring the
+        // editor's Preview section: post row (title = theme name) + metadata,
+        // a comment row, a tinted link row, and a selected-row sample ---
+        CGFloat cx = 48, cy = 112, cw = W - 96, ch = 560, in = 36;
         UIBezierPath *cardPath = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(cx, cy, cw, ch) cornerRadius:26];
         [card setFill]; [cardPath fill];
-        [separator setStroke]; cardPath.lineWidth = 1.5; [cardPath stroke];
 
-        // subreddit row: accent avatar + r/apolloapp + byline
+        CGFloat tx0 = cx + in + 76;             // text column (right of the icon column)
+        CGFloat tw = cx + cw - in - tx0;        // text column width
+        void (^divider)(CGFloat) = ^(CGFloat y) {
+            [separator setFill];
+            CGContextFillRect(ctx, CGRectMake(cx + in, y, cw - in * 2, 2));
+        };
+
+        // subreddit header row: accent avatar + r/apolloapp + byline
         [accent setFill];
-        CGContextFillEllipseInRect(ctx, CGRectMake(cx + in, cy + 34, 72, 72));
-        ATSDrawText(@"r/apolloapp", CGRectMake(cx + in + 92, cy + 38, cw - in * 2 - 92, 34),
-                    [UIFont systemFontOfSize:29 weight:UIFontWeightBold], accent,
+        CGContextFillEllipseInRect(ctx, CGRectMake(cx + in, cy + 26, 56, 56));
+        ATSDrawText(@"r/apolloapp", CGRectMake(tx0, cy + 26, tw, 30),
+                    [UIFont systemFontOfSize:26 weight:UIFontWeightBold], accent,
                     NSTextAlignmentLeft, NSLineBreakByTruncatingTail);
-        ATSDrawText(@"u/christianselig · 2h", CGRectMake(cx + in + 92, cy + 76, cw - in * 2 - 92, 28),
-                    [UIFont systemFontOfSize:22 weight:UIFontWeightRegular], gray,
+        ATSDrawText(@"u/christianselig · 2h", CGRectMake(tx0, cy + 58, tw, 26),
+                    [UIFont systemFontOfSize:21 weight:UIFontWeightRegular], gray,
                     NSTextAlignmentLeft, NSLineBreakByTruncatingTail);
+        divider(cy + 106);
 
-        // title = the theme name (wraps up to 2 lines), then a subtitle
-        ATSDrawText(name, CGRectMake(cx + in, cy + 144, cw - in * 2, 112),
-                    [UIFont systemFontOfSize:46 weight:UIFontWeightBold], primaryText,
-                    NSTextAlignmentLeft, NSLineBreakByWordWrapping);
-        ATSDrawText(@"A custom Apollo theme", CGRectMake(cx + in, cy + 262, cw - in * 2, 30),
+        // post row: accent upvote arrow, theme name as the title (up to 2
+        // lines — metadata tucks up under a 1-line title instead of floating)
+        UIFont *titleFont = [UIFont systemFontOfSize:36 weight:UIFontWeightBold];
+        CGFloat titleH = MIN(ceil([name boundingRectWithSize:CGSizeMake(tw, 90)
+                                                     options:NSStringDrawingUsesLineFragmentOrigin
+                                                  attributes:@{NSFontAttributeName: titleFont}
+                                                     context:nil].size.height), 90);
+        ATSDrawSymbol(@"arrow.up", CGRectMake(cx + in, cy + 130, 48, 48), accent, 34);
+        ATSDrawText(name, CGRectMake(tx0, cy + 124, tw, titleH),
+                    titleFont, primaryText, NSTextAlignmentLeft, NSLineBreakByWordWrapping);
+        ATSDrawText(@"r/apollo · 3h · 142 points", CGRectMake(tx0, cy + 124 + titleH + 10, tw, 30),
                     [UIFont systemFontOfSize:24 weight:UIFontWeightRegular], gray,
                     NSTextAlignmentLeft, NSLineBreakByTruncatingTail);
+        divider(cy + 264);
 
-        // separator + vote/comment pills
-        [separator setFill];
-        CGContextFillRect(ctx, CGRectMake(cx + in, cy + 318, cw - in * 2, 2));
-        ATSDrawPill(CGRectMake(cx + in, cy + 348, 162, 58), accent, @"▲ 1.2k",
-                    accentText, [UIFont systemFontOfSize:24 weight:UIFontWeightSemibold]);
-        ATSDrawPill(CGRectMake(cx + in + 182, cy + 348, 146, 58), raised, @"\U0001F4AC 42",
-                    primaryText, [UIFont systemFontOfSize:24 weight:UIFontWeightMedium]);
+        // comment row
+        ATSDrawSymbol(@"bubble.left", CGRectMake(cx + in, cy + 288, 44, 44), gray, 30);
+        ATSDrawText(@"A comment with body text", CGRectMake(tx0, cy + 282, tw, 36),
+                    [UIFont systemFontOfSize:30 weight:UIFontWeightRegular], primaryText,
+                    NSTextAlignmentLeft, NSLineBreakByTruncatingTail);
+        ATSDrawText(@"username · reply", CGRectMake(tx0, cy + 322, tw, 28),
+                    [UIFont systemFontOfSize:23 weight:UIFontWeightRegular], gray,
+                    NSTextAlignmentLeft, NSLineBreakByTruncatingTail);
+        divider(cy + 368);
+
+        // tinted link row
+        ATSDrawSymbol(@"link", CGRectMake(cx + in, cy + 390, 44, 44), accent, 28);
+        ATSDrawText(@"Tinted link / button", CGRectMake(tx0, cy + 394, tw, 36),
+                    [UIFont systemFontOfSize:30 weight:UIFontWeightSemibold], accent,
+                    NSTextAlignmentLeft, NSLineBreakByTruncatingTail);
+
+        // selected-row sample: Selection-token band across the card bottom
+        CGFloat bandH = 96;
+        UIBezierPath *band = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(cx, cy + ch - bandH, cw, bandH)
+                                                   byRoundingCorners:(UIRectCornerBottomLeft | UIRectCornerBottomRight)
+                                                         cornerRadii:CGSizeMake(26, 26)];
+        [selection setFill]; [band fill];
+        UIBezierPath *chip = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(cx + in, cy + ch - bandH + (bandH - 36) / 2.0, 36, 36)
+                                                        cornerRadius:9];
+        [raised setFill]; [chip fill];
+        [[separator colorWithAlphaComponent:0.7] setStroke]; chip.lineWidth = 1; [chip stroke];
+        ATSDrawText(@"Selected / tapped row", CGRectMake(tx0, cy + ch - bandH + (bandH - 36) / 2.0, tw, 36),
+                    [UIFont systemFontOfSize:30 weight:UIFontWeightMedium], primaryText,
+                    NSTextAlignmentLeft, NSLineBreakByTruncatingTail);
+
+        // stroke the card outline last so it stays crisp over the band
+        [separator setStroke]; cardPath.lineWidth = 1.5; [cardPath stroke];
 
         // --- palette: the user's chosen input colours for this mode ---
-        ATSDrawText(@"PALETTE", CGRectMake(52, 612, 300, 24),
+        ATSDrawText(@"PALETTE", CGRectMake(52, 696, 300, 24),
                     [UIFont systemFontOfSize:20 weight:UIFontWeightSemibold], muted,
                     NSTextAlignmentLeft, NSLineBreakByClipping);
         NSUInteger count = MAX(swatches.count, (NSUInteger)1);
-        CGFloat sgap = 8, sx = 48, sy = 644, sh = 46;
+        CGFloat sgap = 8, sx = 48, sy = 728, sh = 46;
         CGFloat sw = (cw - sgap * (count - 1)) / (CGFloat)count;
         for (NSUInteger i = 0; i < swatches.count; i++) {
             CGRect r = CGRectMake(sx + i * (sw + sgap), sy, sw, sh);
@@ -415,7 +474,7 @@ UIImage *ApolloThemeShareRenderCard(NSDictionary *theme, ApolloThemeMode mode) {
         }
 
         // --- QR plate (always light, for QR contrast) ---
-        CGFloat plateTop = 752;
+        CGFloat plateTop = 806;
         [[UIColor colorWithRed:0.965 green:0.969 blue:0.984 alpha:1.0] setFill];
         CGContextFillRect(ctx, CGRectMake(0, plateTop, W, H - plateTop));
         [[UIColor colorWithWhite:0.0 alpha:0.10] setFill]; // hairline divider

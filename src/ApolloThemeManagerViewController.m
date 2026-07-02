@@ -686,6 +686,10 @@ enum { ESName, ESVariant, ESColors, ESAdvanced, ESGenerate, ESPreview, ESShare, 
 - (void)generateOppositeMode {
     ApolloThemeMode other = (self.editingMode == ApolloThemeModeLight) ? ApolloThemeModeDark : ApolloThemeModeLight;
     [[self store] generateMode:other fromMode:self.editingMode themeID:self.editingThemeID];
+    // Show the result: the generated colours land in the mode we are NOT
+    // looking at, so without flipping the editor there the tap looks like a
+    // silent no-op. Flipping also updates the Appearance segment + preview.
+    self.editingMode = other;
     [self recompilePreview];
     [self maybeLiveReload];
     UINotificationFeedbackGenerator *fb = [[UINotificationFeedbackGenerator alloc] init];
