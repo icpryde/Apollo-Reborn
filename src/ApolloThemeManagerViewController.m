@@ -8,6 +8,46 @@
 #import "ApolloCommon.h"
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <PhotosUI/PhotosUI.h>
+#import <LinkPresentation/LinkPresentation.h>
+
+// ---------------------------------------------------------------------------
+// Share-sheet item for the theme card
+// ---------------------------------------------------------------------------
+
+// A bare UIImage activity item gives the share sheet no preview metadata, so
+// its header shows the generic white app-icon-grid placeholder. Wrap the card
+// so the header shows the card itself + the theme name; the underlying item is
+// still the plain UIImage, so Save Image / Messages / Mail behave unchanged.
+@interface ApolloThemeCardActivityItem : NSObject <UIActivityItemSource>
+@property (nonatomic, strong) UIImage *image;
+@property (nonatomic, copy) NSString *title;
+@end
+
+@implementation ApolloThemeCardActivityItem
+
+- (id)activityViewControllerPlaceholderItem:(UIActivityViewController *)controller {
+    return self.image;
+}
+
+- (id)activityViewController:(UIActivityViewController *)controller itemForActivityType:(UIActivityType)type {
+    return self.image;
+}
+
+- (NSString *)activityViewController:(UIActivityViewController *)controller subjectForActivityType:(UIActivityType)type {
+    return self.title ?: @"";
+}
+
+- (LPLinkMetadata *)activityViewControllerLinkMetadata:(UIActivityViewController *)controller {
+    LPLinkMetadata *metadata = [[LPLinkMetadata alloc] init];
+    metadata.title = self.title;
+    if (self.image) {
+        metadata.imageProvider = [[NSItemProvider alloc] initWithObject:self.image];
+        metadata.iconProvider = [[NSItemProvider alloc] initWithObject:self.image];
+    }
+    return metadata;
+}
+
+@end
 
 // ---------------------------------------------------------------------------
 // Small swatch helper
@@ -911,7 +951,11 @@ enum { ESName, ESVariant, ESColors, ESAdvanced, ESGenerate, ESPreview, ESShare, 
     NSDictionary *theme = [[self store] themeWithID:self.editingThemeID];
     UIImage *card = ApolloThemeShareRenderCard(theme, self.editingMode);
     if (!card) { [self showError:@"Couldn't render a share image for this theme."]; return; }
-    UIActivityViewController *av = [[UIActivityViewController alloc] initWithActivityItems:@[card] applicationActivities:nil];
+    ApolloThemeCardActivityItem *item = [[ApolloThemeCardActivityItem alloc] init];
+    item.image = card;
+    item.title = [theme[@"name"] isKindOfClass:[NSString class]] && [theme[@"name"] length]
+        ? [NSString stringWithFormat:@"%@ — Apollo theme", theme[@"name"]] : @"Apollo theme";
+    UIActivityViewController *av = [[UIActivityViewController alloc] initWithActivityItems:@[item] applicationActivities:nil];
     UIView *anchor = [self.tableView cellForRowAtIndexPath:ip] ?: self.view;
     av.popoverPresentationController.sourceView = anchor;
     av.popoverPresentationController.sourceRect = anchor.bounds;
