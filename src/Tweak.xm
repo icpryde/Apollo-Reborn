@@ -1482,6 +1482,7 @@ static void initializeRandomSources() {
                                     UDKeyCommunityHighlightsWeb: @NO,
                                     UDKeyAutoHideTabBarShowOnIdle: @NO,
                                     UDKeyKeepSearchBarInPlace: @NO,
+                                    UDKeyIPadTabBarBottom: @NO,
                                     UDKeyIconRowMagnifier: @YES,
                                     UDKeyLiveCommentsFollow: @YES,
                                     UDKeyEnableBulkTranslation: @NO,
@@ -1590,6 +1591,7 @@ static void initializeRandomSources() {
     sCommunityHighlightsWeb = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyCommunityHighlightsWeb];
     sAutoHideTabBarShowOnIdle = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyAutoHideTabBarShowOnIdle];
     sKeepSearchBarInPlace = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyKeepSearchBarInPlace];
+    sIPadTabBarBottom = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyIPadTabBarBottom];
     sIconRowMagnifier = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyIconRowMagnifier];
     sLiveCommentsFollow = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyLiveCommentsFollow];
     sModernSubredditDividers = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyModernSubredditDividers];

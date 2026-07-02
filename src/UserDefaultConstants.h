@@ -72,6 +72,12 @@ static NSString *const UDKeyAutoHideTabBarShowOnIdle = @"AutoHideTabBarShowOnIdl
 // "search takeover" (nav slides away + fades, field docks to the top and grows). Mutually
 // exclusive with the default nav-hide mode. Liquid Glass only. Default NO. See ApolloSearchInPlace.xm.
 static NSString *const UDKeyKeepSearchBarInPlace = @"KeepSearchBarInPlace";
+// iPad only, Liquid Glass only. When ON, forces the iOS 26 floating tab bar to
+// dock at the BOTTOM (classic tab bar) instead of the top-center pill, which on
+// iPad overlaps Apollo's search bar. Temporary stopgap for issue #387 until the
+// real iPad build lands. Opt-in; default OFF via registerDefaults. See ApolloIPadTabBarBottom.xm.
+static NSString *const UDKeyIPadTabBarBottom = @"IPadTabBarBottom";
+static NSString *const ApolloIPadTabBarBottomChangedNotification = @"ApolloIPadTabBarBottomChangedNotification";
 // When ON, press-and-hold anywhere on a post info row (score, comments,
 // timestamp, 🌐 translation marker…) shows the glass-slider magnifier loupe: the
 // row is zoomed in a Liquid Glass card, sliding moves the selection pill

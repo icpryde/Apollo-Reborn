@@ -36,6 +36,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloUserAvatars.xm \
     $(SRC_DIR)/ApolloProfileSocialLinks.m \
     $(SRC_DIR)/ApolloModeratorAvatars.xm \
+    $(SRC_DIR)/ApolloPublicStickyAsSubreddit.xm \
     $(SRC_DIR)/ApolloSubredditHeaders.xm \
     $(SRC_DIR)/ApolloSubredditHighlights.xm \
     $(SRC_DIR)/ApolloBannedProfile.xm \
@@ -60,12 +61,14 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloLiquidGlass.xm \
     $(SRC_DIR)/ApolloLiquidGlassIconPicker.xm \
     $(SRC_DIR)/ApolloAutoHideTabBar.xm \
+    $(SRC_DIR)/ApolloIPadTabBarBottom.xm \
     $(SRC_DIR)/ApolloSettings.xm \
     $(SRC_DIR)/ApolloRecentlyRead.xm \
     $(SRC_DIR)/ApolloSavedCategories.xm \
     $(SRC_DIR)/ApolloUserFlair.xm \
     $(SRC_DIR)/ApolloFlairColors.xm \
     $(SRC_DIR)/ApolloNativeActionMenus.xm \
+    $(SRC_DIR)/ApolloHostedVideo.m \
     $(SRC_DIR)/ApolloShareAsImageGallery.xm \
     $(SRC_DIR)/ApolloShareAsImageLink.xm \
     $(SRC_DIR)/ApolloShareAsVideo.xm \

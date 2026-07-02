@@ -33,6 +33,7 @@ BOOL sShowSubredditHeaders = NO;
 BOOL sCommunityHighlights = NO;
 BOOL sCommunityHighlightsWeb = NO;
 BOOL sAutoHideTabBarShowOnIdle = NO;
+BOOL sIPadTabBarBottom = NO;   // opt-in (default OFF via registerDefaults, UDKeyIPadTabBarBottom); iPad-gated in the module
 BOOL sKeepSearchBarInPlace = NO;
 BOOL sIconRowMagnifier = YES;   // effective default ON via registerDefaults (UDKeyIconRowMagnifier)
 BOOL sModernSubredditDividers = YES;
