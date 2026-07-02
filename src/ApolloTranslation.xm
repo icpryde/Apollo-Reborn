@@ -310,6 +310,7 @@ static NSHashTable *sPostInfoMarkerLabels = nil;
 // The title text node whose translation the marker toggles when tapped (feed only).
 static const void *kApolloMarkerTitleNodeKey = &kApolloMarkerTitleNodeKey;
 static void ApolloUpdatePostInfoMarkerForNode(id anyNode, NSString *sourceCode, BOOL show, id toggleNode);
+static void ApolloReserveMarkerSlotInCompactRow(UILabel *label, id postInfoNode, BOOL show);
 static void ApolloToggleTranslationForTitleNode(id titleTextNode);
 
 // YES on a cell view once we've installed the marker tap gesture on it.
@@ -4613,8 +4614,32 @@ static void ApolloUpdatePostInfoMarkerForNode(id anyNode, NSString *sourceCode, 
             // ↑ 💬 🕐 icons. This is now safe: the label is a CHILD of the age
             // view, so it's in a stable coordinate space (no cross-boundary drift
             // that made firstBaselineAnchor unreliable before).
+            //
+            // COMPACT rows draw the ⋯ more-options button immediately after the
+            // age stat — a 6pt lead put the marker right on top of it. When this
+            // is a compact PostInfoNode and the dots are mounted, start the
+            // marker just past their trailing edge instead (…🕐18h ⋯ 🌐PT).
+            CGFloat markerLead = 6.0;
+            {
+                BOOL infoIsCompact = NO;
+                Ivar civ = NULL;
+                for (Class c = [postInfoNode class]; c && c != [NSObject class] && !civ; c = class_getSuperclass(c)) {
+                    civ = class_getInstanceVariable(c, "isCompact");
+                }
+                if (civ) infoIsCompact = *((uint8_t *)(__bridge void *)postInfoNode + ivar_getOffset(civ)) != 0;
+                if (infoIsCompact) {
+                    id dotsNode = GetIvarObjectQuiet(postInfoNode, "moreOptionsButtonNode");
+                    CALayer *dotsLayer = nil;
+                    @try { if ([dotsNode respondsToSelector:@selector(layer)]) dotsLayer = [dotsNode layer]; } @catch (__unused NSException *e) {}
+                    if (dotsLayer && dotsLayer.superlayer && !dotsLayer.hidden && ageView.layer) {
+                        CGRect dotsInAge = [dotsLayer convertRect:dotsLayer.bounds toLayer:ageView.layer];
+                        CGFloat pastDots = CGRectGetMaxX(dotsInAge) - ageView.bounds.size.width + 6.0;
+                        if (pastDots > markerLead && pastDots < 120.0) markerLead = pastDots;
+                    }
+                }
+            }
             fresh = @[
-                [label.leadingAnchor constraintEqualToAnchor:ageView.trailingAnchor constant:6.0],
+                [label.leadingAnchor constraintEqualToAnchor:ageView.trailingAnchor constant:markerLead],
                 [label.firstBaselineAnchor constraintEqualToAnchor:ageView.topAnchor constant:markerFont.ascender],
             ];
         } else {
@@ -4662,11 +4687,71 @@ static void ApolloUpdatePostInfoMarkerForNode(id anyNode, NSString *sourceCode, 
     if (!content) {
         label.attributedText = nil;
         label.hidden = YES;
+        ApolloReserveMarkerSlotInCompactRow(label, postInfoNode, NO);
         return;
     }
     label.attributedText = content;
     label.hidden = NO;
     objc_setAssociatedObject(label, kApolloPostInfoMarkerSizeKey, @(markerFont.pointSize), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    ApolloReserveMarkerSlotInCompactRow(label, postInfoNode, YES);
+}
+
+// Reserve (or release) the marker's slot in the COMPACT stats row. The compact
+// PostInfoNode lays [authorRow, statsRow] in a flexWrap horizontal stack (RE:
+// PostInfoNode.layoutSpecThatFits sets setFlexWrap:1 when isCompact), so the
+// inline-vs-wrapped choice is a pure width decision — one that knows nothing
+// about our out-of-band marker. Rows that "just fit" inline then leave the
+// marker crammed against the screen edge. Reserving the marker's width as
+// spacingAfter on the ⋯ node makes the stack measure the row as if the marker
+// were a real child: tight rows wrap to the two-line layout (like every other
+// post), and the reserved gap after the dots is exactly where the marker sits.
+static const void *kApolloPostInfoMarkerSpacedNodeKey = &kApolloPostInfoMarkerSpacedNodeKey;
+
+static void ApolloReserveMarkerSlotInCompactRow(UILabel *label, id postInfoNode, BOOL show) {
+    id previous = objc_getAssociatedObject(label, kApolloPostInfoMarkerSpacedNodeKey);
+    BOOL infoIsCompact = NO;
+    if (postInfoNode) {
+        Ivar civ = NULL;
+        for (Class c = [postInfoNode class]; c && c != [NSObject class] && !civ; c = class_getSuperclass(c)) {
+            civ = class_getInstanceVariable(c, "isCompact");
+        }
+        if (civ) infoIsCompact = *((uint8_t *)(__bridge void *)postInfoNode + ivar_getOffset(civ)) != 0;
+    }
+    id dotsNode = (show && infoIsCompact) ? GetIvarObjectQuiet(postInfoNode, "moreOptionsButtonNode") : nil;
+    id target = dotsNode ?: previous;
+    if (!target) return;
+    CGFloat want = 0.0;
+    if (show && dotsNode) {
+        CGSize sz = label.intrinsicContentSize;
+        if (sz.width > 1.0 && sz.width < 200.0) want = ceil(sz.width) + 10.0;
+    }
+    id style = nil;
+    @try {
+        if ([target respondsToSelector:@selector(style)]) {
+            style = ((id (*)(id, SEL))objc_msgSend)(target, @selector(style));
+        }
+    } @catch (__unused NSException *e) {}
+    if (!style || ![style respondsToSelector:@selector(setSpacingAfter:)]) return;
+    CGFloat cur = 0.0;
+    @try { cur = ((CGFloat (*)(id, SEL))objc_msgSend)(style, @selector(spacingAfter)); } @catch (__unused NSException *e) {}
+    if (fabs(cur - want) < 0.5) return;
+    @try { ((void (*)(id, SEL, CGFloat))objc_msgSend)(style, @selector(setSpacingAfter:), want); } @catch (__unused NSException *e) { return; }
+    objc_setAssociatedObject(label, kApolloPostInfoMarkerSpacedNodeKey, want > 0.0 ? target : nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    // Re-run layout so the wrap decision sees the reservation; bubble to the
+    // cell node so the row height can grow for the wrapped line.
+    @try { if ([postInfoNode respondsToSelector:@selector(setNeedsLayout)]) [postInfoNode setNeedsLayout]; } @catch (__unused NSException *e) {}
+    Class cellCls = NSClassFromString(@"ASCellNode");
+    id node = postInfoNode;
+    for (int i = 0; i < 8 && node; i++) {
+        @try {
+            node = [node respondsToSelector:@selector(supernode)]
+                ? ((id (*)(id, SEL))objc_msgSend)(node, @selector(supernode)) : nil;
+        } @catch (__unused NSException *e) { node = nil; }
+        if (cellCls && [node isKindOfClass:cellCls]) {
+            @try { [node setNeedsLayout]; } @catch (__unused NSException *e) {}
+            break;
+        }
+    }
 }
 
 static void ApolloHideAllPostInfoMarkers(void) {
@@ -4675,6 +4760,7 @@ static void ApolloHideAllPostInfoMarkers(void) {
         if ([label isKindOfClass:[UILabel class]]) {
             label.attributedText = nil;
             label.hidden = YES;
+            ApolloReserveMarkerSlotInCompactRow(label, nil, NO);
         }
     }
 }
