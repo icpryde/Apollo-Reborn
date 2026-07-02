@@ -115,7 +115,7 @@ static NSString *const kApolloBrowserDefaultToken = @"external-safari";
         return @"When enabled, links to these services open directly in their app (if installed) instead of a web view.";
     }
     if (section == ApolloOpenInAppSectionBrowser) {
-        return @"Choose how other web links open. In-App Safari opens inside Apollo; Default Browser uses your iOS default browser.";
+        return @"Choose how other web links open. In-App Safari opens inside Apollo; System Default uses your iOS default browser.";
     }
     return nil;
 }
@@ -151,13 +151,15 @@ static NSString *const kApolloBrowserDefaultToken = @"external-safari";
 }
 
 // "In-App Safari" when the stored token is in-app (or unset = Apollo's default);
-// "Default Browser" for the external token (or any other external browser token).
+// "System Default" for the external token (or any other external browser token).
+// ("System Default" rather than "Default Browser" so the row doesn't read
+// "Default Browser: Default Browser".)
 - (NSString *)browserModeLabel {
     NSString *token = [[NSUserDefaults standardUserDefaults] stringForKey:kApolloOpenLinksInKey];
     if (token.length == 0 || [token isEqualToString:kApolloBrowserInAppToken]) {
         return @"In-App Safari";
     }
-    return @"Default Browser";
+    return @"System Default";
 }
 
 - (UITableViewCell *)browserCell {
@@ -174,12 +176,12 @@ static NSString *const kApolloBrowserDefaultToken = @"external-safari";
     NSString *current = [self browserModeLabel];
     UIAlertController *sheet = [UIAlertController
         alertControllerWithTitle:@"Default Browser"
-                         message:@"In-App Safari opens links inside Apollo. Default Browser opens them in your iOS default browser (Safari, Chrome, etc.)."
+                         message:@"In-App Safari opens links inside Apollo. System Default opens them in your iOS default browser (Safari, Chrome, etc.)."
                   preferredStyle:UIAlertControllerStyleActionSheet];
 
     NSArray<NSArray<NSString *> *> *options = @[
-        @[@"In-App Safari",   kApolloBrowserInAppToken],
-        @[@"Default Browser", kApolloBrowserDefaultToken],
+        @[@"In-App Safari",  kApolloBrowserInAppToken],
+        @[@"System Default", kApolloBrowserDefaultToken],
     ];
     for (NSArray<NSString *> *option in options) {
         NSString *label = option[0];
