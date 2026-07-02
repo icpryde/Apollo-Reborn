@@ -3,8 +3,11 @@
 #import "ApolloThemeStore.h"
 #import "ApolloThemeCompiler.h"
 #import "ApolloThemeRuntime.h"
+#import "ApolloThemeShareImage.h"
+#import "ApolloThemeQRScanViewController.h"
 #import "ApolloCommon.h"
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#import <PhotosUI/PhotosUI.h>
 
 // ---------------------------------------------------------------------------
 // Small swatch helper
@@ -73,7 +76,7 @@ static NSString *ThemeInputDescription(NSString *key) {
 
 // ---------------------------------------------------------------------------
 
-@interface ApolloThemeManagerViewController () <UIColorPickerViewControllerDelegate, UIDocumentPickerDelegate>
+@interface ApolloThemeManagerViewController () <UIColorPickerViewControllerDelegate, UIDocumentPickerDelegate, PHPickerViewControllerDelegate>
 @property (nonatomic, copy) NSString *editingThemeID;     // nil = list mode
 @property (nonatomic, assign) ApolloThemeMode editingMode; // which appearance the editor shows
 @property (nonatomic, copy) NSString *pickingInputKey;     // input key currently in the colour picker
@@ -82,9 +85,9 @@ static NSString *ThemeInputDescription(NSString *key) {
 
 // List mode:   0 Enable | 1 Themes | 2 New/Import
 // Editor mode: 0 Name | 1 Variant+Mode | 2 Colours | 3 Advanced | 4 Generate
-//              5 Preview | 6 Apply
+//              5 Preview | 6 Share | 7 Apply
 enum { LSEnable, LSThemes, LSActions, LSCount };
-enum { ESName, ESVariant, ESColors, ESAdvanced, ESGenerate, ESPreview, ESApply, ESCount };
+enum { ESName, ESVariant, ESColors, ESAdvanced, ESGenerate, ESPreview, ESShare, ESApply, ESCount };
 
 @implementation ApolloThemeManagerViewController
 
@@ -167,7 +170,7 @@ enum { ESName, ESVariant, ESColors, ESAdvanced, ESGenerate, ESPreview, ESApply, 
         if (active) cell.detailTextLabel.textColor = accent;
     }
     if ((!self.editingThemeID && ip.section == LSActions) ||
-        (self.editingThemeID && (ip.section == ESGenerate || ip.section == ESApply))) {
+        (self.editingThemeID && (ip.section == ESGenerate || ip.section == ESShare || ip.section == ESApply))) {
         cell.textLabel.textColor = accent;
     }
 }
@@ -234,6 +237,7 @@ enum { ESName, ESVariant, ESColors, ESAdvanced, ESGenerate, ESPreview, ESApply, 
             case ESAdvanced: return 1 + (advancedEnabled ? ApolloThemeAdvancedInputKeys().count : 0);
             case ESGenerate: return 1;
             case ESPreview:  return 4;
+            case ESShare:    return 1;
             case ESApply:    return 1;
         }
         return 0;
@@ -262,6 +266,8 @@ enum { ESName, ESVariant, ESColors, ESAdvanced, ESGenerate, ESPreview, ESApply, 
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)section {
     if (self.editingThemeID && section == ESAdvanced)
         return @"Turn on advanced options to override text and separator colours.";
+    if (self.editingThemeID && section == ESShare)
+        return @"Shares a picture of this theme with a QR code — anyone can import it straight from the image.";
     if (self.editingThemeID && section == ESApply)
         return @"Applying selects this theme and enables custom theming.";
     if (!self.editingThemeID && section == LSEnable && [[self store] runtimeDisabledDueToCrash])
@@ -415,6 +421,13 @@ enum { ESName, ESVariant, ESColors, ESAdvanced, ESGenerate, ESPreview, ESApply, 
         }
         case ESPreview:
             return [self previewCellForRow:ip.row];
+        case ESShare: {
+            UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+            cell.textLabel.text = @"Share as Image…";
+            cell.textLabel.textColor = self.view.tintColor;
+            cell.imageView.image = [UIImage systemImageNamed:@"square.and.arrow.up"];
+            return cell;
+        }
         case ESApply: {
             UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
             cell.textLabel.text = @"Apply Theme";
@@ -486,7 +499,7 @@ enum { ESName, ESVariant, ESColors, ESAdvanced, ESGenerate, ESPreview, ESApply, 
     }
     if (ip.section == LSActions) {
         if (ip.row == 0) [self newThemeTapped];
-        else [self importTapped];
+        else [self importOptionsFromIndexPath:ip];
     }
 }
 
@@ -503,6 +516,7 @@ enum { ESName, ESVariant, ESColors, ESAdvanced, ESGenerate, ESPreview, ESApply, 
             }
             break;
         case ESGenerate: [self generateOppositeMode]; break;
+        case ESShare: [self shareThemeAsImageFromIndexPath:ip]; break;
         case ESApply: [self applyTheme]; break;
     }
 }
@@ -710,10 +724,38 @@ enum { ESName, ESVariant, ESColors, ESAdvanced, ESGenerate, ESPreview, ESApply, 
 // Import / export
 // ===========================================================================
 
+// "Import Theme…" now fans out to the three routes: a .json export file, a
+// shared theme-card image (QR), or a live camera scan of someone else's card.
+- (void)importOptionsFromIndexPath:(NSIndexPath *)ip {
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Import Theme"
+                                                                   message:nil
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"From File…" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
+        [self importTapped];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"From Photo…" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
+        [self presentImageImportPicker];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Scan with Camera…" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
+        [self presentThemeQRScanner];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    UIView *anchor = [self.tableView cellForRowAtIndexPath:ip] ?: self.view;
+    sheet.popoverPresentationController.sourceView = anchor;
+    sheet.popoverPresentationController.sourceRect = anchor.bounds;
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
 - (void)importTapped {
-    UTType *json = UTTypeJSON ?: [UTType typeWithIdentifier:@"public.json"];
+    // Widened beyond JSON: theme-card images import here too, and sideloaded
+    // installs often see .json tagged as public.data / dyn.* types.
+    NSMutableArray<UTType *> *types = [NSMutableArray array];
+    for (UTType *t in @[UTTypeJSON ?: [UTType typeWithIdentifier:@"public.json"],
+                        UTTypeImage, UTTypePlainText, UTTypeData, UTTypeItem]) {
+        if (t) [types addObject:t];
+    }
     UIDocumentPickerViewController *picker =
-        [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[json]];
+        [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:types];
     picker.delegate = self;
     picker.allowsMultipleSelection = NO;
     [self presentViewController:picker animated:YES completion:nil];
@@ -723,20 +765,88 @@ enum { ESName, ESVariant, ESColors, ESAdvanced, ESGenerate, ESPreview, ESApply, 
     NSURL *url = urls.firstObject;
     if (!url) return;
     BOOL scoped = [url startAccessingSecurityScopedResource];
-    // Reject oversized files BEFORE reading into memory (spec §14.2).
+    // Reject absurd files BEFORE reading into memory. Theme-card images are
+    // legitimately multi-MB (photos of a screen, PNG screenshots), so the strict
+    // JSON cap only applies on the JSON branch below.
+    static const unsigned long long kMaxImportFileBytes = 40ull * 1024 * 1024;
     NSNumber *size = nil;
     [url getResourceValue:&size forKey:NSURLFileSizeKey error:NULL];
-    if (size && size.unsignedLongLongValue > [ApolloThemeStore maxImportBytes]) {
+    if (size && size.unsignedLongLongValue > kMaxImportFileBytes) {
         if (scoped) [url stopAccessingSecurityScopedResource];
         [self showError:@"That file is too large to be a theme."];
         return;
     }
     NSData *data = [NSData dataWithContentsOfURL:url];
     if (scoped) [url stopAccessingSecurityScopedResource];
+    if (!data.length) { [self showError:@"Couldn't read that file."]; return; }
+
+    // Sniff by content, not by declared type (sideload type tagging is
+    // unreliable): anything that decodes as an image goes down the QR route.
+    UIImage *image = [UIImage imageWithData:data];
+    if (image) {
+        [self importFromCardImage:image];
+        return;
+    }
+    if (data.length > [ApolloThemeStore maxImportBytes]) {
+        [self showError:@"That file is too large to be a theme."];
+        return;
+    }
     NSString *err = nil;
     NSDictionary *parsed = [[self store] parseImportData:data error:&err];
     if (!parsed) { [self showError:err ?: @"Couldn't read that theme."]; return; }
     [self confirmImport:parsed];
+}
+
+// Decode a picked/photographed theme card off-main (Vision on a full-res photo
+// can take a beat), then confirm on main.
+- (void)importFromCardImage:(UIImage *)image {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSDictionary *parsed = ApolloThemeShareDecodeImage(image);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!parsed) {
+                [self showError:@"This image doesn't contain an Apollo theme code. Import the original shared theme image (screenshots of it work too, as long as the QR code is visible)."];
+                return;
+            }
+            [self confirmImport:parsed];
+        });
+    });
+}
+
+- (void)presentImageImportPicker {
+    PHPickerConfiguration *config = [[PHPickerConfiguration alloc] init];
+    config.filter = [PHPickerFilter imagesFilter];
+    config.selectionLimit = 1;
+    PHPickerViewController *picker = [[PHPickerViewController alloc] initWithConfiguration:config];
+    picker.delegate = self;
+    [self presentViewController:picker animated:YES completion:nil];
+}
+
+- (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
+    [picker dismissViewControllerAnimated:YES completion:nil];
+    PHPickerResult *result = results.firstObject;
+    if (!result) return; // cancelled
+    NSItemProvider *provider = result.itemProvider;
+    if (![provider canLoadObjectOfClass:[UIImage class]]) {
+        [self showError:@"Couldn't read that image."];
+        return;
+    }
+    [provider loadObjectOfClass:[UIImage class] completionHandler:^(id<NSItemProviderReading> object, NSError *error) {
+        UIImage *image = [object isKindOfClass:[UIImage class]] ? (UIImage *)object : nil;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!image) { [self showError:@"Couldn't read that image."]; return; }
+            [self importFromCardImage:image];
+        });
+    }];
+}
+
+- (void)presentThemeQRScanner {
+    ApolloThemeQRScanViewController *scanner = [[ApolloThemeQRScanViewController alloc] init];
+    scanner.modalPresentationStyle = UIModalPresentationFullScreen;
+    __weak typeof(self) weakSelf = self;
+    scanner.onScan = ^(NSDictionary *parsed) {
+        [weakSelf confirmImport:parsed];
+    };
+    [self presentViewController:scanner animated:YES completion:nil];
 }
 
 - (void)confirmImport:(NSDictionary *)parsed {
@@ -748,10 +858,28 @@ enum { ESName, ESVariant, ESColors, ESAdvanced, ESGenerate, ESPreview, ESApply, 
     [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [a addAction:[UIAlertAction actionWithTitle:@"Import" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
         NSString *newID = [[self store] importParsedTheme:parsed];
+        // Importing makes the new theme active (Store create semantics) — if
+        // custom theming is live, reload so the app doesn't keep rendering the
+        // previous theme's colours until some unrelated trigger.
+        if ([self store].customThemeEnabled) {
+            ApolloThemeRuntimeReload();
+            ApolloThemeRuntimeInvalidate();
+        }
         [self.tableView reloadData];
         [self openEditorForThemeID:newID];
     }]];
     [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)shareThemeAsImageFromIndexPath:(NSIndexPath *)ip {
+    NSDictionary *theme = [[self store] themeWithID:self.editingThemeID];
+    UIImage *card = ApolloThemeShareRenderCard(theme, self.editingMode);
+    if (!card) { [self showError:@"Couldn't render a share image for this theme."]; return; }
+    UIActivityViewController *av = [[UIActivityViewController alloc] initWithActivityItems:@[card] applicationActivities:nil];
+    UIView *anchor = [self.tableView cellForRowAtIndexPath:ip] ?: self.view;
+    av.popoverPresentationController.sourceView = anchor;
+    av.popoverPresentationController.sourceRect = anchor.bounds;
+    [self presentViewController:av animated:YES completion:nil];
 }
 
 - (void)exportTheme:(NSDictionary *)theme {
