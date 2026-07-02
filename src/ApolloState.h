@@ -23,15 +23,38 @@ extern NSInteger sReadPostMaxCount;
 // 0 = Default (off), 1 = Remember from Full Screen, 2 = Always
 extern NSInteger sUnmuteCommentsVideos;
 
+// "Hold for Video Speed": when ON (default), press-and-hold the right side of a
+// fullscreen video to play it at sVideoHoldSpeed while held; release restores the
+// prior rate. When OFF the right side behaves like the rest of the player (normal
+// long-press menu). sVideoHoldSpeed is one of 0.25/0.5/0.75/1.25/1.5/2.0 (default
+// 2.0×). Both default via registerDefaults. See ApolloVideoHoldSpeed.xm.
+extern BOOL sVideoHoldSpeedEnabled;
+extern float sVideoHoldSpeed;
+// Snap an arbitrary stored value to the nearest supported hold speed; falls back
+// to 2.0× for an unset/corrupt/out-of-set value. Keeps the runtime, the load
+// paths, and the picker agreeing on exactly the six offered speeds. Wrapped in
+// extern "C" so the ObjC++ (.xm) callers and the ObjC (.m) definition agree on the
+// unmangled symbol name (the extern *variables* above need no guard — global
+// variable names aren't C++-mangled).
+#ifdef __cplusplus
+extern "C" {
+#endif
+float ApolloSanitizedHoldSpeed(float value);
+#ifdef __cplusplus
+}
+#endif
+
 extern BOOL sProxyImgurDDG;
 extern BOOL sShowUserAvatars;
 extern BOOL sUseProfileAvatarTabIcon;
-// When ON, a redditor's profile social links (Buy Me a Coffee, Instagram, X, …) are
-// shown in the profile header between the username and bio: a tappable pill for a
-// single link, or a row of brand badges that opens a slide-up sheet for several.
-// Rendered inside the tweak's custom profile header, so it needs sShowUserAvatars ON.
-// See ApolloProfileSocialLinks.{h,m}.
-extern BOOL sSocialLinksInProfile;
+// When ON (default), profile pages show Reborn's detailed profile — the banner,
+// large avatar/snoovatar, display name, bio, and the Social Links band (Buy Me a
+// Coffee, Instagram, X, …). When OFF, profiles revert to Apollo's compact stock
+// layout — the detailed header is not installed and any existing one is torn down.
+// Independent of sShowUserAvatars (inline avatars). The Social Links band lives
+// inside this header, so it is gated on this same flag. Default ON via
+// registerDefaults. See ApolloUserAvatars.xm and ApolloProfileSocialLinks.{h,m}.
+extern BOOL sShowDetailedProfiles;
 extern BOOL sShowSubredditHeaders;
 // When ON, a horizontally-scrolling "Community Highlights" carousel of the
 // subreddit's pinned/stickied posts is shown at the top of the feed (mirrors
@@ -43,10 +66,18 @@ extern BOOL sCommunityHighlights;
 // ApolloSubredditHighlights.xm (ApolloHLWebFetch).
 extern BOOL sCommunityHighlightsWeb;
 extern BOOL sAutoHideTabBarShowOnIdle;
+// iPad + Liquid Glass only. When ON, docks the iOS 26 floating tab bar at the
+// bottom (classic) instead of the top-center pill. Opt-in; default OFF via
+// registerDefaults. Temporary stopgap for issue #387. See ApolloIPadTabBarBottom.xm.
+extern BOOL sIPadTabBarBottom;
 // When ON, neutralizes Apollo's feed/subreddit search takeover (nav-hide + fade + toolbar
 // dock/grow); the field stays put and results populate the feed in place. Liquid Glass only;
 // mutually exclusive with the default nav-hide mode. See ApolloSearchInPlace.xm.
 extern BOOL sKeepSearchBarInPlace;
+// When ON (default), Live Update comment sort keeps the newest comments visible at the top
+// while you're at the top, and shows a "N new comments" jump pill when you've scrolled down
+// to read/reply. See ApolloLiveCommentsFollow.xm. Default ON via registerDefaults.
+extern BOOL sLiveCommentsFollow;
 extern BOOL sModernSubredditDividers;
 // Master toggle for subreddit list enhancements (see UDKeySubredditListEnhancements).
 extern BOOL sSubredditListEnhancements;

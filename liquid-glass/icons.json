@@ -58,6 +58,9 @@
     { "id": "jryng-eap",                "displayName": "EAP",                 "designer": "jryng", "group": "new-variants" },
     { "id": "jryng-red",                "displayName": "Red",                 "designer": "jryng", "group": "new-variants" },
 
+    { "id": "lilacvibes-trans",         "displayName": "Trans",               "designer": "lilacvibes", "group": "new-variants" },
+    { "id": "lilacvibes-pride",         "displayName": "Pride",               "designer": "lilacvibes", "group": "new-variants" },
+    { "id": "lilacvibes-progress",      "displayName": "Progress Pride",      "designer": "lilacvibes", "group": "new-variants" },
 
     { "id": "bajader-aperture-science", "displayName": "Aperture Science",    "designer": "bajader", "group": "custom" },
     { "id": "bajader-apollos",          "displayName": "ApollOS",             "designer": "bajader", "group": "custom" },

@@ -1,8 +1,15 @@
 // ApolloVideoHoldSpeed.xm
 //
-// "Hold for 2×" — press-and-hold the RIGHT third of the fullscreen video to
-// play it at 2× speed while held; release to restore the previous rate.
+// "Hold for Video Speed" — press-and-hold the RIGHT third of the fullscreen video
+// to play it at a chosen speed while held; release to restore the previous rate.
 // (GitHub issue #78.)
+//
+// Configurable via Settings → Media → "Hold for Video Speed":
+//   • A master toggle (default ON — preserves the original always-on behaviour).
+//     When OFF, the right side behaves like the rest of the player (normal menu).
+//   • A "Hold Speed" picker — one of 0.25×/0.5×/0.75×/1.25×/1.5×/2× (default 2×),
+//     so the gesture can speed video up OR slow it down (slow-motion review).
+//   Both live in sVideoHoldSpeedEnabled / sVideoHoldSpeed (read live at touch).
 //
 // The fullscreen player is `MediaViewerController` (ObjC name
 // `_TtC6Apollo21MediaViewerController`). A long-press anywhere on it normally
@@ -11,10 +18,10 @@
 //
 // We must coexist with that menu, not replace it:
 //
-//     ┌──────────────────────────┬──────────┐
-//     │     left + center 2/3    │  right ⅓ │
-//     │   normal long-press menu │  2× hold │
-//     └──────────────────────────┴──────────┘
+//     ┌──────────────────────────┬────────────┐
+//     │     left + center 2/3    │   right ⅓   │
+//     │   normal long-press menu │  speed hold │
+//     └──────────────────────────┴────────────┘
 //
 // Why a custom passive recognizer (not a UILongPressGestureRecognizer):
 //   A second long-press recognizer competing with Apollo's loses UIKit's gesture
@@ -25,14 +32,15 @@
 //   arbitration can't kill it and it never blocks Apollo's own tap/pan handling.
 //
 // Mechanics:
-//   • On touch-DOWN we check, against the video's live on-screen geometry, whether
-//     the touch is in the right third. If so we immediately DISABLE every other
-//     long-press recognizer in the tree — so the menu simply can't appear for this
-//     touch — and re-enable them on release. (No timing race with the menu.)
+//   • On touch-DOWN, if the feature is on, we check (against the video's live
+//     on-screen geometry) whether the touch is in the right third. If so we
+//     immediately DISABLE every other long-press recognizer in the tree — so the
+//     menu simply can't appear for this touch — and re-enable them on release.
+//     (No timing race with the menu.)
 //   • If the press is still held after a short delay, we capture the live rate,
-//     force 2×, and show a "2× ⏵⏵" overlay. On release we restore the captured
-//     rate and hide the overlay. A quick tap in the right zone just toggles the
-//     menu recognizers off/on with no speed change.
+//     force the chosen speed, and show a "<speed>× ⏵⏵" overlay reflecting it. On
+//     release we restore the captured rate and hide the overlay. A quick tap in
+//     the right zone just toggles the menu recognizers off/on with no speed change.
 //   • Left/center touches are left entirely alone, so the normal menu still works.
 //   • We never touch `videoPlaybackSpeed` (Apollo's persistent menu choice), so
 //     the speed menu's checkmark stays correct.
@@ -42,6 +50,7 @@
 // to landscape on the portrait-locked screen, and under pinch-zoom.
 
 #import "ApolloCommon.h"
+#import "ApolloState.h"   // sVideoHoldSpeedEnabled, sVideoHoldSpeed, ApolloSanitizedHoldSpeed
 
 #import <UIKit/UIKit.h>
 #import <UIKit/UIGestureRecognizerSubclass.h>
@@ -49,13 +58,14 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 
-// Rightmost fraction of the video that activates hold-to-2×.
+// Rightmost fraction of the video that activates hold-to-speed.
 static const CGFloat kRightZoneFraction = 1.0 / 3.0;
 
-// The speed applied while held.
-static const float kHoldSpeed = 2.0f;
+// The speed applied while held comes from the in-app "Hold for Video Speed" picker
+// (sVideoHoldSpeed), read live at engage. ApolloSanitizedHoldSpeed() guards it to
+// the six supported values, falling back to 2.0× for any unset/invalid value.
 
-// How long the press must be held before 2× engages. Short enough to feel
+// How long the press must be held before the speed engages. Short enough to feel
 // instant, long enough that a quick tap never trips it. (This only gates the
 // speed change — the menu is suppressed at touch-down, so there's no race.)
 static const NSTimeInterval kHoldActivationDelay = 0.18;
@@ -63,6 +73,34 @@ static const NSTimeInterval kHoldActivationDelay = 0.18;
 // Movement (in points) that cancels a pending hold, so a drag becomes a normal
 // scrub / swipe-to-dismiss instead of a speed-up.
 static const CGFloat kHoldMoveTolerance = 12.0;
+
+// Haptic tap fired the instant the hold speed engages, mirroring the press-and-hold
+// cue in YouTube/Instagram — a clear-but-gentle "it's on" tick. Medium impact;
+// the Taptic Engine is pre-warmed on touch-down so the tap lands with no lag.
+static const UIImpactFeedbackStyle kHoldHapticStyle = UIImpactFeedbackStyleMedium;
+
+// Top-center overlay text for the engaged speed, e.g. "2× ⏵⏵" or "0.5×". The
+// fast-forward chevrons (U+23F5 ×2) read as "faster", so they're shown only when
+// speeding up; for slow-motion speeds (<1×) the bare multiplier is clearer and the
+// arrows would actively mislead. Mirrors whatever the user picked in settings.
+static NSAttributedString *HoldOverlayText(float speed) {
+    NSString *num;
+    if (fabsf(speed - 0.25f) < 0.001f)      num = @"0.25";
+    else if (fabsf(speed - 0.5f)  < 0.001f) num = @"0.5";
+    else if (fabsf(speed - 0.75f) < 0.001f) num = @"0.75";
+    else if (fabsf(speed - 1.25f) < 0.001f) num = @"1.25";
+    else if (fabsf(speed - 1.5f)  < 0.001f) num = @"1.5";
+    else if (fabsf(speed - 2.0f)  < 0.001f) num = @"2";
+    else                                    num = [NSString stringWithFormat:@"%g", speed];
+    // U+00D7 multiplication sign; chevrons only when boosting.
+    NSString *s = (speed > 1.0f)
+        ? [NSString stringWithFormat:@"%@%C ⏵⏵", num, (unichar)0x00D7]
+        : [NSString stringWithFormat:@"%@%C", num, (unichar)0x00D7];
+    return [[NSAttributedString alloc] initWithString:s attributes:@{
+        NSFontAttributeName: [UIFont systemFontOfSize:17.0 weight:UIFontWeightSemibold],
+        NSForegroundColorAttributeName: [UIColor whiteColor],
+    }];
+}
 
 #pragma mark - Player access (mirrors ApolloVideoPlaybackSpeed.xm)
 
@@ -257,17 +295,21 @@ static void CollectContextMenuInteractions(UIView *view,
 @property (nonatomic, weak) UIViewController *mediaViewer;
 @property (nonatomic, strong) ApolloHoldTouchRecognizer *recognizer;
 @property (nonatomic, strong) UIView *overlayView;
+@property (nonatomic, strong) UILabel *overlayLabel;   // updated per-engage to the chosen speed
+@property (nonatomic, assign) float engagedHoldSpeed;  // the speed currently applied (for the overlay)
 // Apollo's context-menu interaction(s), removed while a right-zone touch is down
 // and re-added on release. Parallel arrays (interaction + the view it belongs to).
 @property (nonatomic, strong) NSArray<UIContextMenuInteraction *> *suppressedInteractions;
 @property (nonatomic, strong) NSArray<UIView *> *suppressedInteractionViews;
 @property (nonatomic, assign) BOOL inZone;     // current touch began in the right third
-@property (nonatomic, assign) BOOL active;     // 2× currently engaged
+@property (nonatomic, assign) BOOL active;     // hold speed currently engaged
 @property (nonatomic, assign) float preHoldRate;
+// Fires a single confirmation tap when the hold speed engages. Pre-warmed on touch-down.
+@property (nonatomic, strong) UIImpactFeedbackGenerator *hapticGenerator;
 // The exact AVPlayer we sped up, held strongly so we restore *that* instance on
 // release — not one re-resolved from the (possibly torn-down) media viewer. For
 // shared v.redd.it players, re-resolving could miss the restore and leave the
-// feed/comments copy stuck at 2×.
+// feed/comments copy stuck at the hold speed.
 @property (nonatomic, strong) AVPlayer *engagedPlayer;
 - (void)installOnView:(UIView *)view;
 @end
@@ -347,11 +389,23 @@ static void CollectContextMenuInteractions(UIView *view,
 #pragma mark Touch lifecycle
 
 - (void)touchDownAt:(CGPoint)windowPoint {
+    // Feature off → the right side behaves like the rest of the player: no zone
+    // capture, no menu suppression, no haptic, so Apollo's normal long-press menu
+    // appears everywhere. Read live so a settings change applies immediately.
+    if (!sVideoHoldSpeedEnabled) { self.inZone = NO; return; }
     self.inZone = [self pointInActivationZone:windowPoint];
     // Remove the context-menu interaction the instant a right-zone touch lands, so
     // the menu can never appear for this press. Left/center is left alone → normal
     // menu. Restored on release.
-    if (self.inZone) [self suppressMenu];
+    if (self.inZone) {
+        [self suppressMenu];
+        // Warm up the Taptic Engine now (the press is still ~0.18s from engaging)
+        // so the confirmation tap fires with no perceptible latency.
+        if (!self.hapticGenerator) {
+            self.hapticGenerator = [[UIImpactFeedbackGenerator alloc] initWithStyle:kHoldHapticStyle];
+        }
+        [self.hapticGenerator prepare];
+    }
 }
 
 - (void)holdElapsedAt:(CGPoint)windowPoint {
@@ -359,12 +413,23 @@ static void CollectContextMenuInteractions(UIView *view,
     AVPlayer *player = MediaViewerPlayer(self.mediaViewer);
     if (!player) { ApolloLog(@"VideoHoldSpeed: holdElapsed — no player"); return; }
 
+    float holdSpeed = ApolloSanitizedHoldSpeed(sVideoHoldSpeed);   // user's "Hold Speed" choice
+    self.engagedHoldSpeed = holdSpeed;
     self.engagedPlayer = player;      // restore THIS exact instance on release
     self.preHoldRate = player.rate;   // 0 if paused, 1.0, or a custom menu speed
     self.active = YES;
-    [player setRate:kHoldSpeed];
+    [player setRate:holdSpeed];
     [self showOverlay];
-    ApolloLog(@"VideoHoldSpeed: engaged 2x (prevRate=%.2f)", self.preHoldRate);
+
+    // A single confirmation tap the moment the speed kicks in — the tactile
+    // equivalent of the overlay, like YouTube/Instagram. No-op on devices without a
+    // Taptic Engine. (Created/prepared on touch-down; create defensively in case.)
+    if (!self.hapticGenerator) {
+        self.hapticGenerator = [[UIImpactFeedbackGenerator alloc] initWithStyle:kHoldHapticStyle];
+    }
+    [self.hapticGenerator impactOccurred];
+
+    ApolloLog(@"VideoHoldSpeed: engaged %.2fx (prevRate=%.2f)", holdSpeed, self.preHoldRate);
 }
 
 - (void)touchUp {
@@ -376,7 +441,7 @@ static void CollectContextMenuInteractions(UIView *view,
     // viewer, which may be a different instance (compact posts spin up a fresh
     // comments player) or nil (a swipe-to-dismiss while holding can tear down the
     // weak mediaViewer before the finger lifts). Missing the restore on a shared
-    // v.redd.it player would leave the feed/comments copy stuck at 2×.
+    // v.redd.it player would leave the feed/comments copy stuck at the hold speed.
     [self.engagedPlayer setRate:self.preHoldRate];
     self.engagedPlayer = nil;
     [self hideOverlay];
@@ -407,14 +472,6 @@ static void CollectContextMenuInteractions(UIView *view,
         blur.userInteractionEnabled = NO;
 
         UILabel *label = [[UILabel alloc] init];
-        // "2× ⏵⏵" — U+00D7 multiplication sign, U+23F5 double right-pointing.
-        label.attributedText = ({
-            NSString *s = [NSString stringWithFormat:@"2%C ⏵⏵", (unichar)0x00D7];
-            [[NSAttributedString alloc] initWithString:s attributes:@{
-                NSFontAttributeName: [UIFont systemFontOfSize:17.0 weight:UIFontWeightSemibold],
-                NSForegroundColorAttributeName: [UIColor whiteColor],
-            }];
-        });
         label.translatesAutoresizingMaskIntoConstraints = NO;
         [blur.contentView addSubview:label];
         [NSLayoutConstraint activateConstraints:@[
@@ -423,8 +480,12 @@ static void CollectContextMenuInteractions(UIView *view,
             [label.topAnchor constraintEqualToAnchor:blur.contentView.topAnchor constant:8.0],
             [label.bottomAnchor constraintEqualToAnchor:blur.contentView.bottomAnchor constant:-8.0],
         ]];
+        self.overlayLabel = label;
         self.overlayView = blur;
     }
+
+    // Refresh the text each engage — the chosen speed can change between holds.
+    self.overlayLabel.attributedText = HoldOverlayText(self.engagedHoldSpeed);
 
     UIView *overlay = self.overlayView;
     if (overlay.superview != host) {
@@ -485,5 +546,5 @@ static void InstallHoldSpeed(UIViewController *mvc) {
 %end
 
 %ctor {
-    ApolloLog(@"ApolloVideoHoldSpeed: module loaded (hold right third for 2x)");
+    ApolloLog(@"ApolloVideoHoldSpeed: module loaded (hold right third for chosen speed)");
 }

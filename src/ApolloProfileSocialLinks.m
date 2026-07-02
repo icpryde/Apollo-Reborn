@@ -12,7 +12,9 @@
 NSString *const ApolloSocialLinksToggleChangedNotification = @"ApolloSocialLinksToggleChangedNotification";
 
 BOOL ApolloProfileSocialLinksEnabled(void) {
-    return sSocialLinksInProfile;
+    // The Social Links band is part of the detailed profile (it lives inside the
+    // custom header), so it's gated on the single "Show Detailed Profiles" toggle.
+    return sShowDetailedProfiles;
 }
 
 #pragma mark - Model

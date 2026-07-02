@@ -763,6 +763,105 @@ static void ApolloUserFlairLoadEmojiImage(NSString *urlStr, void (^completion)(U
     }] resume];
 }
 
+#pragma mark Per-template flair limits (max emojis / allowable content)
+
+// Reddit stores a per-flair-template emoji cap (max_emojis) and a content restriction
+// (allowable_content: "all" | "emoji" | "text"). The kApolloUserFlairMaxEmojis (10)
+// above is only Reddit's DEFAULT — a community can allow fewer (e.g. r/apolloreborn's
+// editable flair caps at 3, r/soccer's at 1) or zero (when its flair is text-only). The
+// flairselector `choices` Apollo already fetches DON'T carry these fields; only the
+// GET /r/<sub>/api/user_flair_v2 template list does (keyed by the same template ids),
+// so we fetch that and show the real cap instead of a flat "/10".
+
+// subreddit(lowercased) -> @{ templateID -> @{ @"maxEmojis": NSNumber, @"allowableContent": NSString } }
+// An empty dict is a valid cached value meaning "asked, nothing usable" (don't refetch).
+static NSMutableDictionary<NSString *, NSDictionary *> *ApolloUserFlairTemplateLimitsCache(void) {
+    static NSMutableDictionary *cache = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [NSMutableDictionary dictionary]; });
+    return cache;
+}
+
+// Parse a user_flair_v2 template array into templateID -> {maxEmojis, allowableContent}.
+// Each element: { "id", "max_emojis", "allowable_content", ... }; the ids match
+// flairselector's flair_template_id, so the editor can look up its own template.
+static NSDictionary *ApolloUserFlairParseTemplateLimits(id templates) {
+    if (![templates isKindOfClass:[NSArray class]]) return nil;
+    NSMutableDictionary *byTemplate = [NSMutableDictionary dictionary];
+    for (id obj in (NSArray *)templates) {
+        if (![obj isKindOfClass:[NSDictionary class]]) continue;
+        NSDictionary *t = obj;
+        NSString *tid = t[@"id"];
+        if (![tid isKindOfClass:[NSString class]] || tid.length == 0) continue;
+        NSMutableDictionary *limits = [NSMutableDictionary dictionary];
+        id maxE = t[@"max_emojis"];
+        if ([maxE isKindOfClass:[NSNumber class]]) limits[@"maxEmojis"] = maxE;
+        id ac = t[@"allowable_content"];
+        if ([ac isKindOfClass:[NSString class]] && ((NSString *)ac).length) limits[@"allowableContent"] = ac;
+        if (limits.count) byTemplate[tid] = limits;
+    }
+    return byTemplate.count ? byTemplate : nil;
+}
+
+static void ApolloUserFlairStoreTemplateLimits(NSString *subreddit, NSDictionary *byTemplate) {
+    NSString *key = subreddit.lowercaseString;
+    if (key.length == 0 || !byTemplate) return;
+    @synchronized (ApolloUserFlairTemplateLimitsCache()) { ApolloUserFlairTemplateLimitsCache()[key] = byTemplate; }
+}
+
+static BOOL ApolloUserFlairHasTemplateLimits(NSString *subreddit) {
+    NSString *key = subreddit.lowercaseString;
+    if (key.length == 0) return NO;
+    @synchronized (ApolloUserFlairTemplateLimitsCache()) { return ApolloUserFlairTemplateLimitsCache()[key] != nil; }
+}
+
+// The emoji cap to show for a template, defaulting to kApolloUserFlairMaxEmojis when we
+// have no data yet. A "text"-only flair allows no emoji at all, so report 0 there.
+static NSUInteger ApolloUserFlairMaxEmojisForTemplate(NSString *subreddit, NSString *templateID) {
+    NSString *key = subreddit.lowercaseString;
+    NSDictionary *byTemplate;
+    @synchronized (ApolloUserFlairTemplateLimitsCache()) { byTemplate = ApolloUserFlairTemplateLimitsCache()[key]; }
+    id raw = templateID.length ? byTemplate[templateID] : nil;
+    NSDictionary *limits = [raw isKindOfClass:[NSDictionary class]] ? raw : nil;
+    if (!limits) return kApolloUserFlairMaxEmojis;
+    if ([limits[@"allowableContent"] isEqualToString:@"text"]) return 0;
+    id m = limits[@"maxEmojis"];
+    if ([m isKindOfClass:[NSNumber class]]) return [m unsignedIntegerValue];
+    return kApolloUserFlairMaxEmojis;
+}
+
+// Ensure the per-template limits for a subreddit are cached, fetching user_flair_v2 once
+// if needed. Lazy: the editor calls this on open. `completion` always runs on the main
+// queue. The result is cached (including an empty marker for 403/none) so reopening the
+// editor doesn't refetch; a pure network failure is left uncached so it can retry.
+static void ApolloUserFlairEnsureTemplateLimits(NSString *subreddit, void (^completion)(void)) {
+    void (^done)(void) = ^{
+        if (!completion) return;
+        if ([NSThread isMainThread]) completion();
+        else dispatch_async(dispatch_get_main_queue(), completion);
+    };
+    if (ApolloUserFlairHasTemplateLimits(subreddit)) { done(); return; }
+    NSString *token = [sLatestRedditBearerToken copy];
+    NSString *enc = [subreddit stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLPathAllowedCharacterSet]] ?: subreddit;
+    if (token.length == 0 || enc.length == 0) { done(); return; }
+    NSString *urlStr = [NSString stringWithFormat:@"https://oauth.reddit.com/r/%@/api/user_flair_v2?raw_json=1", enc];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlStr]];
+    [req setValue:[@"Bearer " stringByAppendingString:token] forHTTPHeaderField:@"Authorization"];
+    [req setValue:@"Apollo iOS" forHTTPHeaderField:@"User-Agent"];
+    req.timeoutInterval = 20;
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *error) {
+        id json = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL] : nil;
+        NSDictionary *byTemplate = ApolloUserFlairParseTemplateLimits(json);
+        if (byTemplate.count) {
+            ApolloUserFlairStoreTemplateLimits(subreddit, byTemplate);
+            ApolloLog(@"[UserFlair] template emoji limits r/%@: %lu templates", subreddit, (unsigned long)byTemplate.count);
+        } else if (resp) {
+            ApolloUserFlairStoreTemplateLimits(subreddit, @{}); // definitive: no usable limits
+        }
+        done();
+    }] resume];
+}
+
 #pragma mark Emoji grid cell
 
 @interface ApolloUserFlairEmojiCell : UICollectionViewCell
@@ -803,6 +902,7 @@ static void ApolloUserFlairLoadEmojiImage(NSString *urlStr, void (^completion)(U
 @property (nonatomic, strong) UIActivityIndicatorView *spinner;
 @property (nonatomic, strong) UIBarButtonItem *saveItem;
 @property (nonatomic, assign) BOOL didFinish;
+@property (nonatomic, assign) NSUInteger maxEmojis;     // this template's emoji cap (0 = text-only)
 @end
 
 @implementation ApolloUserFlairEditorViewController
@@ -811,6 +911,10 @@ static void ApolloUserFlairLoadEmojiImage(NSString *urlStr, void (^completion)(U
     [super viewDidLoad];
     self.title = @"Set Flair";
     self.view.backgroundColor = [UIColor systemBackgroundColor];
+
+    // Seed from cache (warm if this sub's editor was opened before); loadFlairLimits
+    // fetches and refreshes it otherwise. Defaults to Reddit's cap of 10 until known.
+    self.maxEmojis = ApolloUserFlairMaxEmojisForTemplate(self.subreddit, self.session.templateID);
 
     self.navigationItem.leftBarButtonItem =
         [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemCancel target:self action:@selector(cancelTapped)];
@@ -898,7 +1002,9 @@ static void ApolloUserFlairLoadEmojiImage(NSString *urlStr, void (^completion)(U
     ]];
 
     [self updateCounterAndPreview];
+    [self refreshEmojiAvailability];
     [self loadEmojis];
+    [self loadFlairLimits];
 }
 
 - (void)loadEmojis {
@@ -913,10 +1019,32 @@ static void ApolloUserFlairLoadEmojiImage(NSString *urlStr, void (^completion)(U
         NSMutableDictionary *map = [NSMutableDictionary dictionary];
         for (NSDictionary *e in emojis) map[e[@"name"]] = e[@"url"];
         self.emojiURLByName = map;
-        self.searchBar.hidden = (emojis.count <= 24);
+        [self refreshEmojiAvailability];
         [self.collectionView reloadData];
         [self updateCounterAndPreview]; // preview can now resolve tokens to images
     });
+}
+
+// Fetch this template's real emoji cap (user_flair_v2), then update the counter + emoji
+// UI. Cached per subreddit, so it's a no-op after the first open of this sub's editor.
+- (void)loadFlairLimits {
+    __weak typeof(self) weakSelf = self;
+    ApolloUserFlairEnsureTemplateLimits(self.subreddit, ^{
+        typeof(self) self = weakSelf;
+        if (!self) return;
+        self.maxEmojis = ApolloUserFlairMaxEmojisForTemplate(self.subreddit, self.session.templateID);
+        [self refreshEmojiAvailability];
+        [self updateCounterAndPreview];
+    });
+}
+
+// Hide the emoji picker entirely for text-only flair (cap 0); otherwise show it once
+// emoji have arrived, keeping the search bar only when the grid is long enough to need it.
+- (void)refreshEmojiAvailability {
+    BOOL emojiAllowed = (self.maxEmojis > 0);
+    self.collectionView.hidden = !emojiAllowed;
+    self.searchBar.hidden = !emojiAllowed || (self.allEmojis.count <= 24);
+    if (!emojiAllowed) [self.spinner stopAnimating];
 }
 
 #pragma mark counter + preview
@@ -944,10 +1072,16 @@ static void ApolloUserFlairLoadEmojiImage(NSString *urlStr, void (^completion)(U
     NSUInteger textLen = 0;
     NSUInteger emojiCount = [self emojiCountInText:text textLength:&textLen];
     BOOL overText = textLen > kApolloUserFlairMaxLength;
-    BOOL overEmoji = emojiCount > kApolloUserFlairMaxEmojis;
-    self.counterLabel.text = [NSString stringWithFormat:@"%lu/%lu chars · %lu/%lu emoji",
-        (unsigned long)textLen, (unsigned long)kApolloUserFlairMaxLength,
-        (unsigned long)emojiCount, (unsigned long)kApolloUserFlairMaxEmojis];
+    BOOL overEmoji = emojiCount > self.maxEmojis;
+    if (self.maxEmojis == 0) {
+        // Text-only flair: report just the character count, and flag any emoji as over.
+        self.counterLabel.text = [NSString stringWithFormat:@"%lu/%lu chars · no emoji",
+            (unsigned long)textLen, (unsigned long)kApolloUserFlairMaxLength];
+    } else {
+        self.counterLabel.text = [NSString stringWithFormat:@"%lu/%lu chars · %lu/%lu emoji",
+            (unsigned long)textLen, (unsigned long)kApolloUserFlairMaxLength,
+            (unsigned long)emojiCount, (unsigned long)self.maxEmojis];
+    }
     self.counterLabel.textColor = (overText || overEmoji) ? [UIColor systemRedColor] : [UIColor secondaryLabelColor];
     self.saveItem.enabled = !overText && !overEmoji;
     [self refreshPreview];
@@ -1007,7 +1141,7 @@ static void ApolloUserFlairLoadEmojiImage(NSString *urlStr, void (^completion)(U
 - (void)insertEmojiToken:(NSString *)name {
     NSUInteger textLen = 0;
     NSUInteger emojiCount = [self emojiCountInText:(self.textField.text ?: @"") textLength:&textLen];
-    if (emojiCount >= kApolloUserFlairMaxEmojis) {
+    if (emojiCount >= self.maxEmojis) {
         [self flashCounter];
         return;
     }

@@ -38,6 +38,13 @@ static NSString *const UDKeyReadPostMaxCount = @"ReadPostMaxCount";
 static NSString *const UDKeyShowRecentlyReadThumbnails = @"ShowRecentlyReadThumbnails";
 static NSString *const UDKeyPreferredGIFFallbackFormat = @"PreferredGIFFallbackFormat";
 static NSString *const UDKeyUnmuteCommentsVideos = @"UnmuteCommentsVideos";
+// "Hold for Video Speed": press-and-hold the right side of a fullscreen video to
+// play at a chosen speed while held. Master toggle (default YES via
+// registerDefaults — preserves the original always-on behaviour) and the speed
+// applied while held (one of 0.25/0.5/0.75/1.25/1.5/2.0; default 2.0×). See
+// ApolloVideoHoldSpeed.xm.
+static NSString *const UDKeyVideoHoldSpeedEnabled = @"VideoHoldSpeedEnabled";
+static NSString *const UDKeyVideoHoldSpeed = @"VideoHoldSpeed";
 static NSString *const UDKeyOpenLinksInSteamApp = @"OpenLinksInSteamApp";
 static NSString *const UDKeyCollapsePinnedComments = @"CollapsePinnedComments";
 static NSString *const UDKeyShowDeletedComments = @"ShowDeletedComments";
@@ -48,7 +55,14 @@ static NSString *const UDKeyProxyImgurDDG = @"ProxyImgurDDG";
 static NSString *const UDKeyImageUploadProvider = @"ImageUploadProvider";
 static NSString *const UDKeyShowUserAvatars = @"ShowUserAvatars";
 static NSString *const UDKeyUseProfileAvatarTabIcon = @"UseProfileAvatarTabIcon";
-static NSString *const UDKeySocialLinksInProfile = @"SocialLinksInProfile";
+// When ON (default), profile pages show Reborn's detailed profile — the banner,
+// large avatar/snoovatar, display name, bio, and the Social Links band. When OFF,
+// the profile page reverts to Apollo's compact stock layout: the detailed header is
+// not installed, and any header already on screen is torn down (restoring Apollo's
+// native table header). Independent of "Show User Profile Pictures"
+// (UDKeyShowUserAvatars), which governs the inline avatars next to usernames.
+// See ApolloUserAvatars.xm and ApolloProfileSocialLinks.m. Default YES.
+static NSString *const UDKeyShowDetailedProfiles = @"ShowDetailedProfiles";
 static NSString *const UDKeyShowSubredditHeaders = @"ShowSubredditHeaders";
 static NSString *const UDKeyCommunityHighlights = @"CommunityHighlights";
 static NSString *const UDKeyCommunityHighlightsWeb = @"CommunityHighlightsWeb";
@@ -58,6 +72,13 @@ static NSString *const UDKeyAutoHideTabBarShowOnIdle = @"AutoHideTabBarShowOnIdl
 // "search takeover" (nav slides away + fades, field docks to the top and grows). Mutually
 // exclusive with the default nav-hide mode. Liquid Glass only. Default NO. See ApolloSearchInPlace.xm.
 static NSString *const UDKeyKeepSearchBarInPlace = @"KeepSearchBarInPlace";
+// iPad only, Liquid Glass only. When ON, forces the iOS 26 floating tab bar to
+// dock at the BOTTOM (classic tab bar) instead of the top-center pill, which on
+// iPad overlaps Apollo's search bar. Temporary stopgap for issue #387 until the
+// real iPad build lands. Opt-in; default OFF via registerDefaults. See ApolloIPadTabBarBottom.xm.
+static NSString *const UDKeyIPadTabBarBottom = @"IPadTabBarBottom";
+static NSString *const ApolloIPadTabBarBottomChangedNotification = @"ApolloIPadTabBarBottomChangedNotification";
+static NSString *const UDKeyLiveCommentsFollow = @"LiveCommentsFollow";
 // Render image URLs (i.redd.it, preview.redd.it, i.imgur.com, generic .png/.jpg/.jpeg/.webp)
 // inline within post selftext and comments instead of leaving them as plain text links.
 static NSString *const UDKeyEnableInlineImages = @"EnableInlineImages";

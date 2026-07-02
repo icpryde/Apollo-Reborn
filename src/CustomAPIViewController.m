@@ -59,6 +59,24 @@ static NSInteger ApolloMediaPhysicalRow(NSInteger logicalRow) {
     return logicalRow;
 }
 
+// The six speeds the "Hold for Video Speed" picker offers, in display order. They
+// mirror the video player's own speed menu minus 1.0× (holding at normal speed
+// would be a no-op). ApolloSanitizedHoldSpeed() guards the stored value to this set.
+static const float kVideoHoldSpeeds[] = { 0.25f, 0.5f, 0.75f, 1.25f, 1.5f, 2.0f };
+
+// "0.25×" / "0.5×" / … / "2×", using the U+00D7 multiplication sign Apollo uses.
+static NSString *ApolloVideoHoldSpeedTitle(float speed) {
+    NSString *num;
+    if (fabsf(speed - 0.25f) < 0.001f)      num = @"0.25";
+    else if (fabsf(speed - 0.5f)  < 0.001f) num = @"0.5";
+    else if (fabsf(speed - 0.75f) < 0.001f) num = @"0.75";
+    else if (fabsf(speed - 1.25f) < 0.001f) num = @"1.25";
+    else if (fabsf(speed - 1.5f)  < 0.001f) num = @"1.5";
+    else if (fabsf(speed - 2.0f)  < 0.001f) num = @"2";
+    else                                    num = [NSString stringWithFormat:@"%g", speed];
+    return [num stringByAppendingFormat:@"%C", (unichar)0x00D7];
+}
+
 // Canonical (mode-on) row indices within SectionAPIKeys. The Web Session Login
 // row only exists while API-Key-Free Mode is on; with it off, that row is absent
 // and every row at or below it slides up one slot. Mirrors the Media-section
@@ -534,15 +552,18 @@ typedef NS_ENUM(NSInteger, Tag) {
         // row, so the count is its index + 1, minus the Web Session Login row when
         // the mode is off.
         case SectionAPIKeys: return kAPIKeyRowWidgetSetupCode + (sWebJSONEnabled ? 1 : 0);
-        // General base rows + the search-in-place toggle (effectiveRow 11),
-        // minus the conditional "Tap to Show Deleted Comments" row.
-        case SectionGeneral: return sShowDeletedComments ? 12 : 11;
+        // General base rows + the search-in-place (effectiveRow 11),
+        // follow-live-comments (effectiveRow 12) and iPad-tab-bar-bottom
+        // (effectiveRow 13) toggles, minus the conditional "Tap to Show Deleted
+        // Comments" row.
+        case SectionGeneral: return sShowDeletedComments ? 14 : 13;
         case SectionApolloAI: return 1;
         case SectionLinkPreviews: return 1;
         // Media base rows (the three "Rich Link Previews" rows moved out to their
-        // own SectionLinkPreviews) plus the chat inline-media toggle, minus the two
-        // inline-dependent rows when off.
-        case SectionMedia: return 12 + (sEnableInlineImages ? 0 : -kApolloMediaInlineDependentRows);
+        // own SectionLinkPreviews) plus the chat inline-media toggle and the
+        // "Hold for Video Speed" toggle, minus the two inline-dependent rows when
+        // off, plus the hold-speed picker (logical row 13) when that toggle is on.
+        case SectionMedia: return 13 + (sEnableInlineImages ? 0 : -kApolloMediaInlineDependentRows) + (sVideoHoldSpeedEnabled ? 1 : 0);
         case SectionSubreddits: return 10 - (sSubredditListEnhancements ? 0 : 1) - (sCommunityHighlights ? 0 : 1);
         case SectionNotificationBackend: return 3; // URL + Registration Token + Test Connection
         case SectionAbout: return 5; // GitHub + Reddit + Thanks To + Export Logs + Version
@@ -1007,6 +1028,27 @@ typedef NS_ENUM(NSInteger, Tag) {
             cell.detailTextLabel.enabled = lgSupported;
             return cell;
         }
+        case 12:
+            return [self switchCellWithIdentifier:@"Cell_Gen_LiveCommentsFollow"
+                                            label:@"Follow New Live Comments"
+                                           detail:@"During Live Update comment sort, keep the newest at the top and show a jump button when you've scrolled down."
+                                               on:[defaults boolForKey:UDKeyLiveCommentsFollow]
+                                           action:@selector(liveCommentsFollowSwitchToggled:)];
+        case 13: {
+            // Temporary iPad stopgap (#387): dock the floating tab bar at the
+            // bottom instead of the top-center pill that overlaps the search bar.
+            BOOL supported = (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad) && IsLiquidGlass();
+            UITableViewCell *cell = [self switchCellWithIdentifier:@"Cell_Gen_IPadTabBarBottom"
+                                                             label:@"Move Tab Bar to Bottom"
+                                                            detail:@"iPad only. Docks the tab bar at the bottom instead of the top."
+                                                                on:supported && [defaults boolForKey:UDKeyIPadTabBarBottom]
+                                                            action:@selector(iPadTabBarBottomSwitchToggled:)];
+            UISwitch *toggleSwitch = [cell.accessoryView isKindOfClass:[UISwitch class]] ? (UISwitch *)cell.accessoryView : nil;
+            toggleSwitch.enabled = supported;
+            cell.textLabel.enabled = supported;
+            cell.detailTextLabel.enabled = supported;
+            return cell;
+        }
         default: return [[UITableViewCell alloc] init];
     }
 }
@@ -1121,15 +1163,40 @@ typedef NS_ENUM(NSInteger, Tag) {
                                                on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyUseProfileAvatarTabIcon]
                                            action:@selector(profileTabAvatarSwitchToggled:)];
         case 10:
-            return [self switchCellWithIdentifier:@"Cell_Media_SocialLinks"
-                                            label:@"Social Links in Profile"
-                                               on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeySocialLinksInProfile]
-                                           action:@selector(socialLinksInProfileSwitchToggled:)];
+            // Single toggle for Reborn's detailed profile page: banner, large
+            // avatar/snoovatar, display name, bio, and the Social Links band (all of
+            // which live in the custom header). Off → Apollo's compact stock profile.
+            return [self switchCellWithIdentifier:@"Cell_Media_DetailedProfiles"
+                                            label:@"Show Detailed Profiles"
+                                               on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowDetailedProfiles]
+                                           action:@selector(showDetailedProfilesSwitchToggled:)];
         case 11:
             return [self switchCellWithIdentifier:@"Cell_Media_ChatMedia"
                                             label:@"Inline Media in Chat"
                                                on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyEnableChatMedia]
                                            action:@selector(chatMediaSwitchToggled:)];
+        case 12:
+            // Master toggle for "Hold for Video Speed". When on, the hold-speed
+            // picker (logical row 13) is shown below; when off, the right side of a
+            // fullscreen video keeps Apollo's normal long-press menu. The gesture is
+            // explained in the section footer, matching the sibling Media toggles
+            // (which are plain switches with no inline subtitle).
+            return [self switchCellWithIdentifier:@"Cell_Media_HoldSpeed"
+                                            label:@"Hold for Video Speed"
+                                               on:sVideoHoldSpeedEnabled
+                                           action:@selector(videoHoldSpeedSwitchToggled:)];
+        case 13: {
+            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_Media_HoldSpeedValue"];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:@"Cell_Media_HoldSpeedValue"];
+                cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+                cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+            }
+            cell.textLabel.text = @"Hold Speed";
+            cell.detailTextLabel.text = [self videoHoldSpeedText];
+            cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+            return cell;
+        }
         default: return [[UITableViewCell alloc] init];
     }
 }
@@ -1582,6 +1649,8 @@ typedef NS_ENUM(NSInteger, Tag) {
             [self presentInlineImageAlignmentSheetFromSourceView:cell];
         } else if (row == 6) {
             [self presentAutoplayInlineGIFModeSheetFromSourceView:cell];
+        } else if (row == 13) {
+            [self presentVideoHoldSpeedSheetFromSourceView:cell];
         }
     } else if (indexPath.section == SectionNotificationBackend && indexPath.row == 2) {
         [self testNotificationBackendConnection];
@@ -1657,7 +1726,7 @@ typedef NS_ENUM(NSInteger, Tag) {
     if (indexPath.section == SectionLinkPreviews) return YES;
     if (indexPath.section == SectionMedia) {
         NSInteger row = ApolloMediaLogicalRow(indexPath.row);
-        return (row == 0 || row == 1 || row == 2 || row == 5 || row == 6);
+        return (row == 0 || row == 1 || row == 2 || row == 5 || row == 6 || row == 13);
     }
     if (indexPath.section == SectionAbout && (indexPath.row == 0 || indexPath.row == 1 || indexPath.row == 2 || indexPath.row == 3)) return YES;
     if (indexPath.section == SectionNotificationBackend && indexPath.row == 2) return YES;
@@ -2084,8 +2153,8 @@ typedef NS_ENUM(NSInteger, Tag) {
     NSArray<NSIndexPath *> *paths = @[[NSIndexPath indexPathForRow:4 inSection:SectionGeneral]];
     if (sShowDeletedComments) {
         [self.tableView insertRowsAtIndexPaths:paths withRowAnimation:UITableViewRowAnimationFade];
-        [self showAlertWithTitle:@"Show Deleted Comments"
-                          message:@"This feature uses Arctic Shift to recover deleted comments. When Arctic Shift is slow or rate-limited, comments may load more slowly or recovered comments may not appear."];
+        [self showAlertWithTitle:@"⚠️ WARNING"
+                          message:@"This feature can slow down comment loading. If you notice comments loading slowly, turn this feature off."];
     } else {
         [self.tableView deleteRowsAtIndexPaths:paths withRowAnimation:UITableViewRowAnimationFade];
     }
@@ -2112,6 +2181,12 @@ typedef NS_ENUM(NSInteger, Tag) {
     sAutoHideTabBarShowOnIdle = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:sAutoHideTabBarShowOnIdle forKey:UDKeyAutoHideTabBarShowOnIdle];
     [[NSNotificationCenter defaultCenter] postNotificationName:@"ApolloAutoHideTabBarShowOnIdleChangedNotification" object:nil];
+}
+
+- (void)iPadTabBarBottomSwitchToggled:(UISwitch *)sender {
+    sIPadTabBarBottom = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sIPadTabBarBottom forKey:UDKeyIPadTabBarBottom];
+    [[NSNotificationCenter defaultCenter] postNotificationName:ApolloIPadTabBarBottomChangedNotification object:nil];
 }
 
 - (void)proxyImgurDDGSwitchToggled:(UISwitch *)sender {
@@ -2159,6 +2234,11 @@ typedef NS_ENUM(NSInteger, Tag) {
     [[NSUserDefaults standardUserDefaults] setBool:sKeepSearchBarInPlace forKey:UDKeyKeepSearchBarInPlace];
 }
 
+- (void)liveCommentsFollowSwitchToggled:(UISwitch *)sender {
+    sLiveCommentsFollow = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sLiveCommentsFollow forKey:UDKeyLiveCommentsFollow];
+}
+
 - (void)userAvatarsSwitchToggled:(UISwitch *)sender {
     sShowUserAvatars = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:sShowUserAvatars forKey:UDKeyShowUserAvatars];
@@ -2171,9 +2251,15 @@ typedef NS_ENUM(NSInteger, Tag) {
     [[NSNotificationCenter defaultCenter] postNotificationName:@"ApolloProfileTabAvatarIconChangedNotification" object:nil];
 }
 
-- (void)socialLinksInProfileSwitchToggled:(UISwitch *)sender {
-    sSocialLinksInProfile = sender.isOn;
-    [[NSUserDefaults standardUserDefaults] setBool:sSocialLinksInProfile forKey:UDKeySocialLinksInProfile];
+- (void)showDetailedProfilesSwitchToggled:(UISwitch *)sender {
+    // One toggle for the whole detailed profile (header + banner + avatar + bio +
+    // social links). The avatars-toggle notification is observed in ApolloUserAvatars.xm
+    // and re-walks visible profile controllers, installing or tearing down the header
+    // per the new value; the social-links notification refreshes the band (gated on the
+    // same flag). Both apply live, no relaunch.
+    sShowDetailedProfiles = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sShowDetailedProfiles forKey:UDKeyShowDetailedProfiles];
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"ApolloUserAvatarsToggleChangedNotification" object:nil];
     [[NSNotificationCenter defaultCenter] postNotificationName:ApolloSocialLinksToggleChangedNotification object:nil];
 }
 
@@ -2319,6 +2405,62 @@ typedef NS_ENUM(NSInteger, Tag) {
     [[NSUserDefaults standardUserDefaults] setInteger:sAutoplayInlineGIFMode forKey:UDKeyAutoplayInlineGIFs];
     NSIndexPath *autoplayRow = [NSIndexPath indexPathForRow:ApolloMediaPhysicalRow(6) inSection:SectionMedia];
     [self.tableView reloadRowsAtIndexPaths:@[autoplayRow] withRowAnimation:UITableViewRowAnimationNone];
+}
+
+#pragma mark - Hold for Video Speed
+
+- (void)videoHoldSpeedSwitchToggled:(UISwitch *)sender {
+    BOOL wasOn = sVideoHoldSpeedEnabled;
+    sVideoHoldSpeedEnabled = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sVideoHoldSpeedEnabled forKey:UDKeyVideoHoldSpeedEnabled];
+    if (sVideoHoldSpeedEnabled == wasOn) return;
+    // The "Hold Speed" picker (logical row 13) is the last Media row and is shown
+    // only while this toggle is on. Insert/delete it so the row counts stay
+    // consistent. ApolloMediaPhysicalRow(13) accounts for the inline-dependent gap.
+    NSIndexPath *pickerPath = [NSIndexPath indexPathForRow:ApolloMediaPhysicalRow(13) inSection:SectionMedia];
+    if (sVideoHoldSpeedEnabled) {
+        [self.tableView insertRowsAtIndexPaths:@[pickerPath] withRowAnimation:UITableViewRowAnimationFade];
+    } else {
+        [self.tableView deleteRowsAtIndexPaths:@[pickerPath] withRowAnimation:UITableViewRowAnimationFade];
+    }
+}
+
+- (NSString *)videoHoldSpeedText {
+    return ApolloVideoHoldSpeedTitle(sVideoHoldSpeed);
+}
+
+- (void)setVideoHoldSpeed:(float)speed {
+    sVideoHoldSpeed = ApolloSanitizedHoldSpeed(speed);
+    [[NSUserDefaults standardUserDefaults] setFloat:sVideoHoldSpeed forKey:UDKeyVideoHoldSpeed];
+    NSIndexPath *pickerPath = [NSIndexPath indexPathForRow:ApolloMediaPhysicalRow(13) inSection:SectionMedia];
+    if ([[self.tableView indexPathsForVisibleRows] containsObject:pickerPath]) {
+        [self.tableView reloadRowsAtIndexPaths:@[pickerPath] withRowAnimation:UITableViewRowAnimationNone];
+    }
+}
+
+- (void)presentVideoHoldSpeedSheetFromSourceView:(UIView *)sourceView {
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Hold Speed"
+                                                                   message:@"Speed applied while you hold the right side of a fullscreen video."
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+
+    for (size_t i = 0; i < sizeof(kVideoHoldSpeeds) / sizeof(kVideoHoldSpeeds[0]); i++) {
+        float speed = kVideoHoldSpeeds[i];
+        BOOL isCurrent = fabsf(sVideoHoldSpeed - speed) < 0.001f;
+        NSString *title = isCurrent ? [ApolloVideoHoldSpeedTitle(speed) stringByAppendingString:@" (Current)"]
+                                    : ApolloVideoHoldSpeedTitle(speed);
+        [sheet addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+            [self setVideoHoldSpeed:speed];
+        }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+
+    UIPopoverPresentationController *popover = sheet.popoverPresentationController;
+    if (popover && sourceView) {
+        popover.sourceView = sourceView;
+        popover.sourceRect = sourceView.bounds;
+    }
+
+    [self presentViewController:sheet animated:YES completion:nil];
 }
 
 - (void)promptClearCustomSubredditBannersFromSourceView:(__unused UIView *)sourceView {
@@ -2613,6 +2755,8 @@ static void ApolloReplayValetKeychainItems(NSArray<NSDictionary *> *items) {
     sEnableFlairColors = [defaults boolForKey:UDKeyEnableFlairColors];
     sPreferredGIFFallbackFormat = ([defaults integerForKey:UDKeyPreferredGIFFallbackFormat] == 0) ? 0 : 1;
     sUnmuteCommentsVideos = [defaults integerForKey:UDKeyUnmuteCommentsVideos];
+    sVideoHoldSpeedEnabled = [defaults boolForKey:UDKeyVideoHoldSpeedEnabled];
+    sVideoHoldSpeed = ApolloSanitizedHoldSpeed([defaults floatForKey:UDKeyVideoHoldSpeed]);
     sImageUploadProvider = [defaults integerForKey:UDKeyImageUploadProvider];
     sLinkPreviewCardColor = [defaults integerForKey:UDKeyLinkPreviewCardColor];
     if (sLinkPreviewCardColor < ApolloLinkPreviewCardColorNeutral || sLinkPreviewCardColor > ApolloLinkPreviewCardColorSlate) {

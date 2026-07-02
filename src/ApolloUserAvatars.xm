@@ -22,7 +22,12 @@ static CGFloat const ApolloProfileHeaderHeight = 206.0;
 static CGFloat const ApolloProfileAvatarDiameter = 96.0;
 static CGFloat const ApolloProfileSnoovatarWidth = 156.0;
 static CGFloat const ApolloProfileSnoovatarHeight = 178.0;
-static NSUInteger const ApolloInlineAvatarMaxActiveInfoRequests = 6;
+// Governs how many about.json info fetches are in flight at once. Kept a touch above
+// the info session's per-host socket cap (8) so NSURLSession — not this app-level
+// gate — manages the queue, while still bounding wasted fetches when fast-scrolling a
+// huge thread. (Was 6, which exactly duplicated the old socket cap and only added
+// queueing latency.)
+static NSUInteger const ApolloInlineAvatarMaxActiveInfoRequests = 10;
 static NSUInteger const ApolloInlineAvatarMaxBindAttempts = 4;
 static NSUInteger const ApolloInlineAvatarLogLimit = 16;
 
@@ -70,6 +75,12 @@ static const void *kApolloProfileTabAvatarImageMarkerKey = &kApolloProfileTabAva
 @property(nonatomic, strong) ApolloProfileSocialLinksView *socialLinksView;
 @property(nonatomic, weak) UIViewController *hostViewController;
 @property(nonatomic, copy) NSString *username;
+// The avatar/snoovatar and banner URLs the most recent profile info applied to this
+// header wanted. The header view is reused across usernames (and re-fetched for the
+// same user), so async image completions compare against these to detect that a newer
+// load has superseded the URL they were fetching before stamping a stale image.
+@property(nonatomic, copy) NSURL *currentProfileImageURL;
+@property(nonatomic, copy) NSURL *currentBannerURL;
 @property(nonatomic, copy) void (^heightInvalidationBlock)(void);
 - (void)applyProfileInfo:(ApolloUserProfileInfo *)info fallbackUsername:(NSString *)username;
 - (CGFloat)preferredHeightForWidth:(CGFloat)width;
@@ -83,6 +94,7 @@ static BOOL ApolloProfileUsernameIsLoggedInAccount(NSString *username);
 static void ApolloProfileOpenRedditProfileEditor(void);
 static void ApolloProfileSetSnoovatarMode(ApolloProfileHeaderView *header, BOOL showSnoovatar);
 static void ApolloProfileLoadImages(ApolloProfileHeaderView *header, NSString *username, BOOL forceRefresh);
+static void ApolloProfileRemoveHeader(id viewControllerObject, UITableView *tableView);
 static void ApolloProfileRefreshControllersForUsername(NSString *username);
 static void ApolloProfileApplyTabAvatarForController(UITabBarController *tabBarController);
 static void ApolloProfileApplyTabAvatarForVisibleWindows(void);
@@ -1398,13 +1410,35 @@ static ApolloProfileHeaderView *ApolloProfileCreateHeader(CGFloat width) {
     return header;
 }
 
+static BOOL ApolloProfileURLsMatch(NSURL *left, NSURL *right) {
+    if (left == right) return YES;
+    if (!left || !right) return NO;
+    return [left.absoluteString isEqualToString:right.absoluteString];
+}
+
 static void ApolloProfileLoadImages(ApolloProfileHeaderView *header, NSString *username, BOOL forceRefresh) {
     if (!header || username.length == 0) return;
     ApolloUserProfileCache *cache = [ApolloUserProfileCache sharedCache];
     ApolloUserProfileInfo *cachedInfo = [cache cachedInfoForUsername:username];
 
+    // The header view is cached on the profile/account-manager VC and repointed to a
+    // new username by ApolloProfileInstallOrUpdateHeader (account switch, reused
+    // persistent ProfileViewController, etc.). These info/image fetches are async and
+    // land on the main queue, so by the time a completion fires the header may already
+    // belong to a different user — stamping a late result would bleed user A's
+    // avatar/snoovatar/banner/name/bio onto user B and never self-heal. Capture the
+    // target identity up front and bail from every completion whose header no longer
+    // matches it (mirrors the social-links band's `username == want` guard).
+    NSString *targetUsername = ApolloAvatarNormalizedUsername(username);
+    if (targetUsername.length == 0) return;
+
     void (^applyInfo)(ApolloUserProfileInfo *) = ^(ApolloUserProfileInfo *info) {
         if (!info) return;
+        // Dropped if the header was repointed to another user while this was in flight.
+        if (!ApolloAvatarUsernameMatches(header.username, targetUsername)) {
+            ApolloLog(@"[UserAvatars] Dropping stale profile info for u/%@ (header now u/%@)", targetUsername, header.username ?: @"nil");
+            return;
+        }
         [header applyProfileInfo:info fallbackUsername:username];
 
         if (header.hostViewController) {
@@ -1415,6 +1449,10 @@ static void ApolloProfileLoadImages(ApolloProfileHeaderView *header, NSString *u
         ApolloProfileSetSnoovatarMode(header, showSnoovatar);
 
         NSURL *profileImageURL = showSnoovatar ? info.snoovatarURL : info.iconURL;
+        // Record what this (now-current) info wants so a later async image completion
+        // can tell whether it has been superseded by a newer load for the same user.
+        header.currentProfileImageURL = profileImageURL;
+        header.currentBannerURL = info.bannerURL;
         if (profileImageURL) {
             UIImage *image = [cache cachedImageForURL:profileImageURL];
             if (image) {
@@ -1423,6 +1461,10 @@ static void ApolloProfileLoadImages(ApolloProfileHeaderView *header, NSString *u
             } else {
                 [cache requestImageForURL:profileImageURL completion:^(UIImage *loadedImage) {
                     if (!loadedImage) return;
+                    // Re-validate: the header may have switched users, or a newer fetch
+                    // for this same user may have chosen a different avatar/snoovatar URL.
+                    if (!ApolloAvatarUsernameMatches(header.username, targetUsername)) return;
+                    if (!ApolloProfileURLsMatch(header.currentProfileImageURL, profileImageURL)) return;
                     if (showSnoovatar) header.snoovatarImageView.image = loadedImage;
                     else header.avatarImageView.image = loadedImage;
                 }];
@@ -1433,8 +1475,12 @@ static void ApolloProfileLoadImages(ApolloProfileHeaderView *header, NSString *u
             if (banner) {
                 header.bannerImageView.image = banner;
             } else {
-                [cache requestImageForURL:info.bannerURL completion:^(UIImage *loadedImage) {
-                    if (loadedImage) header.bannerImageView.image = loadedImage;
+                NSURL *bannerURL = info.bannerURL;
+                [cache requestImageForURL:bannerURL completion:^(UIImage *loadedImage) {
+                    if (!loadedImage) return;
+                    if (!ApolloAvatarUsernameMatches(header.username, targetUsername)) return;
+                    if (!ApolloProfileURLsMatch(header.currentBannerURL, bannerURL)) return;
+                    header.bannerImageView.image = loadedImage;
                 }];
             }
         }
@@ -1569,6 +1615,46 @@ static void ApolloProfileInstallUsernameCopyInteraction(UIViewController *viewCo
     }
 }
 
+// Tear down the custom profile header and restore Apollo's native table header.
+// Used when "Show Detailed Profiles" is OFF (either toggled off live, or already
+// off when a profile page appears) so the page falls back to Apollo's stock layout.
+// Safe to call repeatedly: once the wrapper is removed and the per-VC state cleared,
+// subsequent calls are a cheap no-op.
+static void ApolloProfileRemoveHeader(id viewControllerObject, UITableView *tableView) {
+    if (!viewControllerObject) return;
+
+    UIView *wrappedHeader = objc_getAssociatedObject(viewControllerObject, kApolloProfileWrappedHeaderKey);
+    UIView *originalHeader = objc_getAssociatedObject(viewControllerObject, kApolloProfileOriginalHeaderKey);
+
+    // The table may currently host our wrapper even if our per-VC refs went stale
+    // (fresh controller, reused VC, etc.) — detect it via the wrapper marker.
+    UIView *currentTableHeader = tableView.tableHeaderView;
+    if (currentTableHeader && objc_getAssociatedObject(currentTableHeader, kApolloProfileWrapperMarkerKey)) {
+        wrappedHeader = currentTableHeader;
+        originalHeader = objc_getAssociatedObject(currentTableHeader, kApolloProfileOriginalHeaderKey) ?: originalHeader;
+    }
+
+    if (wrappedHeader && tableView.tableHeaderView == wrappedHeader) {
+        // Pull Apollo's native header back out of our wrapper, reset its frame to the
+        // origin, and reinstate it as the table header (nil if Apollo had none — that
+        // is the stock look for AsyncDisplayKit profiles whose stats live in cells).
+        if (originalHeader) {
+            CGFloat width = tableView.bounds.size.width > 0 ? tableView.bounds.size.width : originalHeader.frame.size.width;
+            [originalHeader removeFromSuperview];
+            originalHeader.frame = CGRectMake(0.0, 0.0, width, originalHeader.frame.size.height);
+        }
+        tableView.tableHeaderView = originalHeader;  // nil is valid — clears the header
+        NSString *className = NSStringFromClass([(UIViewController *)viewControllerObject class]);
+        ApolloLog(@"[UserAvatars] Removed profile header (toggle off) class=%@ vc=%p native=%@", className, viewControllerObject, originalHeader ? NSStringFromClass([originalHeader class]) : @"nil");
+    }
+
+    // Clear all per-VC state so a later re-enable installs a fresh header cleanly.
+    objc_setAssociatedObject(viewControllerObject, kApolloProfileHeaderViewKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(viewControllerObject, kApolloProfileWrappedHeaderKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(viewControllerObject, kApolloProfileOriginalHeaderKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(viewControllerObject, kApolloProfileUsernameKey, nil, OBJC_ASSOCIATION_COPY_NONATOMIC);
+}
+
 static void ApolloProfileInstallOrUpdateHeader(id viewControllerObject) {
     if (![viewControllerObject isKindOfClass:[UIViewController class]]) return;
     UIViewController *viewController = (UIViewController *)viewControllerObject;
@@ -1578,6 +1664,14 @@ static void ApolloProfileInstallOrUpdateHeader(id viewControllerObject) {
         if (ApolloViewControllerLooksProfileRelated(viewController)) {
             ApolloLog(@"[UserAvatars] Profile header skipped class=%@ vc=%p reason=no-table", className, viewControllerObject);
         }
+        return;
+    }
+
+    // "Show Detailed Profiles" OFF → revert to Apollo's stock profile layout. Tear
+    // down anything we previously installed and bail before building/refreshing it.
+    // (Independent of sShowUserAvatars, which only governs the inline username avatars.)
+    if (!sShowDetailedProfiles) {
+        ApolloProfileRemoveHeader(viewControllerObject, tableView);
         return;
     }
 
@@ -1664,6 +1758,10 @@ static void ApolloProfileInstallOrUpdateHeader(id viewControllerObject) {
         header.avatarImageView.image = ApolloProfilePlaceholderAvatar();
         header.snoovatarImageView.image = nil;
         header.bannerImageView.image = nil;
+        // Forget the previous user's expected image URLs so an in-flight completion
+        // from that user can't match and stamp onto the freshly-repointed header.
+        header.currentProfileImageURL = nil;
+        header.currentBannerURL = nil;
         [header applyProfileInfo:nil fallbackUsername:username];
         ApolloProfileSetSnoovatarMode(header, NO);
         ApolloProfileLoadImages(header, username, NO);
@@ -2113,11 +2211,86 @@ static void ApolloProfileOpenRedditProfileEditor(void) {
 
 %end
 
+// ---- Batch prefetch (#4/#5): collect comment authors' t2_ fullnames from their cells
+// (as they enter Texture's preload range, ahead of display) and coalesce them into ONE
+// user_data_by_account_ids request — so a thread's avatars are cached in a few batched
+// requests, ahead of scroll, instead of one about.json per author as each cell appears.
+// (Reading the Swift CommentTree / IGListKit objects array directly is not ObjC-safe, so
+// the per-cell `comment` ivar — the same one the avatar binding already reads — is used.)
+static NSMutableSet<NSString *> *sApolloPendingBatchFullNames = nil;
+static BOOL sApolloBatchFireScheduled = NO;
+
+static NSString *ApolloCommentAuthorFullName(id comment) {
+    if (!comment || ![comment respondsToSelector:@selector(authorFullName)]) return nil;
+    @try {
+        NSString *(*msgSend)(id, SEL) = (NSString *(*)(id, SEL))objc_msgSend;
+        NSString *fullName = msgSend(comment, @selector(authorFullName));
+        return [fullName isKindOfClass:[NSString class]] ? fullName : nil;
+    } @catch (__unused NSException *exception) {
+        return nil;
+    }
+}
+
+// Fire whatever fullnames have accumulated as one batched request. Main-thread only.
+static void ApolloInlineAvatarFireBatchNow(void) {
+    sApolloBatchFireScheduled = NO;
+    if (sApolloPendingBatchFullNames.count == 0) return;
+    NSArray<NSString *> *batch = [sApolloPendingBatchFullNames allObjects];
+    [sApolloPendingBatchFullNames removeAllObjects];
+    [[ApolloUserProfileCache sharedCache] batchPrefetchProfilesForFullNames:batch];
+}
+
+// Coalesce authors into batches. A thread open (or fast scroll) floods cells into the
+// preload range at once → fire promptly once a burst accumulates; a slow trickle of
+// cells is gathered over a short window so it still collapses into one request rather
+// than many 1-id calls. Main-thread only, so the statics need no locking.
+static void ApolloInlineAvatarEnqueueFullNameForBatch(NSString *fullName) {
+    if (!sShowUserAvatars) return;
+    if (![fullName isKindOfClass:[NSString class]] || ![fullName hasPrefix:@"t2_"]) return;
+    if (!sApolloPendingBatchFullNames) sApolloPendingBatchFullNames = [NSMutableSet set];
+    [sApolloPendingBatchFullNames addObject:fullName];
+    if (sApolloPendingBatchFullNames.count >= 25) {
+        ApolloInlineAvatarFireBatchNow();
+        return;
+    }
+    if (sApolloBatchFireScheduled) return;
+    sApolloBatchFireScheduled = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        ApolloInlineAvatarFireBatchNow();
+    });
+}
+
+// Read the comment cell's own RDKComment (the same safe ivar path the avatar binding
+// uses) to get the author's t2_ fullname, and enqueue it for the batch — unless we
+// already have that user's avatar cached (memory is hydrated from disk at launch, so
+// this is a cheap check that stops return visits from re-batching known users).
+static void ApolloInlineAvatarBatchEnqueueFromCommentCell(id cell) {
+    if (!cell) return;
+    id comment = ApolloObjectIvarValue(cell, @"comment");
+    if (!comment) return;
+    NSString *fullName = ApolloCommentAuthorFullName(comment);
+    if (fullName.length == 0) return;
+    NSString *username = ApolloUsernameFromModelObject(comment);
+    if (username.length > 0 && [[ApolloUserProfileCache sharedCache] cachedInfoForUsername:username].iconURL) return;
+    ApolloInlineAvatarEnqueueFullNameForBatch(fullName);
+}
+
 %hook _TtC6Apollo15CommentCellNode
+
+// didEnterPreloadState fires while a cell is still in Texture's preload range (AHEAD of
+// display), so enqueuing the author here lets the coalesced batch cache their avatar
+// before the cell actually appears — turning ~N per-author about.json calls into a
+// handful of batched requests, and making the avatar already-present on scroll.
+- (void)didEnterPreloadState {
+    %orig;
+    if (!sShowUserAvatars) return;
+    ApolloInlineAvatarBatchEnqueueFromCommentCell(self);
+}
 
 - (void)didLoad {
     %orig;
     if (!sShowUserAvatars) return;
+    ApolloInlineAvatarBatchEnqueueFromCommentCell(self);
     ApolloApplyAvatarToCellWithDiameter(self, ApolloUsernameFromCell(self, @"comment"), ApolloCommentInlineAvatarDiameter);
 }
 

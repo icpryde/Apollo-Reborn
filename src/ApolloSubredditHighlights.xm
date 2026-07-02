@@ -1244,6 +1244,33 @@ static void ApolloHLTeardown(UIViewController *vc, BOOL restoreNativeHeader) {
     ApolloHLRestoreStandaloneHeader(vc);
 }
 
+// Mid-search predicate from ApolloSearchInPlace.xm (same dylib): YES while this feed table is showing
+// search results for a non-empty query, so we must not re-attach/scroll its carousel back to the top.
+extern BOOL ApolloFeedSearchIsActiveQuery(UIScrollView *tv);
+
+// Keep a just-re-attached standalone carousel pinned to the feed top while the search dismiss finishes.
+// The dismiss animates BOTH the content inset (the search field restoring) and the offset back over a
+// device-dependent duration (the sim is much faster than a real device — see the memory's issues 2/2b),
+// so a single scroll mis-lands: read too early (before the field's inset grows back) and we over-scroll
+// the carousel up behind the nav, hiding the field. Instead re-pin to the CURRENT -inset.top every ~0.1s
+// for up to ~0.8s, so the carousel tracks the field as its inset grows and ends just below it. Aborts
+// permanently the moment the user takes over the scroll (tracking/dragging/decelerating) or a search
+// re-activates. Non-animated (instant) so the per-tick re-pin reads as one smooth settle, and re-reads the
+// table weakly so it never retains it across the delays.
+static void ApolloHLPinCarouselToTop(UITableView *tv, int attempt) {
+    if (!tv || attempt > 8) return;
+    if (tv.tracking || tv.dragging || tv.decelerating) return;     // user took over → stop
+    if (ApolloFeedSearchIsActiveQuery((UIScrollView *)tv)) return;  // search re-activated → leave results up
+    CGFloat top = -tv.adjustedContentInset.top;
+    if (tv.contentOffset.y > top + 0.5) {
+        [tv setContentOffset:CGPointMake(tv.contentOffset.x, top) animated:NO];
+    }
+    __weak UITableView *weakTV = tv;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        ApolloHLPinCarouselToTop(weakTV, attempt + 1);
+    });
+}
+
 static void ApolloHLInstallCarousel(UIViewController *vc, UITableView *tableView, NSArray<ApolloHLItem *> *items, NSString *subreddit) {
     if (items.count == 0) {
         // Nothing pinned — make sure we aren't leaving a stale carousel up.
@@ -1257,7 +1284,31 @@ static void ApolloHLInstallCarousel(UIViewController *vc, UITableView *tableView
 
     BOOL sameContent = [storedSubreddit isEqualToString:subreddit] && [storedSignature isEqualToString:signature];
     if (sameContent && wrapper && tableView.tableHeaderView == wrapper) {
-        return; // already installed and current
+        // Already installed and current — UNLESS the wrapper has been detached from the window while the
+        // table is on-screen. Apollo's in-place feed search removes the tableHeaderView from the view
+        // hierarchy to show results, but leaves the `tableHeaderView` PROPERTY pointing at our wrapper, so
+        // on dismiss every re-install short-circuits here and the carousel never comes back (it's set but
+        // unrendered → a blank gap). Detect that and force a re-attach: nil then re-set under the rewrap
+        // guard so the table re-adds + lays out the header. STANDALONE carousel only (Subreddit Headers
+        // off): when headers are on, the carousel is hosted inside the headers wrapper and the search
+        // module owns that chrome, so re-seating + scrolling here would scroll the banner off. And skip
+        // entirely while a search is ACTIVE with a query (results are showing) — re-attaching + scrolling
+        // to the top then would yank the user's results away; the carousel should only come back once the
+        // search ends (dismiss) or the query is cleared to empty.
+        if (sShowSubredditHeaders || !(tableView.window && !wrapper.window) ||
+            ApolloFeedSearchIsActiveQuery((UIScrollView *)tableView)) {
+            return; // headers-hosted, attached/off-screen, or mid-search → nothing to do
+        }
+        objc_setAssociatedObject(tableView, kApolloHLRewrapInProgressKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        tableView.tableHeaderView = nil;
+        tableView.tableHeaderView = wrapper;
+        objc_setAssociatedObject(tableView, kApolloHLRewrapInProgressKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        // The feed is still scrolled where the search results were, so the just-re-attached carousel sits
+        // above the viewport (behind the field). Pin it back to the top so it's visible again — tracking the
+        // still-restoring inset so it lands just below the field instead of over-scrolling behind the nav.
+        ApolloHLPinCarouselToTop(tableView, 0);
+        ApolloLog(@"[Highlights] re-attached detached carousel r/%@", subreddit);
+        return;
     }
 
     CGFloat width = tableView.bounds.size.width > 0 ? tableView.bounds.size.width : UIScreen.mainScreen.bounds.size.width;

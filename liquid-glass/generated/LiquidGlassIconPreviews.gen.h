@@ -71,6 +71,9 @@ static const LGIconRowEntry kLGGroupEntries_new_variants[] = {
     { "jryng-andru", "Pro Wrestler", "jryng" },
     { "jryng-eap", "EAP", "jryng" },
     { "jryng-red", "Red", "jryng" },
+    { "lilacvibes-trans", "Trans", "lilacvibes" },
+    { "lilacvibes-pride", "Pride", "lilacvibes" },
+    { "lilacvibes-progress", "Progress Pride", "lilacvibes" },
 };
 
 static const LGIconRowEntry kLGGroupEntries_custom[] = {
@@ -83,7 +86,7 @@ static const LGIconRowEntry kLGGroupEntries_custom[] = {
 
 static const LGIconGroupDef kLGIconGroups[] = {
     { "community", "Liquid Glass", LGGroupPresentationInline, kLGGroupEntries_community, 4 },
-    { "new-variants", "New Variants", LGGroupPresentationPush, kLGGroupEntries_new_variants, 42 },
+    { "new-variants", "New Variants", LGGroupPresentationPush, kLGGroupEntries_new_variants, 45 },
     { "custom", "Custom", LGGroupPresentationPush, kLGGroupEntries_custom, 5 },
 };
 
