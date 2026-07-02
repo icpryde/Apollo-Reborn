@@ -267,7 +267,7 @@ enum { ESName, ESVariant, ESColors, ESAdvanced, ESGenerate, ESPreview, ESShare, 
     if (self.editingThemeID && section == ESAdvanced)
         return @"Turn on advanced options to override text and separator colours.";
     if (self.editingThemeID && section == ESShare)
-        return @"Shares a picture of this theme with a QR code — anyone can import it straight from the image.";
+        return @"Share as an image (a picture of this theme with a QR code anyone can import) or as a theme file.";
     if (self.editingThemeID && section == ESApply)
         return @"Applying selects this theme and enables custom theming.";
     if (!self.editingThemeID && section == LSEnable && [[self store] runtimeDisabledDueToCrash])
@@ -423,7 +423,7 @@ enum { ESName, ESVariant, ESColors, ESAdvanced, ESGenerate, ESPreview, ESShare, 
             return [self previewCellForRow:ip.row];
         case ESShare: {
             UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
-            cell.textLabel.text = @"Share as Image…";
+            cell.textLabel.text = @"Share…";
             cell.textLabel.textColor = self.view.tintColor;
             cell.imageView.image = [UIImage systemImageNamed:@"square.and.arrow.up"];
             return cell;
@@ -516,7 +516,7 @@ enum { ESName, ESVariant, ESColors, ESAdvanced, ESGenerate, ESPreview, ESShare, 
             }
             break;
         case ESGenerate: [self generateOppositeMode]; break;
-        case ESShare: [self shareThemeAsImageFromIndexPath:ip]; break;
+        case ESShare: [self shareOptionsFromIndexPath:ip]; break;
         case ESApply: [self applyTheme]; break;
     }
 }
@@ -886,6 +886,27 @@ enum { ESName, ESVariant, ESColors, ESAdvanced, ESGenerate, ESPreview, ESShare, 
     [self presentViewController:a animated:YES completion:nil];
 }
 
+// Editor "Share…" — pick the payload (image card vs .json file), then hand off
+// to the system share sheet, which offers Messages/Mail/Save Image/Save to
+// Files etc. for whichever was chosen.
+- (void)shareOptionsFromIndexPath:(NSIndexPath *)ip {
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Share Theme"
+                                                                   message:nil
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"As Image…" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
+        [self shareThemeAsImageFromIndexPath:ip];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"As Theme File…" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
+        NSDictionary *theme = [[self store] themeWithID:self.editingThemeID];
+        [self shareThemeFile:theme fromView:[self.tableView cellForRowAtIndexPath:ip]];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    UIView *anchor = [self.tableView cellForRowAtIndexPath:ip] ?: self.view;
+    sheet.popoverPresentationController.sourceView = anchor;
+    sheet.popoverPresentationController.sourceRect = anchor.bounds;
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
 - (void)shareThemeAsImageFromIndexPath:(NSIndexPath *)ip {
     NSDictionary *theme = [[self store] themeWithID:self.editingThemeID];
     UIImage *card = ApolloThemeShareRenderCard(theme, self.editingMode);
@@ -897,16 +918,24 @@ enum { ESName, ESVariant, ESColors, ESAdvanced, ESGenerate, ESPreview, ESShare, 
     [self presentViewController:av animated:YES completion:nil];
 }
 
-- (void)exportTheme:(NSDictionary *)theme {
+// Write the theme's portable .json to temp and share it, anchored to `anchor`
+// (falls back to view-centre, matching the list's Export swipe action).
+- (void)shareThemeFile:(NSDictionary *)theme fromView:(UIView *)anchor {
     NSData *data = [[self store] exportDataForTheme:theme];
     if (!data) { [self showError:@"Couldn't export that theme."]; return; }
     NSString *name = [[self store] exportFilenameForName:theme[@"name"]];
     NSURL *tmp = [[NSURL fileURLWithPath:NSTemporaryDirectory()] URLByAppendingPathComponent:name];
-    [data writeToURL:tmp atomically:YES];
+    if (![data writeToURL:tmp atomically:YES]) { [self showError:@"Couldn't export that theme."]; return; }
     UIActivityViewController *av = [[UIActivityViewController alloc] initWithActivityItems:@[tmp] applicationActivities:nil];
-    av.popoverPresentationController.sourceView = self.view;
-    av.popoverPresentationController.sourceRect = CGRectMake(self.view.bounds.size.width / 2, self.view.bounds.size.height / 2, 1, 1);
+    UIView *src = anchor ?: self.view;
+    av.popoverPresentationController.sourceView = src;
+    av.popoverPresentationController.sourceRect = anchor ? src.bounds
+        : CGRectMake(src.bounds.size.width / 2, src.bounds.size.height / 2, 1, 1);
     [self presentViewController:av animated:YES completion:nil];
+}
+
+- (void)exportTheme:(NSDictionary *)theme {
+    [self shareThemeFile:theme fromView:nil];
 }
 
 - (void)showError:(NSString *)message {
