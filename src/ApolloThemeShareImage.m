@@ -444,8 +444,20 @@ UIImage *ApolloThemeShareRenderCard(NSDictionary *theme, ApolloThemeMode mode) {
 
 #pragma mark - QR decoding
 
+// An image can carry several QRs (a screenshot of a Reddit page with a promo
+// QR next to the theme card, two cards side by side, …) and detectors return
+// them in no documented order — so always prefer an Apollo-tagged payload over
+// whichever code happened to come first, falling back to the first payload
+// only so the caller can log/reject something concrete.
+static NSString *ATSPreferTagged(NSString *best, NSString *candidate) {
+    if (!candidate.length) return best;
+    if ([candidate hasPrefix:kThemeQRTag]) return candidate;
+    return best.length ? best : candidate;
+}
+
 // Vision path — more tolerant of the blur/resample a recompressed image picks up.
 static NSString *ATSReadQRVision(CIImage *ci) {
+    NSString *best = nil;
     if (@available(iOS 11.0, *)) {
         VNDetectBarcodesRequest *request = [[VNDetectBarcodesRequest alloc] init];
         request.symbologies = @[VNBarcodeSymbologyQR];
@@ -456,10 +468,11 @@ static NSString *ATSReadQRVision(CIImage *ci) {
             return nil;
         }
         for (VNBarcodeObservation *obs in request.results) {
-            if (obs.payloadStringValue.length) return obs.payloadStringValue;
+            best = ATSPreferTagged(best, obs.payloadStringValue);
+            if ([best hasPrefix:kThemeQRTag]) break;
         }
     }
-    return nil;
+    return best;
 }
 
 // CIDetector fallback — no extra framework, handles clean/axis-aligned codes
@@ -472,13 +485,14 @@ static NSString *ATSReadQRCIDetector(CIImage *ci) {
     CIDetector *detector = [CIDetector detectorOfType:CIDetectorTypeQRCode
                                               context:ctx
                                               options:@{CIDetectorAccuracy: CIDetectorAccuracyHigh}];
+    NSString *best = nil;
     for (CIFeature *feature in [detector featuresInImage:ci]) {
         if ([feature isKindOfClass:[CIQRCodeFeature class]]) {
-            NSString *s = ((CIQRCodeFeature *)feature).messageString;
-            if (s.length) return s;
+            best = ATSPreferTagged(best, ((CIQRCodeFeature *)feature).messageString);
+            if ([best hasPrefix:kThemeQRTag]) break;
         }
     }
-    return nil;
+    return best;
 }
 
 NSDictionary *ApolloThemeShareDecodePayload(NSString *payload) {
@@ -515,7 +529,14 @@ NSDictionary *ApolloThemeShareDecodeImage(UIImage *image) {
         return nil;
     }
 
-    NSString *payload = ATSReadQRVision(ci) ?: ATSReadQRCIDetector(ci);
+    // Vision first for recompressed-image robustness; but if the best it found
+    // is a non-Apollo QR, still give CIDetector a chance to surface the tagged
+    // one before giving up (an untagged result is a guaranteed reject anyway).
+    NSString *payload = ATSReadQRVision(ci);
+    if (![payload hasPrefix:kThemeQRTag]) {
+        NSString *alt = ATSReadQRCIDetector(ci);
+        if ([alt hasPrefix:kThemeQRTag] || !payload.length) payload = alt;
+    }
     if (!payload.length) {
         ApolloLog(@"ThemeShare: no QR found in image");
         return nil;

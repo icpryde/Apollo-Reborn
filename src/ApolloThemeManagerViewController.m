@@ -764,6 +764,13 @@ enum { ESName, ESVariant, ESColors, ESAdvanced, ESGenerate, ESPreview, ESShare, 
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     NSURL *url = urls.firstObject;
     if (!url) return;
+    // Defer past the picker's own dismissal animation — a result alert presented
+    // while the picker is still animating out is silently dropped on device
+    // (device-verified in the original share feature).
+    dispatch_async(dispatch_get_main_queue(), ^{ [self importThemeFromPickedURL:url]; });
+}
+
+- (void)importThemeFromPickedURL:(NSURL *)url {
     BOOL scoped = [url startAccessingSecurityScopedResource];
     // Reject absurd files BEFORE reading into memory. Theme-card images are
     // legitimately multi-MB (photos of a screen, PNG screenshots), so the strict
@@ -822,20 +829,24 @@ enum { ESName, ESVariant, ESColors, ESAdvanced, ESGenerate, ESPreview, ESShare, 
 }
 
 - (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
-    [picker dismissViewControllerAnimated:YES completion:nil];
     PHPickerResult *result = results.firstObject;
-    if (!result) return; // cancelled
-    NSItemProvider *provider = result.itemProvider;
-    if (![provider canLoadObjectOfClass:[UIImage class]]) {
-        [self showError:@"Couldn't read that image."];
-        return;
-    }
-    [provider loadObjectOfClass:[UIImage class] completionHandler:^(id<NSItemProviderReading> object, NSError *error) {
-        UIImage *image = [object isKindOfClass:[UIImage class]] ? (UIImage *)object : nil;
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (!image) { [self showError:@"Couldn't read that image."]; return; }
-            [self importFromCardImage:image];
-        });
+    // Do everything from the dismissal completion — an alert (or a fast decode's
+    // confirm) presented while the picker sheet is still animating out is
+    // silently dropped by UIKit.
+    [picker dismissViewControllerAnimated:YES completion:^{
+        if (!result) return; // cancelled
+        NSItemProvider *provider = result.itemProvider;
+        if (![provider canLoadObjectOfClass:[UIImage class]]) {
+            [self showError:@"Couldn't read that image."];
+            return;
+        }
+        [provider loadObjectOfClass:[UIImage class] completionHandler:^(id<NSItemProviderReading> object, NSError *error) {
+            UIImage *image = [object isKindOfClass:[UIImage class]] ? (UIImage *)object : nil;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (!image) { [self showError:@"Couldn't read that image."]; return; }
+                [self importFromCardImage:image];
+            });
+        }];
     }];
 }
 

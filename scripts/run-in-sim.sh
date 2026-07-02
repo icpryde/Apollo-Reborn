@@ -199,6 +199,17 @@ if [[ "$FRESH_APP" == 1 || ! -d "$APP_DIR" ]]; then
     unzip -q "$SRC_IPA" 'Payload/*' -d "$WORK_DIR"
     [[ -d "$APP_DIR" ]] || die "extracted IPA has no Payload/Apollo.app"
 
+    # Strip the DEVICE tweak baked into the already-injected base IPA. The base
+    # bakes ApolloImprovedCustomApi.dylib (the device build of the tweak, which
+    # hard-links CydiaSubstrate) plus a device CydiaSubstrate.framework. Those are
+    # device Mach-Os; the iOS 26+ Simulator runtime rejects them at load
+    # ("Code Signature Invalid / Invalid Page"), crashing the app on launch. We
+    # don't need them in the sim — the sim tweak is injected separately and uses
+    # the internal Logos generator (no CydiaSubstrate). The main binary's
+    # reference to the baked tweak is weak, so removing the file is safe.
+    rm -rf "$APP_DIR/Frameworks/ApolloImprovedCustomApi.dylib" \
+           "$APP_DIR/Frameworks/CydiaSubstrate.framework"
+
     write_patcher
     # Patch every Mach-O in the bundle (main binary + appex + frameworks).
     mapfile -t MACHOS < <(find "$APP_DIR" -type f -print0 \
@@ -229,18 +240,32 @@ if [[ "$FRESH_APP" == 1 || ! -d "$APP_DIR" ]]; then
         shopt -u nullglob
     fi
 
-    # Re-sign ad-hoc inside-out (frameworks, then plugins, then the app).
+    # Re-sign ad-hoc. The platform-patch above MODIFIES every Mach-O, so each one
+    # must be re-signed or the iOS 26+ Simulator rejects it at load ("Code
+    # Signature Invalid / Invalid Page"). Signing only the *.framework bundles
+    # leaves loose dylibs (and any nested Mach-O) with stale signatures, which
+    # crashes the app — so sign EVERY Mach-O first, then re-seal the bundles.
+    # NB: `set -euo pipefail` is active. Each resign step below must always end
+    # with status 0 — otherwise the LAST file/framework/appex determines the
+    # loop/pipeline exit status, and a non-Mach-O last file (grep -q fails) or a
+    # single codesign miss would silently abort prep before the bundle re-seals.
     log "Re-signing ad-hoc"
+    find "$APP_DIR" -type f -print0 2>/dev/null \
+        | while IFS= read -r -d '' f; do
+            if file "$f" 2>/dev/null | grep -q 'Mach-O'; then
+                codesign -f -s - "$f" >/dev/null 2>&1 || true
+            fi
+        done || true
     if [[ -d "$APP_DIR/Frameworks" ]]; then
         find "$APP_DIR/Frameworks" -maxdepth 1 -name '*.framework' -print0 \
-            | while IFS= read -r -d '' fw; do codesign -f -s - "$fw" >/dev/null 2>&1; done
+            | while IFS= read -r -d '' fw; do codesign -f -s - "$fw" >/dev/null 2>&1 || true; done || true
     fi
     if [[ -d "$APP_DIR/PlugIns" ]]; then
         for ext in "$APP_DIR/PlugIns"/*.appex; do
-            [[ -e "$ext" ]] && codesign -f -s - "$ext" >/dev/null 2>&1
+            [[ -e "$ext" ]] && codesign -f -s - "$ext" >/dev/null 2>&1 || true
         done
     fi
-    codesign -f -s - "$APP_DIR" >/dev/null 2>&1
+    codesign -f -s - "$APP_DIR" >/dev/null 2>&1 || true
 fi
 
 # Stage the tweak's resource bundle inside the app so ApolloBundledResourcePath()

@@ -486,7 +486,17 @@ static BOOL InputHasAnyAdvancedOverrides(NSDictionary *input) {
         ? [obj[kApolloThemeAdvancedOptionsEnabledKey] boolValue]
         : InputHasAnyAdvancedOverrides(input);
     parsed[kApolloThemeAdvancedOptionsEnabledKey] = @(enabled);
-    if ([obj[@"generation"] isKindOfClass:[NSDictionary class]]) parsed[@"generation"] = obj[@"generation"];
+    // Keep only string->string pairs from a payload's generation dict: JSON
+    // null becomes NSNull, which NSUserDefaults can't persist — setAllThemes
+    // would refuse the whole array while activeThemeID already points at the
+    // never-saved theme (a ghost). Provenance is strings-only by design anyway.
+    if ([obj[@"generation"] isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *gen = [NSMutableDictionary dictionary];
+        [obj[@"generation"] enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *stop) {
+            if ([k isKindOfClass:[NSString class]] && [v isKindOfClass:[NSString class]]) gen[k] = v;
+        }];
+        if (gen.count) parsed[@"generation"] = gen;
+    }
     parsed[@"schemaVersion"] = @(schema ?: kApolloThemeSchemaVersion);
     return parsed;
 }
