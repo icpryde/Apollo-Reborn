@@ -555,7 +555,7 @@ typedef NS_ENUM(NSInteger, Tag) {
         // General base rows + the search-in-place (effectiveRow 11) and
         // follow-live-comments (effectiveRow 12) toggles, minus the conditional
         // "Tap to Show Deleted Comments" row.
-        case SectionGeneral: return sShowDeletedComments ? 13 : 12;
+        case SectionGeneral: return sShowDeletedComments ? 14 : 13;
         case SectionApolloAI: return 1;
         case SectionLinkPreviews: return 1;
         // Media base rows (the three "Rich Link Previews" rows moved out to their
@@ -1033,6 +1033,12 @@ typedef NS_ENUM(NSInteger, Tag) {
                                            detail:@"During Live Update comment sort, keep the newest at the top and show a jump button when you've scrolled down."
                                                on:[defaults boolForKey:UDKeyLiveCommentsFollow]
                                            action:@selector(liveCommentsFollowSwitchToggled:)];
+        case 13:
+            return [self switchCellWithIdentifier:@"Cell_Gen_IconRowMagnifier"
+                                            label:@"Magnify Info Row on Hold"
+                                           detail:@"Press and hold a post's info row (score, comments, time…) to magnify the icons and slide to the one you want."
+                                               on:[defaults boolForKey:UDKeyIconRowMagnifier]
+                                           action:@selector(iconRowMagnifierSwitchToggled:)];
         default: return [[UITableViewCell alloc] init];
     }
 }
@@ -2210,6 +2216,11 @@ typedef NS_ENUM(NSInteger, Tag) {
 - (void)keepSearchBarInPlaceSwitchToggled:(UISwitch *)sender {
     sKeepSearchBarInPlace = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:sKeepSearchBarInPlace forKey:UDKeyKeepSearchBarInPlace];
+}
+
+- (void)iconRowMagnifierSwitchToggled:(UISwitch *)sender {
+    sIconRowMagnifier = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sIconRowMagnifier forKey:UDKeyIconRowMagnifier];
 }
 
 - (void)liveCommentsFollowSwitchToggled:(UISwitch *)sender {

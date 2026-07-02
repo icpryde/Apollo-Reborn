@@ -55,6 +55,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloMediaAutoplay.m \
     $(SRC_DIR)/ApolloCommentsCollapse.xm \
     $(SRC_DIR)/ApolloInboxCommentScroll.xm \
+    $(SRC_DIR)/ApolloStatsRowTouch.xm \
     $(SRC_DIR)/ApolloLiveCommentsFollow.xm \
     $(SRC_DIR)/ApolloLiquidGlass.xm \
     $(SRC_DIR)/ApolloLiquidGlassIconPicker.xm \
