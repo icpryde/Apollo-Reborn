@@ -997,7 +997,7 @@ typedef NS_ENUM(NSInteger, Tag) {
                 cell.selectionStyle = UITableViewCellSelectionStyleDefault;
             }
             cell.textLabel.text = @"Open in App";
-            cell.detailTextLabel.text = @"Open Steam, YouTube, GitHub, X and Bluesky links in their apps, and pick your default browser.";
+            cell.detailTextLabel.text = @"Open Bluesky, GitHub, Steam and YouTube links in their apps, and pick your default browser.";
             cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
             cell.detailTextLabel.numberOfLines = 0;
             return cell;

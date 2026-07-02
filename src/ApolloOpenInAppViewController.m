@@ -15,11 +15,12 @@ typedef NS_ENUM(NSInteger, ApolloOpenInAppSection) {
 // Rows within the Apps section. (X/Twitter is intentionally not here — Apollo
 // already ships a native "Open Tweets in" picker that even supports third-party
 // clients, so a Reborn toggle would just duplicate it. See ApolloShareLinks.xm.)
+// Alphabetical, matching the on-screen order (rows are plain app names).
 typedef NS_ENUM(NSInteger, ApolloOpenInAppAppsRow) {
-    ApolloOpenInAppAppsRowSteam = 0,
-    ApolloOpenInAppAppsRowYouTube,
+    ApolloOpenInAppAppsRowBluesky = 0,
     ApolloOpenInAppAppsRowGitHub,
-    ApolloOpenInAppAppsRowBluesky,
+    ApolloOpenInAppAppsRowSteam,
+    ApolloOpenInAppAppsRowYouTube,
     ApolloOpenInAppAppsRowCount,
 };
 
@@ -111,7 +112,7 @@ static NSString *const kApolloBrowserDefaultToken = @"external-safari";
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
     if (section == ApolloOpenInAppSectionApps) {
-        return @"When on, links to these services open directly in their app (if installed) instead of a web view.";
+        return @"When enabled, links to these services open directly in their app (if installed) instead of a web view.";
     }
     if (section == ApolloOpenInAppSectionBrowser) {
         return @"Choose how other web links open. In-App Safari opens inside Apollo; Default Browser uses your iOS default browser.";
@@ -121,27 +122,29 @@ static NSString *const kApolloBrowserDefaultToken = @"external-safari";
 
 - (UITableViewCell *)appsCellForRow:(NSInteger)row {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    // Plain app names (alphabetical) — the section header + footer carry the
+    // "open links in their app" explanation, so the rows don't repeat it.
     switch (row) {
+        case ApolloOpenInAppAppsRowBluesky:
+            return [self switchCellWithIdentifier:@"Cell_OIA_Bluesky"
+                                            label:@"Bluesky"
+                                               on:[defaults boolForKey:UDKeyOpenLinksInBlueskyApp]
+                                           action:@selector(blueskySwitchToggled:)];
+        case ApolloOpenInAppAppsRowGitHub:
+            return [self switchCellWithIdentifier:@"Cell_OIA_GitHub"
+                                            label:@"GitHub"
+                                               on:[defaults boolForKey:UDKeyOpenLinksInGitHubApp]
+                                           action:@selector(gitHubSwitchToggled:)];
         case ApolloOpenInAppAppsRowSteam:
             return [self switchCellWithIdentifier:@"Cell_OIA_Steam"
-                                            label:@"Open Steam Links in App"
+                                            label:@"Steam"
                                                on:[defaults boolForKey:UDKeyOpenLinksInSteamApp]
                                            action:@selector(steamSwitchToggled:)];
         case ApolloOpenInAppAppsRowYouTube:
             return [self switchCellWithIdentifier:@"Cell_OIA_YouTube"
-                                            label:@"Open Videos in YouTube App"
+                                            label:@"YouTube"
                                                on:[defaults boolForKey:UDKeyOpenVideosInYouTubeApp]
                                            action:@selector(youTubeSwitchToggled:)];
-        case ApolloOpenInAppAppsRowGitHub:
-            return [self switchCellWithIdentifier:@"Cell_OIA_GitHub"
-                                            label:@"Open GitHub Links in App"
-                                               on:[defaults boolForKey:UDKeyOpenLinksInGitHubApp]
-                                           action:@selector(gitHubSwitchToggled:)];
-        case ApolloOpenInAppAppsRowBluesky:
-            return [self switchCellWithIdentifier:@"Cell_OIA_Bluesky"
-                                            label:@"Open Bluesky Links in App"
-                                               on:[defaults boolForKey:UDKeyOpenLinksInBlueskyApp]
-                                           action:@selector(blueskySwitchToggled:)];
         default:
             return [[UITableViewCell alloc] init];
     }
