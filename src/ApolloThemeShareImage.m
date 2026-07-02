@@ -344,19 +344,19 @@ UIImage *ApolloThemeShareRenderCard(NSDictionary *theme, ApolloThemeMode mode) {
     NSDictionary *modeInput = [theme[@"input"][modeKey] isKindOfClass:[NSDictionary class]]
         ? theme[@"input"][modeKey] : @{};
     BOOL advancedEnabled = [theme[kApolloThemeAdvancedOptionsEnabledKey] boolValue];
-    NSMutableArray<UIColor *> *swatches = [NSMutableArray array];
+    NSMutableArray<NSNumber *> *swatchRGBs = [NSMutableArray array]; // packed 0xRRGGBB
     for (NSString *key in ApolloThemeDefaultInputKeys()) {
         uint32_t rgb = 0;
         id hex = modeInput[key];
         BOOL ok = [hex isKindOfClass:[NSString class]] && ApolloThemeParseHex(hex, &rgb);
-        [swatches addObject:ok ? ApolloThemeUIColorFromRGB(rgb) : UIColor.grayColor];
+        [swatchRGBs addObject:@(ok ? rgb : 0x808080)];
     }
     if (advancedEnabled) {
         for (NSString *key in ApolloThemeAdvancedInputKeys()) {
             uint32_t rgb = 0;
             id hex = modeInput[key];
             if ([hex isKindOfClass:[NSString class]] && ApolloThemeParseHex(hex, &rgb)) {
-                [swatches addObject:ApolloThemeUIColorFromRGB(rgb)];
+                [swatchRGBs addObject:@(rgb)];
             }
         }
     }
@@ -463,14 +463,23 @@ UIImage *ApolloThemeShareRenderCard(NSDictionary *theme, ApolloThemeMode mode) {
         ATSDrawText(@"PALETTE", CGRectMake(52, 696, 300, 24),
                     [UIFont systemFontOfSize:20 weight:UIFontWeightSemibold], muted,
                     NSTextAlignmentLeft, NSLineBreakByClipping);
-        NSUInteger count = MAX(swatches.count, (NSUInteger)1);
+        NSUInteger count = MAX(swatchRGBs.count, (NSUInteger)1);
         CGFloat sgap = 8, sx = 48, sy = 728, sh = 46;
         CGFloat sw = (cw - sgap * (count - 1)) / (CGFloat)count;
-        for (NSUInteger i = 0; i < swatches.count; i++) {
+        for (NSUInteger i = 0; i < swatchRGBs.count; i++) {
+            uint32_t rgb = swatchRGBs[i].unsignedIntValue;
             CGRect r = CGRectMake(sx + i * (sw + sgap), sy, sw, sh);
-            UIBezierPath *sp = [UIBezierPath bezierPathWithRoundedRect:r cornerRadius:9];
-            [swatches[i] setFill]; [sp fill];
-            [[separator colorWithAlphaComponent:0.7] setStroke]; sp.lineWidth = 1; [sp stroke];
+            UIBezierPath *sp = [UIBezierPath bezierPathWithRoundedRect:CGRectInset(r, 1.5, 1.5) cornerRadius:9];
+            [ApolloThemeUIColorFromRGB(rgb) setFill]; [sp fill];
+            // Adaptive contrast ring: a chip whose colour sits near the page
+            // background would otherwise vanish (dark chips on a dark card,
+            // pastels on a light one) — ring each chip with whichever of
+            // black/white contrasts more with the chip itself, so either the
+            // fill or its ring is always visible on any page.
+            BOOL darkRing = ApolloThemeContrastRatio(rgb, 0x000000) >= ApolloThemeContrastRatio(rgb, 0xFFFFFF);
+            [(darkRing ? [UIColor colorWithWhite:0.0 alpha:0.55]
+                       : [UIColor colorWithWhite:1.0 alpha:0.92]) setStroke];
+            sp.lineWidth = 3; [sp stroke];
         }
 
         // --- QR plate (always light, for QR contrast) ---
