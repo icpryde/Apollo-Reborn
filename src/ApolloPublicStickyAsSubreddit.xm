@@ -12,17 +12,28 @@
 //       "Mod Mail from Subreddit"
 //       "Mod Mail from You"
 //   Picking one walks a short compose flow (message → optional private mod
-//   note → submit) that ultimately calls, on RDKClient:
+//   note → submit) that fires TWO RDKClient calls in sequence:
 //
-//     -[RDKClient addRemovalReasonToRemovedThingWithFullName:title:message:
-//                   type:reasonID:modNote:completion:]
+//     1. -[RDKClient addRemovalReasonToRemovedThingWithFullName:title:message:
+//          type:reasonID:modNote:completion:]
+//        POST `api/v1/modactions/removal_reasons` — LOGS the removal reason
+//        (reason_id + mod_note). Reddit ignores the `type` here.
+//     2. From 1.'s success completion:
+//        -[RDKClient sendRemovalReasonForRemovedThingWithFullName:type:title:
+//          message:completion:]
+//        POST `api/v1/modactions/removal_link_message` (posts) or
+//        `…/removal_comment_message` (comments, fullname `t1*`) with
+//        item_id/type/title/message — this is what actually SENDS the
+//        notification. type = "public" makes REDDIT post the stickied comment
+//        (authored by the caller); "private"/"private_exposed" send modmail.
 //
-//   which POSTs `api/v1/modactions/removal_reasons` with a `type` parameter.
-//   The three options pass type = "public" / "private" / "private_exposed".
-//   Reddit's API (confirmed via PRAW) accepts a FOURTH value the three options
-//   never use:
-//       "public_as_subreddit" -> stickied comment as u/<Sub>-ModTeam.
-//   That single value IS the requested feature — same endpoint, same method.
+//   Reddit's message endpoint (confirmed via PRAW) accepts a FOURTH `type` the
+//   three options never use:
+//       "public_as_subreddit" -> Reddit posts the sticky as u/<Sub>-ModTeam.
+//   So the feature = the same send call with that type. (An earlier revision
+//   swapped the `type` on call 1 — the reason-LOGGING endpoint, where Reddit
+//   ignores it — so the comment still posted as the moderator. The swap must
+//   happen on call 2.)
 //
 // How the option is added:
 //
@@ -34,16 +45,16 @@
 //   menu; for the "Notify user via…" menu we append a 4th UIAction that clones
 //   the "Public Sticky"/"Public Reply" action (inheriting its styling) and, on
 //   tap, arms a one-shot flag and runs the ORIGINAL action's handler — so the
-//   entire native compose flow runs unchanged.
+//   entire native compose flow runs unchanged. Without Liquid Glass the same
+//   row is added to the original ActionController table sheet (see the
+//   action-sheet section below).
 //
-//   The RDKClient hook below is UI-independent (every notify path funnels
-//   through it) and rewrites type "public" → "public_as_subreddit" while the
-//   flag is set, then consumes it. Every other option/path is untouched.
-//
-//   NOTE: this covers the Liquid-Glass path (the native UIMenu). Without Liquid
-//   Glass, Apollo presents its original ActionController table sheet, which
-//   self-sizes from its own row count — injecting a visible row there needs the
-//   sheet's height/layout handled too, tracked as a follow-up.
+//   The RDKClient hook below rewrites type "public" → "public_as_subreddit" on
+//   the SEND call while the flag is set, then consumes it. The flag stays armed
+//   across the whole compose flow (the send happens inside call 1's async
+//   completion) and is re-cleared whenever a fresh "Notify user via…" menu or
+//   sheet is built, so a cancelled compose can never leak into a later genuine
+//   "Public Sticky". Every other option/path is untouched.
 //
 // Mod-only and additive: non-mods never see this menu; untouched options behave
 // exactly like stock Apollo. No settings toggle.
@@ -319,27 +330,31 @@ void ApolloInjectPublicStickyAsSubredditIfNeeded(NSMutableArray *children, NSStr
 
 #pragma mark - Type rewrite at the API boundary
 
+// The swap happens on the SEND call (removal_link_message /
+// removal_comment_message) — the one whose `type` Reddit honors — NOT on the
+// reason-logging call (removal_reasons), which fires first and ignores `type`.
+// The flag is consumed here (one-shot); it survives the async gap between the
+// two calls because nothing else can rebuild the Notify menu mid-flow, and any
+// abandoned compose is disarmed the next time a Notify menu/sheet is built.
 %hook RDKClient
 
-- (id)addRemovalReasonToRemovedThingWithFullName:(id)fullName
-                                           title:(id)title
-                                         message:(id)message
-                                            type:(id)type
-                                        reasonID:(id)reasonID
-                                         modNote:(id)modNote
-                                      completion:(id)completion {
+- (id)sendRemovalReasonForRemovedThingWithFullName:(id)fullName
+                                              type:(id)type
+                                             title:(id)title
+                                           message:(id)message
+                                        completion:(id)completion {
     if (sSendNextRemovalAsSubreddit) {
         sSendNextRemovalAsSubreddit = NO; // consume regardless, one-shot
         if ([type isKindOfClass:[NSString class]] && [type isEqualToString:kTypePublic]) {
-            ApolloLog(@"[PublicStickyAsSub] rewriting removal type 'public' -> 'public_as_subreddit'");
+            ApolloLog(@"[PublicStickyAsSub] rewriting removal-message type 'public' -> 'public_as_subreddit' for %@", fullName);
             type = kTypePublicAsSubreddit;
         } else {
-            ApolloLog(@"[PublicStickyAsSub] flag set but type was %@ (not 'public'); left unchanged", type);
+            ApolloLog(@"[PublicStickyAsSub] flag set but send type was %@ (not 'public'); left unchanged", type);
         }
     }
     // Explicit args: bare %orig would re-pass the ORIGINAL captured `type`,
     // discarding our rewrite (see CLAUDE.md Logos note).
-    return %orig(fullName, title, message, type, reasonID, modNote, completion);
+    return %orig(fullName, type, title, message, completion);
 }
 
 %end
