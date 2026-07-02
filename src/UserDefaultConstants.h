@@ -79,6 +79,14 @@ static NSString *const UDKeyKeepSearchBarInPlace = @"KeepSearchBarInPlace";
 static NSString *const UDKeyIPadTabBarBottom = @"IPadTabBarBottom";
 static NSString *const ApolloIPadTabBarBottomChangedNotification = @"ApolloIPadTabBarBottomChangedNotification";
 static NSString *const UDKeyLiveCommentsFollow = @"LiveCommentsFollow";
+// Per-POST comment sort memory (issue #555). When ON, changing a post's comment sort
+// is remembered for that post (capped LRU mapping below) and restored when its
+// comments are reopened; every other post keeps Apollo's native chain (suggested
+// sort > per-subreddit remembered > default). Opt-in; default NO via registerDefaults.
+// See ApolloPerPostCommentSort.xm.
+static NSString *const UDKeyPerPostCommentSort = @"PerPostCommentSort";
+// Backing store for the above: { bare post id : { "s": sort raw, "t": last-use unix time } }.
+static NSString *const UDKeyPerPostCommentSortMapping = @"PerPostCommentSortMapping";
 // Render image URLs (i.redd.it, preview.redd.it, i.imgur.com, generic .png/.jpg/.jpeg/.webp)
 // inline within post selftext and comments instead of leaving them as plain text links.
 static NSString *const UDKeyEnableInlineImages = @"EnableInlineImages";

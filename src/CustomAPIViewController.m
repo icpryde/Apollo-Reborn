@@ -2751,6 +2751,7 @@ static void ApolloReplayValetKeychainItems(NSArray<NSDictionary *> *items) {
     sReadPostMaxCount = [defaults integerForKey:UDKeyReadPostMaxCount];
     sShowDeletedComments = [defaults boolForKey:UDKeyShowDeletedComments];
     sTapToRevealDeletedComments = [defaults boolForKey:UDKeyTapToRevealDeletedComments];
+    sPerPostCommentSort = [defaults boolForKey:UDKeyPerPostCommentSort];
     sShowRecentlyReadThumbnails = [defaults boolForKey:UDKeyShowRecentlyReadThumbnails];
     sEnableFlairColors = [defaults boolForKey:UDKeyEnableFlairColors];
     sPreferredGIFFallbackFormat = ([defaults integerForKey:UDKeyPreferredGIFFallbackFormat] == 0) ? 0 : 1;

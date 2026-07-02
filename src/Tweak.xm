@@ -1484,6 +1484,7 @@ static void initializeRandomSources() {
                                     UDKeyKeepSearchBarInPlace: @NO,
                                     UDKeyIPadTabBarBottom: @NO,
                                     UDKeyLiveCommentsFollow: @YES,
+                                    UDKeyPerPostCommentSort: @NO,
                                     UDKeyEnableBulkTranslation: @NO,
                                     UDKeyAutoTranslateOnAppear: @YES,
                                     UDKeyTranslatePostTitles: @NO,
@@ -1592,6 +1593,7 @@ static void initializeRandomSources() {
     sKeepSearchBarInPlace = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyKeepSearchBarInPlace];
     sIPadTabBarBottom = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyIPadTabBarBottom];
     sLiveCommentsFollow = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyLiveCommentsFollow];
+    sPerPostCommentSort = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyPerPostCommentSort];
     sModernSubredditDividers = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyModernSubredditDividers];
     sSubredditListEnhancements = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeySubredditListEnhancements];
     sEnableFlairColors = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyEnableFlairColors];
