@@ -8,6 +8,7 @@
 #import "ApolloWebSessionLoginViewController.h" // silent re-harvest before the expiry prompt
 #import <objc/message.h>
 #import <os/lock.h>
+#import <stdatomic.h>
 
 #import <Security/Security.h>
 
@@ -444,39 +445,108 @@ BOOL ApolloWebJSONPathNeedsWebBearer(NSString *path) {
     return [re firstMatchInString:path options:0 range:NSMakeRange(0, path.length)] != nil;
 }
 
-// Reads www.reddit.com now answers with its 403 HTML page for the cookie go to
-// api.reddit.com, which serves them to the cookie as the signed-in user (and
-// 403s them without it):
-// - GET /api/info (RDKClient's thingsByFullNames:completion:). oauth.reddit.com
-//   refuses the web bearer for it the same way (checked live 2026-10-22). The
-//   Inbox's Notifications list waits on this lookup (completion at 0x10019dde8).
-// - /api/morechildren, the "more replies" rows in a thread (issue #1456). Apollo
-//   POSTs it; www 403s it as a POST or a GET, and as /r/<sub>/api/morechildren
-//   too, while api.reddit.com answers both with the comments (checked live
-//   2026-10-22).
-static BOOL ApolloWebJSONReadNeedsAPIHost(NSString *method, NSString *path) {
-    NSString *p = path.lowercaseString;
-    if ([p isEqualToString:@"/api/morechildren"] || [p isEqualToString:@"/api/morechildren.json"] ||
-        [p isEqualToString:@"/api/morechildren/"]) {
-        return [method isEqualToString:@"POST"] || [method isEqualToString:@"GET"];
-    }
-    if (![method isEqualToString:@"GET"]) return NO;
-    return [p isEqualToString:@"/api/info"] || [p isEqualToString:@"/api/info.json"] || [p isEqualToString:@"/api/info/"];
+// /api/info (RDKClient's thingsByFullNames:completion:, which the Inbox's
+// Notifications list waits on: completion at 0x10019dde8) and /api/morechildren
+// (the "more replies" rows, which Apollo POSTs). For the cookie, Reddit answers
+// both with its 403 HTML block page on www.reddit.com/api/<name> and
+// api.reddit.com, refuses the web bearer for them on oauth.reddit.com, and
+// closes the routes that still work one at a time. So each endpoint tries these
+// routes in order and moves to the next for the rest of the launch when one
+// answers with the block page (ApolloWebJSONLegacyAPIRouteBlocked). Both served
+// the signed-in user on 2026-10-24; old.reddit.com is last because Reddit is
+// limiting Old Reddit to accounts that used it in the last six months.
+typedef NS_ENUM(NSInteger, ApolloWebJSONLegacyAPIRoute) {
+    ApolloWebJSONLegacyAPIRouteWWWTrailingSlash,  // www.reddit.com/api/<name>/.json
+    ApolloWebJSONLegacyAPIRouteOldReddit,         // old.reddit.com/api/<name>.json
+    ApolloWebJSONLegacyAPIRouteCount,
+};
+
+static NSString *ApolloWebJSONLegacyAPIRouteDescription(ApolloWebJSONLegacyAPIRoute route, NSString *name) {
+    return route == ApolloWebJSONLegacyAPIRouteOldReddit
+        ? [NSString stringWithFormat:@"old.reddit.com/api/%@.json", name]
+        : [NSString stringWithFormat:@"www.reddit.com/api/%@/.json", name];
 }
 
-// Once per method and path per launch, so a report's log shows the reroute
-// (the per-request "Rewrote" line is debug-level and never reaches it) without
-// a line for every Load More tap. Any thread: the rewrite runs on NSURLSession's queue.
-static void ApolloWebJSONNoteAPIHostRoute(NSString *method, NSString *path) {
-    static NSMutableSet<NSString *> *logged;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ logged = [NSMutableSet set]; });
-    NSString *key = [NSString stringWithFormat:@"%@ %@", method, path.lowercaseString];
-    @synchronized (logged) {
-        if ([logged containsObject:key]) return;
-        [logged addObject:key];
+// "info" or "morechildren" for a request these routes cover, else nil. Takes a
+// URL path from either host and route ("/api/info.json", "/api/info/.json").
+static NSString *ApolloWebJSONLegacyAPIName(NSString *method, NSString *path) {
+    NSString *p = path.lowercaseString;
+    if ([p hasSuffix:@".json"]) p = [p substringToIndex:p.length - 5];
+    while ([p hasSuffix:@"/"] && p.length > 1) p = [p substringToIndex:p.length - 1];
+    if ([p isEqualToString:@"/api/morechildren"]) {
+        return [method isEqualToString:@"GET"] || [method isEqualToString:@"POST"] ? @"morechildren" : nil;
     }
-    ApolloLog(@"[WebJSON] Sending %@ %@ to api.reddit.com (www.reddit.com refuses it for the cookie)", method, path);
+    if ([p isEqualToString:@"/api/info"]) return [method isEqualToString:@"GET"] ? @"info" : nil;
+    return nil;
+}
+
+// Current route per endpoint (index 0 info, 1 morechildren). Starts at the
+// first route each launch and only moves forward.
+static _Atomic NSInteger sLegacyAPIRoute[2];
+
+static NSInteger ApolloWebJSONLegacyAPISlot(NSString *name) {
+    return [name isEqualToString:@"morechildren"] ? 1 : 0;
+}
+
+static ApolloWebJSONLegacyAPIRoute ApolloWebJSONCurrentLegacyAPIRoute(NSString *name) {
+    NSInteger route = atomic_load(&sLegacyAPIRoute[ApolloWebJSONLegacyAPISlot(name)]);
+    return (ApolloWebJSONLegacyAPIRoute)MIN(route, ApolloWebJSONLegacyAPIRouteCount - 1);
+}
+
+// Points `components` (host and path) at `name`'s current route.
+static void ApolloWebJSONApplyLegacyAPIRoute(NSURLComponents *components, NSString *name) {
+    ApolloWebJSONLegacyAPIRoute route = ApolloWebJSONCurrentLegacyAPIRoute(name);
+    if (route == ApolloWebJSONLegacyAPIRouteOldReddit) {
+        components.host = @"old.reddit.com";
+        components.path = [NSString stringWithFormat:@"/api/%@.json", name];
+    } else {
+        components.host = @"www.reddit.com";
+        components.path = [NSString stringWithFormat:@"/api/%@/.json", name];
+    }
+}
+
+// The route a response came back from, or -1 when its URL isn't one of them.
+static NSInteger ApolloWebJSONLegacyAPIRouteForURL(NSURL *url, NSString **name) {
+    NSString *host = url.host.lowercaseString;
+    NSString *p = url.path.lowercaseString ?: @"";
+    NSString *found = ApolloWebJSONLegacyAPIName(@"GET", p) ?: ApolloWebJSONLegacyAPIName(@"POST", p);
+    if (!found) return -1;
+    if (name) *name = found;
+    if ([host isEqualToString:@"old.reddit.com"]) return ApolloWebJSONLegacyAPIRouteOldReddit;
+    if ([host isEqualToString:@"www.reddit.com"] && [p hasSuffix:@"/.json"]) return ApolloWebJSONLegacyAPIRouteWWWTrailingSlash;
+    return -1;
+}
+
+static BOOL ApolloWebJSONResponseIsBlockPage(NSHTTPURLResponse *response) {
+    if (![response isKindOfClass:[NSHTTPURLResponse class]] || response.statusCode != 403) return NO;
+    NSString *contentType = [response.allHeaderFields[@"Content-Type"] lowercaseString] ?: @"";
+    return [contentType containsString:@"text/html"];
+}
+
+BOOL ApolloWebJSONLegacyAPIRouteBlocked(NSHTTPURLResponse *response) {
+    if (!sWebJSONEnabled || !ApolloWebJSONResponseIsBlockPage(response)) return NO;
+    NSString *name = nil;
+    NSInteger used = ApolloWebJSONLegacyAPIRouteForURL(response.URL, &name);
+    if (used < 0) return NO;
+    NSInteger expected = used;
+    NSInteger next = used + 1;
+    _Atomic NSInteger *slot = &sLegacyAPIRoute[ApolloWebJSONLegacyAPISlot(name)];
+    // Moves the endpoint on only from the route this response used, so a burst
+    // of block pages from one route moves it once.
+    if (next < ApolloWebJSONLegacyAPIRouteCount && atomic_compare_exchange_strong(slot, &expected, next)) {
+        ApolloLog(@"[WebJSON] %@ answered with its block page; sending /api/%@ to %@ from now on",
+                  ApolloWebJSONLegacyAPIRouteDescription((ApolloWebJSONLegacyAPIRoute)used, name), name,
+                  ApolloWebJSONLegacyAPIRouteDescription((ApolloWebJSONLegacyAPIRoute)next, name));
+        return YES;
+    }
+    // Another request already moved it on: resend on the newer route.
+    if (atomic_load(slot) > used) return YES;
+    static _Atomic bool exhaustedLogged[2];
+    if (!atomic_exchange(&exhaustedLogged[ApolloWebJSONLegacyAPISlot(name)], true)) {
+        ApolloLog(@"[WebJSON] %@ answered with its block page and no route is left for /api/%@",
+                  ApolloWebJSONLegacyAPIRouteDescription((ApolloWebJSONLegacyAPIRoute)used, name), name);
+    }
+    return NO;
 }
 
 // Which web-session account a Reddit request carrying `bearer` belongs to, or
@@ -666,10 +736,10 @@ NSURLRequest *ApolloWebJSONRewriteRequest(NSURLRequest *request) {
 
     NSURLComponents *components = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
     if (!components) return nil;
-    BOOL apiHost = ApolloWebJSONReadNeedsAPIHost(method, path);
-    components.host = apiHost ? @"api.reddit.com" : @"www.reddit.com";
-    if (apiHost) ApolloWebJSONNoteAPIHostRoute(method, path);
+    components.host = @"www.reddit.com";
     if (subredditWritePath) components.path = subredditWritePath;
+    NSString *legacyAPIName = ApolloWebJSONLegacyAPIName(method, path);
+    if (legacyAPIName) ApolloWebJSONApplyLegacyAPIRoute(components, legacyAPIName);
 
     // Listing/page URLs must carry ".json"; /api endpoints are already JSON.
     if (kind == ApolloWebJSONPathListing) {
@@ -1331,10 +1401,10 @@ void ApolloWebJSONNoteResponse(NSURLRequest *request, NSURLResponse *response) {
         return;
     }
 
-    // api.reddit.com carries the cookie for /api/info and /api/morechildren
-    // (ApolloWebJSONReadNeedsAPIHost).
+    // old.reddit.com carries the cookie for /api/info and /api/morechildren
+    // (ApolloWebJSONLegacyAPIRoute).
     if (![url.host.lowercaseString isEqualToString:@"www.reddit.com"] &&
-        ![url.host.lowercaseString isEqualToString:@"api.reddit.com"]) return;
+        ![url.host.lowercaseString isEqualToString:@"old.reddit.com"]) return;
     // Only react to requests we authenticated with the cookie — those carry the
     // Cookie header we set in ApolloWebJSONRewriteRequest. This skips unrelated
     // www.reddit.com traffic (e.g. the trending-subreddits fetch) that could
@@ -1372,6 +1442,9 @@ void ApolloWebJSONNoteResponse(NSURLRequest *request, NSURLResponse *response) {
     // with a web bearer instead; one only reaches www with the cookie when no
     // bearer could be minted, and then its refusal is guaranteed.
     if (ApolloWebJSONPathNeedsWebBearer(url.path)) return;
+    // A block page on /api/info or /api/morechildren means Reddit closed that
+    // route (ApolloWebJSONLegacyAPIRouteBlocked), not that the session died.
+    if (ApolloWebJSONLegacyAPIRouteForURL(url, NULL) >= 0) return;
 
     NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
     // Reddit's anonymous block page is HTTP 403 with a ~190 KB text/html body.
@@ -1713,19 +1786,19 @@ NSData *ApolloWebJSONFixupListingMediaResponseData(NSURLResponse *response, NSDa
 // See ApolloWebJSONWriteRepair.h. Lives here because it needs this file's
 // transport privates (session cookie, captured bearer, probe marker, browser
 // User-Agent). Auth follows the active account's mode: web-session actives use
-// their cookie against api.reddit.com (the probe marker skips the rewrite, so
-// this read doesn't get ApolloWebJSONReadNeedsAPIHost's host on its own, and
-// www answers /api/info with its 403 block page); API-key (OAuth) actives use
-// the captured bearer against oauth.reddit.com.
+// their cookie on /api/info's current route (the probe marker skips the
+// rewrite, which would pick it otherwise); API-key (OAuth) actives use the
+// captured bearer against oauth.reddit.com.
 void ApolloWebJSONPrefetchModernThingData(NSString *fullname, void (^completion)(NSDictionary *data)) {
     if (fullname.length == 0) { completion(nil); return; }
     NSString *cookie = ApolloActiveWebSession().cookieHeader;
     NSString *bearer = cookie.length == 0 ? [sLatestRedditBearerToken copy] : nil;
     if (cookie.length == 0 && bearer.length == 0) { completion(nil); return; }
 
-    NSString *host = cookie.length > 0 ? @"https://api.reddit.com" : @"https://oauth.reddit.com";
-    NSString *urlStr = [NSString stringWithFormat:@"%@/api/info.json?id=%@&raw_json=1", host, fullname];
-    NSURL *probeURL = ApolloWebJSONURLWithFragment([NSURL URLWithString:urlStr], kApolloWebJSONProbeMarker);
+    NSURLComponents *components = [NSURLComponents componentsWithString:@"https://oauth.reddit.com/api/info.json"];
+    components.percentEncodedQuery = [NSString stringWithFormat:@"id=%@&raw_json=1", fullname];
+    if (cookie.length > 0) ApolloWebJSONApplyLegacyAPIRoute(components, @"info");
+    NSURL *probeURL = ApolloWebJSONURLWithFragment(components.URL, kApolloWebJSONProbeMarker);
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:probeURL];
     if (cookie.length > 0) [req setValue:cookie forHTTPHeaderField:@"Cookie"];
     else [req setValue:[@"Bearer " stringByAppendingString:bearer] forHTTPHeaderField:@"Authorization"];

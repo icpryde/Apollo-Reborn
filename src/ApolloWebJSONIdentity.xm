@@ -948,7 +948,14 @@ static __thread BOOL sApolloWebJSONResendingAfterWebBearerMint = NO;
     NSString *requestPath = [path copy];
     NSString *username = ApolloWebJSONShouldActForClient(self) ? ApolloWebJSONClientUsername(self) : nil;
     ApolloWebJSONCheckAccountSession(username);
+    RDKClient *client = self;
     void (^wrapped)(NSHTTPURLResponse *, id, NSError *) = ^(NSHTTPURLResponse *response, id object, NSError *error) {
+        // Reddit closed the route this /api/info or /api/morechildren request
+        // took: send it again on the next one, with the caller's completion.
+        if (username && ApolloWebJSONLegacyAPIRouteBlocked(response)) {
+            [client taskWithMethod:method path:path parameters:parameters completion:completion];
+            return;
+        }
         NSError *sessionError = ApolloWebJSONAccountSessionError(username);
         if (sessionError) {
             completion(response, nil, sessionError);

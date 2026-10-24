@@ -158,6 +158,12 @@ NSString *ApolloWebJSONReadyWebBearer(NSString *username);
 // hook mints before sending an ApolloWebJSONPathNeedsWebBearer request then.
 BOOL ApolloWebJSONWebBearerNeedsMint(NSString *username);
 
+// YES when `response` is Reddit's block page from the current route for
+// /api/info or /api/morechildren and that endpoint now has a later route, so
+// the request should be sent again (the rewrite picks the new route). Moves the
+// endpoint on when needed and logs it. Any thread.
+BOOL ApolloWebJSONLegacyAPIRouteBlocked(NSHTTPURLResponse *response);
+
 // Hydrates the legacy single-session globals from the keychain, migrating any
 // legacy NSUserDefaults cookie value, then any legacy single-global session,
 // into the per-account ApolloWebSessionStore (see that file's harvest path for
